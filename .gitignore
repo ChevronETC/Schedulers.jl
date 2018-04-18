@@ -1,0 +1,7 @@
+*.swp
+*.swo
+*.js
+*.o*
+*.e*
+Manifest.toml
+docs/build
