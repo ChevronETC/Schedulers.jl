@@ -24,5 +24,3 @@ method also aims for features of fault tolerance, dynamic load balancing and ela
 
 [code-coverage-img]: https://codecov.io/gh/ChevronETC/Schedulers.jl/branch/master/graph/badge.svg
 [code-coverage-results]: https://codecov.io/gh/ChevronETC/Schedulers.jl
-
-Elastic and fault tolerant `map` and `mapreduce` methods for traditional HPC and cloud computing.
