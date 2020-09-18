@@ -58,7 +58,7 @@ end
     end
 
     for (key,value) in h
-        @test value ∈ 8:12
+        @test value ∈ 5:25
     end
 end
 
@@ -98,7 +98,7 @@ end
 
     for (key,value) in h
         if key ∈ workers()
-            @test value ∈ 8:12
+            @test value ∈ 5:25
         end
     end
 end
@@ -131,7 +131,7 @@ end
     end
 
     for (key,value) in h
-        @test value ∈ 8:12
+        @test value ∈ 5:25
     end
 end
 
