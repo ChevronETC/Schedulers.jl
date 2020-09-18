@@ -143,7 +143,7 @@ end
         nothing
     end
 
-    tmpdir = mktempdir()
+    tmpdir = mktempdir(;cleanup=false)
 
     a,b = 2,3
     x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a; b=b, epmap_scratch=tmpdir)
@@ -237,9 +237,9 @@ end
 
     a,b = 2,3
 
-    tmpdir = mktempdir()
+    tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=10)
+    x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=10, epmap_scratch=tmpdir)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
