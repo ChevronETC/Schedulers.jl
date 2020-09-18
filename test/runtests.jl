@@ -172,7 +172,7 @@ end
 
     a,b = 2,3
 
-    tmpdir = mktempdir()
+    tmpdir = mktempdir(;cleanup=false)
 
     tsk = @async epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_scratch=tmpdir)
 
@@ -206,7 +206,7 @@ end
     a,b = 2,3
     id = randstring(6)
 
-    tmpdir = mktempdir()
+    tmpdir = mktempdir(;cleanup=false)
 
     checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, Float32, (10,), a, b;
         epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_quantum=32, epmap_scratch=tmpdir)
@@ -214,7 +214,6 @@ end
     tsk = @async Schedulers.epmapreduce_reduce!(zeros(Float32,10), checkpoints;
         epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_quantum=32, epmap_scratch=tmpdir)
 
-    rm(tmpdir; recursive=true, force=true)
     rmprocs(workers()[randperm(nworkers())[1]])
 
     x = fetch(tsk)
