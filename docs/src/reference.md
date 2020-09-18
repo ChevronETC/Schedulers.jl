@@ -1,6 +1,6 @@
 # Reference
 
 ```@autodocs
-Modules = [DistributedOperations]
+Modules = [Schedulers]
 Order   = [:function, :type]
 ```
