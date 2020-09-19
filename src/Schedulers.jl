@@ -221,6 +221,7 @@ addprocs(2)
 @everywhere f(x, tsk) = (fetch(x)::Vector{Float32} .+= tsk; nothing)
 result = epmapreduce(zeros(Float32,10), f, 1:100)
 rmprocs(workers())
+```
 """
 function epmapreduce!(result::AbstractArray{T,N}, f, tasks, args...;
         epmapreduce_id = randstring(6),
