@@ -27,7 +27,7 @@ using Distributed
 addprocs(5)
 @everywhere using Distributed, Schedulers
 @everywhere function foo(x, tsk)
-    localpart(x) .+= tsk
+    fetch(x)::Vector{Float64} .+= tsk
     @info "sleeping for task $tsk on worker $(myid()) for 60 seconds"
     sleep(60)
 end
