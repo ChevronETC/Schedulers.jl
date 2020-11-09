@@ -212,14 +212,30 @@ with an assoicated partial reduction.
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[1]
+* `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
 
-# Example
-```julia
+# Examples
+## Example 1
+With the assumption that `/scratch` is accesible from all workers:
+```
 using Distributed
 addprocs(2)
 @everywhere using Distributed, Schedulers
 @everywhere f(x, tsk) = (fetch(x)::Vector{Float32} .+= tsk; nothing)
-result = epmapreduce(zeros(Float32,10), f, 1:100)
+result = epmapreduce!(zeros(Float32,10), f, 1:100)
+rmprocs(workers())
+```
+
+## Example 2
+Using Azure blob storage:
+```
+using Distributed, AzStorage
+container = AzContainer("scratch"; storageaccount="mystorageaccount")
+mkpath(container)
+addprocs(2)
+@everywhere using Distributed, Schedulers
+@everywhere f(x, tsk) = (fetch(x)::Vector{Float32} .+= tsk; nothing)
+result = epmapreduce!(zeros(Float32,10), f, 1:100; epmap_scratch=container)
 rmprocs(workers())
 ```
 """
