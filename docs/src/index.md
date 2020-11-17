@@ -19,6 +19,6 @@ elasticity.  However, it is important to note that it comes at the cost of IO op
 to investigate alternatives ideas that avoid IO such as resilient distributed data from Spark.
 
 # Important note
-Note that the error handling in the `epmapreduce` method is, as of Schedulers 0.1.0, limited to the case where
+Note that the error handling in the `epmapreduce!` method is, as of Schedulers 0.1.0, limited to the case where
 a worker is removed, throwing a `ProcessExitedException`.  In future versions, we will work to expand the scope
 of the error handling.
