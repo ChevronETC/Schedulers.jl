@@ -209,10 +209,10 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, Float32, (10,), a, b;
-        epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_quantum=32, epmap_scratch=tmpdir)
+        epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
 
     tsk = @async Schedulers.epmapreduce_reduce!(zeros(Float32,10), checkpoints;
-        epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_quantum=32, epmap_scratch=tmpdir)
+        epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
 
     rmprocs(workers()[randperm(nworkers())[1]])
 

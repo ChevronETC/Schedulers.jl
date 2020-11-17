@@ -4,6 +4,7 @@ using Distributed, DistributedOperations, Printf, Random, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
+epmap_default_init = pid->nothing
 
 function load_modules_on_new_workers(pid)
     _names = names(Main; imported=true)
@@ -40,11 +41,9 @@ end
 # for performance metrics, track when the pid is started
 const _pid_up_timestamp = Dict{Int, Float64}()
 
-function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs)
-    for worker in workers()
-        _pid_up_timestamp[worker] = time()
-        put!(pid_channel, worker)
-    end
+function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+    pids = epmap_usemaster ? Int[] : [1]
+    init_tasks = Dict{Int,Task}()
 
     while true
         @debug "checking pool, length=$(length(tsk_pool_done)), count=$tsk_count"
@@ -53,32 +52,64 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
         @debug "checking for interrupt=$interrupted"
         yield()
         interrupted && break
-        @debug "checking for workers, nworkers=$(nworkers()), max=$epmap_maxworkers, #todo=$(length(tsk_pool_todo))"
+
+        @debug "checking for new workers, nworkers=$(nworkers()), max=$epmap_maxworkers, #todo=$(length(tsk_pool_todo))"
         yield()
-        n = min(epmap_maxworkers-nworkers(), epmap_quantum, length(tsk_pool_todo))
-        if n > 0
-            new_pids = epmap_addprocs(n)
-            for new_pid in new_pids
-                load_modules_on_new_workers(new_pid)
-                load_functions_on_new_workers(new_pid)
+
+        new_pids = Int[]
+        for pid in workers()
+            if pid ∉ pids
+                push!(new_pids, pid)
+                push!(pids, pid)
             end
-            for new_pid in new_pids
+        end
+
+        @debug "new_pids=$new_pids, nworkers=$(nworkers()), epmap_nworkers=$(epmap_nworkers())"
+        yield()
+
+        for new_pid in new_pids
+            init_tasks[new_pid] = @async begin
+                @debug "loading modules on $new_pid"
+                yield()
+                load_modules_on_new_workers(new_pid)
+                @debug "loading functions on $new_pid"
+                yield()
+                load_functions_on_new_workers(new_pid)
+                @debug "calling init on new worker"
+                yield()
+                try
+                    epmap_init(new_pid)
+                catch
+                    @warn "problem running epmap_init on $new_pid"
+                end
+                @debug "done loading functions modules, and calling init on $new_pid"
+                yield()
                 _pid_up_timestamp[new_pid] = time()
                 put!(pid_channel, new_pid)
             end
         end
 
+        n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
+        if n > 0
+            epmap_addprocs(n)
+        end
+
         @debug "checking for workers to remove"
+        yield()
         while isready(rm_pid_channel)
             pid = take!(rm_pid_channel)
+            @debug "making sure that $pid is initialized"
+            yield()
+            wait(init_tasks[pid])
             _nworkers = 1 ∈ workers() ? nworkers()-1 : nworkers()
             @debug "removing worker $pid"
+            yield()
             if _nworkers > epmap_minworkers
                 rmprocs(pid)
             end
         end
 
-        sleep(5)
+        sleep(10)
     end
     nothing
 end
@@ -95,20 +126,29 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 * `epmap_maxerrors=Inf` the maximum number of errors before we give-up and exit
 * `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
+* `epmap_usemaster=false` assign tasks to the master process?
+* `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
-* `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[1]
+* `epmap_init=_->nothing` method for arbitrary initialization work on the worker
+* `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
 
 ## Notes
-[1] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
+[1] The number of machines provisioined may be greater than the number of workers in the cluster since with
+some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
+Julia cluster.
+[2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
 """
 function epmap(f::Function, tasks, args...;
         epmap_retries = 0,
         epmap_maxerrors = Inf,
         epmap_minworkers = nworkers(),
         epmap_maxworkers = nworkers(),
+        epmap_usemaster = false,
+        epmap_nworkers = nworkers,
         epmap_quantum = 32,
         epmap_addprocs = epmap_default_addprocs,
+        epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,
         kwargs...)
     tsk_pool_todo = collect(tasks)
@@ -123,7 +163,7 @@ function epmap(f::Function, tasks, args...;
 
     interrupted = false
 
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs)
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     # work loop
     @sync while true
@@ -206,13 +246,20 @@ positional arguments `args` and the named arguments `kwargs` are passed to `f` w
 the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is a Future
 with an assoicated partial reduction.
 
-# pmap_kwargs
+## pmap_kwargs
 * `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
+* `epmap_usemaster=false` assign tasks to the master process?
+* `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
-* `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[1]
 * `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
+
+## Notes
+[1] The number of machines provisioined may be greater than the number of workers in the cluster since with
+some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
+Julia cluster.
+[2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
 
 # Examples
 ## Example 1
@@ -243,24 +290,30 @@ function epmapreduce!(result::AbstractArray{T,N}, f, tasks, args...;
         epmapreduce_id = randstring(6),
         epmap_minworkers = nworkers(),
         epmap_maxworkers = nworkers(),
+        epmap_usemaster = false,
+        epmap_nworkers = nworkers,
         epmap_quantum = 32,
         epmap_addprocs = epmap_default_addprocs,
+        epmap_init = epmap_default_init,
         epmap_scratch = "/scratch",
         kwargs...) where {T,N}
     isdir(epmap_scratch) || mkpath(epmap_scratch)
     empty!(_timers)
     checkpoints = epmapreduce_map(f, tasks, T, size(result), args...;
-        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_scratch=epmap_scratch, kwargs...)
+        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, kwargs...)
     epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_scratch=epmap_scratch)
+        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch)
 end
 
 function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
         epmapreduce_id,
         epmap_minworkers,
         epmap_maxworkers,
+        epmap_usemaster,
+        epmap_nworkers,
         epmap_quantum,
         epmap_addprocs,
+        epmap_init,
         epmap_scratch,
         kwargs...) where {T,N}
     tsk_pool_todo = collect(tasks)
@@ -271,7 +324,7 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
     pid_channel = Channel{Int}(32)
     rm_pid_channel = Channel{Int}(32)
 
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs)
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     localresults = Dict{Int, Future}()
     checkpoints = Dict{Int, Any}()
@@ -412,8 +465,11 @@ function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
         epmapreduce_id,
         epmap_minworkers,
         epmap_maxworkers,
+        epmap_usemaster,
+        epmap_nworkers,
         epmap_quantum,
         epmap_addprocs,
+        epmap_init,
         epmap_scratch) where {T,N}
     @info "reduce loop..."
     n_checkpoints = length(checkpoints)
@@ -426,7 +482,7 @@ function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
     pid_channel = Channel{Int}(32)
     rm_pid_channel = Channel{Int}(32)
     
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, ntsks, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs)
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, ntsks, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     _timers["reduce"] = Dict{Int, Dict{String,Float64}}()
 
