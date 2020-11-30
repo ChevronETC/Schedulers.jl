@@ -208,11 +208,15 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, Float32, (10,), a, b;
-        epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
+    epmap_zeros = ()->zeros(Float32,10)
 
-    tsk = @async Schedulers.epmapreduce_reduce!(zeros(Float32,10), checkpoints;
-        epmapreduce_id=id, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
+    result = epmap_zeros()
+
+    checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, result, a, b;
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
+
+    tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints;
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
 
     rmprocs(workers()[randperm(nworkers())[1]])
 
@@ -245,4 +249,32 @@ end
 
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, structured data test" begin
+    addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    s = randstring(6)
+    @everywhere function foo5(x, tsk, a, b)
+        fetch(x).y::Vector{Float32} .+= a*tsk
+        fetch(x).z::Vector{Float32} .+= b*tsk
+        sleep(1)
+        nothing
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    my_zeros() = (y=zeros(Float32,10),z=zeros(Float32,10))
+    x = my_zeros()
+
+    epmapreduce!(x, foo5, 1:100, a, b;
+        epmap_maxworkers = 10,
+        epmap_scratch = tmpdir,
+        epmap_zeros = my_zeros,
+        epmap_reducer! = (x,y)->(x.y .+= y.y; x.z .+= y.z; nothing))
+
+    @test x.y ≈ sum([a*tsk for tsk in 1:100])*ones(Float32,10)
+    @test x.z ≈ sum([b*tsk for tsk in 1:100])*ones(Float32,10)
 end

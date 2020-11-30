@@ -36,6 +36,34 @@ x = epmapreduce!(zeros(Float64,5), foo, 1:10) # x=[10,10,10,10,10]
 Note that `y` in the above examples is a `Future` that contains the
 partial reduction.
 
+## Parallel map reduce with structured data
+By default the reduction assumes that the object being reduced is a Julia array.
+However, this can be customized to use an arbitrary object by specifying the
+`epmap_zeros` and `epmap_reducer!` key-work arguments.
+```julia
+using Distributed
+
+addprocs(5)
+@everywhere using Distributed, Schedulers
+@everywhere function foo(y, tsk)
+    a = (fetch(y).a)::Vector{Float64}
+    b = (fetch(y).b)::Vector{Float64}
+    a .+= tsk
+    b .+= 2*tsk
+    nothing
+end
+
+@everywhere my_zeros() = (a=zeros(Float64,5), b=zeros(Float64,5))
+@everywhere function my_reducer!(x,y)
+    x.a .+= y.a
+    x.b .+= y.b
+    nothing
+end
+x = epmapreduce!(my_zeros(), foo, 1:10;
+    epmap_zeros = my_zeros,
+    epmap_reducer! = my_reducer!)
+```
+
 ## Parallel map with elasticity
 Both `epmap` and `epmapreduce` can accept `epmap_minworkers` and
 `epmap_maxworkers` key-word arguments to control the elasticity.  In

@@ -1,6 +1,6 @@
 module Schedulers
 
-using Distributed, DistributedOperations, Printf, Random, Statistics
+using Distributed, DistributedOperations, Printf, Random, Serialization, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
@@ -133,7 +133,7 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
-* `epmap_init=_->nothing` method for arbitrary initialization work on the worker
+* `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
 
 ## Notes
@@ -241,6 +241,7 @@ function epmap(f::Function, tasks, args...;
     nothing
 end
 
+default_reducer!(x, y) = x .+= y
 """
     epmapreduce!(result, f, tasks, args...; epmap_kwargs..., kwargs...) -> result
 
@@ -249,13 +250,16 @@ positional arguments `args` and the named arguments `kwargs` are passed to `f` w
 the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is a Future
 with an assoicated partial reduction.
 
-## pmap_kwargs
+## epmap_kwargs
+* `epmap_reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
+* `epmap_zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
 * `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
+* `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
 
 ## Notes
@@ -289,7 +293,9 @@ result = epmapreduce!(zeros(Float32,10), f, 1:100; epmap_scratch=container)
 rmprocs(workers())
 ```
 """
-function epmapreduce!(result::AbstractArray{T,N}, f, tasks, args...;
+function epmapreduce!(result::T, f, tasks, args...;
+        epmap_reducer! = default_reducer!,
+        epmap_zeros = nothing,
         epmapreduce_id = randstring(6),
         epmap_minworkers = nworkers(),
         epmap_maxworkers = nworkers(),
@@ -301,15 +307,20 @@ function epmapreduce!(result::AbstractArray{T,N}, f, tasks, args...;
         epmap_scratch = "/scratch",
         kwargs...) where {T,N}
     isdir(epmap_scratch) || mkpath(epmap_scratch)
+    if epmap_zeros == nothing
+        epmap_zeros = ()->zeros(eltype(result), size(result))::T
+    end
     empty!(_timers)
-    checkpoints = epmapreduce_map(f, tasks, T, size(result), args...;
-        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, kwargs...)
+    checkpoints = epmapreduce_map(f, tasks, result, args...;
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, kwargs...)
     epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=epmapreduce_id, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch)
 end
 
-function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
+function epmapreduce_map(f, tasks, results::T, args...;
         epmapreduce_id,
+        epmap_reducer!,
+        epmap_zeros,
         epmap_minworkers,
         epmap_maxworkers,
         epmap_usemaster,
@@ -318,7 +329,7 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
         epmap_addprocs,
         epmap_init,
         epmap_scratch,
-        kwargs...) where {T,N}
+        kwargs...) where {T}
     tsk_pool_todo = collect(tasks)
     tsk_pool_done = []
     interrupted = false
@@ -343,7 +354,7 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
         pid = take!(pid_channel)
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
-        localresults[pid] = remotecall(zeros, pid, T, n)
+        localresults[pid] = remotecall(epmap_zeros, pid)
         checkpoints[pid] = nothing
 
         _timers["map"][pid] = Dict("cumulative"=>0.0, "restart"=>0.0, "f"=>0.0, "checkpoint"=>0.0, "uptime"=>0.0)
@@ -360,7 +371,7 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
                 local orphan
                 try
                     orphan = pop!(orphans_compute)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(restart, pid, orphan, localresults[pid], T, n)
+                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(restart, pid, epmap_reducer!, orphan, localresults[pid], T)
                 catch e
                     @warn "caught restart error, reduce-in orhpan checkpoing"
                     push!(orphans_compute, orphan)
@@ -371,7 +382,7 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
                 
                 try
                     _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T, n)
+                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                     old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
                     push!(orphans_remove, orphan)
                     old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
@@ -433,7 +444,7 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
             _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
-                _timers["map"][pid]["checkpoint"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T, n)
+                _timers["map"][pid]["checkpoint"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
                 push!(tsk_pool_done, tsk)
             catch e
@@ -464,8 +475,9 @@ function epmapreduce_map(f, tasks, ::Type{T}, n::NTuple{N,Int}, args...;
     filter!(checkpoint->checkpoint != nothing, [collect(values(checkpoints)); orphans_compute...])
 end
 
-function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
+function epmapreduce_reduce!(result::T, checkpoints;
         epmapreduce_id,
+        epmap_reducer!,
         epmap_minworkers,
         epmap_maxworkers,
         epmap_usemaster,
@@ -473,7 +485,7 @@ function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
         epmap_quantum,
         epmap_addprocs,
         epmap_init,
-        epmap_scratch) where {T,N}
+        epmap_scratch) where {T}
     @info "reduce loop..."
     n_checkpoints = length(checkpoints)
     # reduce loop, tsk_pool_todo and tsk_pool_done are not really needed, but lets us reuse the elastic_loop method
@@ -516,7 +528,7 @@ function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
             end
             
             try
-                t_io, t_sum = remotecall_fetch(reduce, pid, checkpoint1, checkpoint2, checkpoint3, T, size(result))
+                t_io, t_sum = remotecall_fetch(reduce, pid, epmap_reducer!, checkpoint1, checkpoint2, checkpoint3, T)
                 _timers["reduce"][pid]["IO"] += t_io
                 _timers["reduce"][pid]["reduce"] += t_sum
                 push!(checkpoints, checkpoint3)
@@ -560,10 +572,10 @@ function epmapreduce_reduce!(result::AbstractArray{T,N}, checkpoints;
     1 ∈ _workers && popfirst!(_workers)
     rmprocs(_workers[1:(length(_workers) - epmap_minworkers)])
 
-    x = read!(checkpoints[1], result)
+    epmap_reducer!(result, deserialize(checkpoints[1]))
     rm_checkpoint(checkpoints[1])
     rm_checkpoint.(orphans_remove)
-    x
+    result
 end
 
 const _timers = Dict{String,Dict{Int,Dict{String,Float64}}}()
@@ -668,20 +680,20 @@ let CID::Int = 1
 end
 next_checkpoint(id, scratch) = joinpath(scratch, string("checkpoint-", id, "-", next_checkpoint_id()))
 
-function reduce(checkpoint1, checkpoint2, checkpoint3, ::Type{T}, n::NTuple{N,Int}) where {T,N}
+function reduce(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
     t_io = @elapsed begin
-        c1 = read!(checkpoint1, Array{T,N}(undef, n))
-        c2 = read!(checkpoint2, Array{T,N}(undef, n))
+        c1 = deserialize(checkpoint1)::T
+        c2 = deserialize(checkpoint2)::T
     end
     t_sum = @elapsed begin
-        c3 = c1 .+ c2
+        reducer!(c2, c1)
     end
-    t_io += @elapsed write(checkpoint3, c3)
+    t_io += @elapsed serialize(checkpoint3, c2)
     t_io, t_sum
 end
 
-save_checkpoint(checkpoint, localresult, ::Type{T}, n::NTuple{N,Int}) where {T,N} = (write(checkpoint, fetch(localresult)::Array{T,N}); nothing)
-restart(orphan, localresult, ::Type{T}, n::NTuple{N,Int}) where {T,N} = (fetch(localresult)::Array{T,N} .+= read!(orphan, Array{T,N}(undef, n)); nothing)
+save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
+restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
 rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
 function handle_process_exited(pid, localresults, checkpoints, orphans)
