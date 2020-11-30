@@ -69,23 +69,26 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
 
         for new_pid in new_pids
             init_tasks[new_pid] = @async begin
-                @debug "loading modules on $new_pid"
-                yield()
-                load_modules_on_new_workers(new_pid)
-                @debug "loading functions on $new_pid"
-                yield()
-                load_functions_on_new_workers(new_pid)
-                @debug "calling init on new worker"
-                yield()
                 try
+                    @debug "loading modules on $new_pid"
+                    yield()
+                    load_modules_on_new_workers(new_pid)
+                    @debug "loading functions on $new_pid"
+                    yield()
+                    load_functions_on_new_workers(new_pid)
+                    @debug "calling init on new worker"
+                    yield()
                     epmap_init(new_pid)
-                catch
+                    @debug "done loading functions modules, and calling init on $new_pid"
+                    yield()
+                    _pid_up_timestamp[new_pid] = time()
+                    put!(pid_channel, new_pid)
+                catch e
                     @warn "problem running epmap_init on $new_pid"
+                    isa(e, ProcessExitedException) && rmprocs(pid)
+                    @warn "TODO"
+                    showerror(e)
                 end
-                @debug "done loading functions modules, and calling init on $new_pid"
-                yield()
-                _pid_up_timestamp[new_pid] = time()
-                put!(pid_channel, new_pid)
             end
         end
 
