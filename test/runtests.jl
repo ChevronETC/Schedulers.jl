@@ -213,10 +213,10 @@ end
     result = epmap_zeros()
 
     checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, result, a, b;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
 
     tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir)
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
 
     rmprocs(workers()[randperm(nworkers())[1]])
 
