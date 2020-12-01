@@ -135,7 +135,7 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
-* `epmap_reportinterval=1` report task assignment at this interval
+* `epmap_reporttasks=true` log task assignment
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -154,7 +154,7 @@ function epmap(f::Function, tasks, args...;
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,
-        epmap_reportinterval = 1,
+        epmap_reporttasks = true,
         kwargs...)
     tsk_pool_todo = collect(tasks)
     tsk_pool_done = []
@@ -201,7 +201,7 @@ function epmap(f::Function, tasks, args...;
             end
 
             try
-                epmap_reportinterval > 0 && rem(tsk_count - length(tsk_pool_todo), epmap_reportinterval) == 0 && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
+                epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
@@ -263,7 +263,7 @@ with an assoicated partial reduction.
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
-* `epmap_reportinterval=1` report task assignment at this interval
+* `epmap_reporttasks=true` log task assignment
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -308,7 +308,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_scratch = "/scratch",
-        epmap_reportinterval = 1,
+        epmap_reporttasks = true,
         kwargs...) where {T,N}
     isdir(epmap_scratch) || mkpath(epmap_scratch)
     if epmap_zeros == nothing
@@ -316,9 +316,9 @@ function epmapreduce!(result::T, f, tasks, args...;
     end
     empty!(_timers)
     checkpoints = epmapreduce_map(f, tasks, result, args...;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reportinterval=epmap_reportinterval, kwargs...)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, kwargs...)
     epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reportinterval=epmap_reportinterval)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks)
 end
 
 function epmapreduce_map(f, tasks, results::T, args...;
@@ -333,7 +333,7 @@ function epmapreduce_map(f, tasks, results::T, args...;
         epmap_addprocs,
         epmap_init,
         epmap_scratch,
-        epmap_reportinterval,
+        epmap_reporttasks,
         kwargs...) where {T}
     tsk_pool_todo = collect(tasks)
     tsk_pool_done = []
@@ -354,7 +354,7 @@ function epmapreduce_map(f, tasks, results::T, args...;
     tic_cumulative = Dict{Int,Float64}()
 
     # task loop
-    epmap_reportinterval > 0 && @info "task loop..."
+    epmap_reporttasks && @info "task loop..."
     @sync while true
         pid = take!(pid_channel)
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
@@ -433,7 +433,7 @@ function epmapreduce_map(f, tasks, results::T, args...;
 
             # compute and reduce
             try
-                epmap_reportinterval > 0 && rem(tsk_count - length(tsk_pool_todo), epmap_reportinterval) == 0 && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
+                epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 _timers["map"][pid]["f"] += @elapsed remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
                 @debug "... task, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
             catch e
@@ -476,7 +476,7 @@ function epmapreduce_map(f, tasks, results::T, args...;
         end
     end
     fetch(_elastic_loop)
-    epmap_reportinterval > 0 && @info "...done task loop"
+    epmap_reporttasks && @info "...done task loop"
     filter!(checkpoint->checkpoint != nothing, [collect(values(checkpoints)); orphans_compute...])
 end
 
@@ -491,8 +491,8 @@ function epmapreduce_reduce!(result::T, checkpoints;
         epmap_addprocs,
         epmap_init,
         epmap_scratch,
-        epmap_reportinterval) where {T}
-    epmap_reportinterval > 0 && @info "reduce loop..."
+        epmap_reporttasks) where {T}
+    epmap_reporttasks && @info "reduce loop..."
     n_checkpoints = length(checkpoints)
     # reduce loop, tsk_pool_todo and tsk_pool_done are not really needed, but lets us reuse the elastic_loop method
     tsk_pool_todo = [1:n_checkpoints-1;]
@@ -571,7 +571,7 @@ function epmapreduce_reduce!(result::T, checkpoints;
         end
     end
     fetch(_elastic_loop)
-    epmap_reportinterval > 0 && @info "...done reduce loop."
+    epmap_reporttasks && @info "...done reduce loop."
 
     # ensure we are left with epmap_minworkers
     _workers = workers()
