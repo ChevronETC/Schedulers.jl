@@ -201,7 +201,7 @@ function epmap(f::Function, tasks, args...;
             end
 
             try
-                epmap_reportinterval > 0 && rem(length(tsk_pool_done), epmap_reportinterval) == 0 && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
+                epmap_reportinterval > 0 && rem(tsk_count - length(tsk_pool_todo), epmap_reportinterval) == 0 && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
@@ -433,7 +433,7 @@ function epmapreduce_map(f, tasks, results::T, args...;
 
             # compute and reduce
             try
-                epmap_reportinterval > 0 && rem(length(tsk_pool_done), epmap_reportinterval) == 0 && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
+                epmap_reportinterval > 0 && rem(tsk_count - length(tsk_pool_todo), epmap_reportinterval) == 0 && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 _timers["map"][pid]["f"] += @elapsed remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
                 @debug "... task, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
             catch e
