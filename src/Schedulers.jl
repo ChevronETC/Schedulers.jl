@@ -93,6 +93,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
         end
 
         n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
+        @debug "add to the cluster?, n=$n, epmap_maxworkers-epmap_nworkers()=$(epmap_maxworkers-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
         if n > 0
             epmap_addprocs(n)
         end
@@ -204,9 +205,9 @@ function epmap(f::Function, tasks, args...;
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
-                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
-                yield()
                 push!(tsk_pool_done, tsk)
+                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo, tsk_pool_done=$tsk_pool_done -!"
+                yield()
             catch e
                 fails[pid] += 1
                 nerrors = sum(values(fails))
