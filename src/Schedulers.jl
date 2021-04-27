@@ -87,7 +87,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
                     @warn "problem running epmap_init on $new_pid"
                     isa(e, ProcessExitedException) && rmprocs(pid)
                     @warn "TODO"
-                    showerror(e)
+                    showerror(stderr, e)
                 end
             end
         end
