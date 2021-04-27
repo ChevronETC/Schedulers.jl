@@ -170,7 +170,6 @@ function epmap(f::Function, tasks, args...;
     rm_pid_channel = Channel{Int}(32)
 
     fails = Dict{Int,Int}()
-    map(pid->fails[pid]=0, workers())
 
     interrupted = false
 
@@ -180,6 +179,7 @@ function epmap(f::Function, tasks, args...;
     @sync while true
         interrupted && break
         pid = take!(pid_channel)
+        fails[pid] = 0
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
         @async while true
