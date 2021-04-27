@@ -95,7 +95,12 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
         n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
         @debug "add to the cluster?, n=$n, epmap_maxworkers-epmap_nworkers()=$(epmap_maxworkers-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
         if n > 0
-            epmap_addprocs(n)
+            try
+                epmap_addprocs(n)
+            catch e
+                @error "problem adding new processes"
+                showerror(stderr, e)
+            end
         end
 
         @debug "checking for workers to remove"
