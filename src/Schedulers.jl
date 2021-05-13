@@ -85,6 +85,10 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
                     put!(pid_channel, new_pid)
                 catch e
                     @warn "problem running epmap_init on $new_pid"
+                    for (exc, bt) in Base.catch_stack()
+                        showerror(stderr, exc, bt)
+                        println()
+                    end
                     isa(e, ProcessExitedException) && rmprocs(new_pid)
                     @warn "TODO"
                     showerror(stderr, e)
