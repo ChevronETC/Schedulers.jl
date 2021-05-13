@@ -41,14 +41,15 @@ end
 # for performance metrics, track when the pid is started
 const _pid_up_timestamp = Dict{Int, Float64}()
 
-function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster, epmap_maxerrors_init)
     pids = epmap_usemaster ? Int[] : [1]
     init_tasks = Dict{Int,Task}()
+    errorstatus = 0
 
     while true
-        @debug "checking pool, length=$(length(tsk_pool_done)), count=$tsk_count"
+        @debug "checking pool, length=$(length(tsk_pool_done)), count=$tsk_count, errorstatus=$errorstatus"
         yield()
-        length(tsk_pool_done) == tsk_count && (put!(pid_channel, -1); break)
+        (length(tsk_pool_done) == tsk_count || errorstatus != 0) && (put!(pid_channel, -1); break)
         @debug "checking for interrupt=$interrupted"
         yield()
         interrupted && break
@@ -67,6 +68,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
         @debug "new_pids=$new_pids, nworkers=$(nworkers()), epmap_nworkers=$(epmap_nworkers())"
         yield()
 
+        nerrors = 0
         for new_pid in new_pids
             init_tasks[new_pid] = @async begin
                 try
@@ -89,8 +91,18 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
                         showerror(stderr, exc, bt)
                         println()
                     end
-                    isa(e, ProcessExitedException) && rmprocs(new_pid)
-                    @warn "TODO"
+                    if isa(e, ProcessExitedException)
+                        rmprocs(new_pid)
+                    else
+                        @warn "TODO"
+                    end
+
+                    nerrors += 1
+                    if nerrors >= epmap_maxerrors_init
+                        errorstatus = 1
+                        @error "too many errors running epmap_init"
+
+                    end
                     showerror(stderr, e)
                 end
             end
@@ -98,7 +110,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
 
         n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
         @debug "add to the cluster?, n=$n, epmap_maxworkers-epmap_nworkers()=$(epmap_maxworkers-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
-        if n > 0
+        if errorstatus == 0 && n > 0
             try
                 epmap_addprocs(n)
             catch e
@@ -136,7 +148,8 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 
 ## pmap_kwargs
 * `epmap_retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
-* `epmap_maxerrors=Inf` the maximum number of errors before we give-up and exit
+* `epmap_maxerrors=Inf` the maximum number of errors when running tasks before we give-up and exit
+* `epmap_maxerrors_init=Inf` the maximum number of errors when running `epmap_init` before we give-up and exit
 * `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
@@ -156,6 +169,7 @@ Julia cluster.
 function epmap(f::Function, tasks, args...;
         epmap_retries = 0,
         epmap_maxerrors = Inf,
+        epmap_maxerrors_init = Inf,
         epmap_minworkers = nworkers(),
         epmap_maxworkers = nworkers(),
         epmap_usemaster = false,
@@ -177,7 +191,7 @@ function epmap(f::Function, tasks, args...;
 
     interrupted = false
 
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster, epmap_maxerrors_init)
 
     # work loop
     @sync while true
@@ -185,7 +199,7 @@ function epmap(f::Function, tasks, args...;
         pid = take!(pid_channel)
         fails[pid] = 0
         @debug "pid=$pid"
-        pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
+        pid == -1 && (interrupted = true; break) # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full or when there are too many init errors.
         @async while true
             interrupted && break
             try
@@ -243,7 +257,9 @@ function epmap(f::Function, tasks, args...;
             end
         end
     end
+    @debug "waiting for elastic loop..."
     fetch(_elastic_loop)
+    @debug "...done waiting for elastic loop."
 
     # ensure we are left with epmap_minworkers
     _workers = workers()
