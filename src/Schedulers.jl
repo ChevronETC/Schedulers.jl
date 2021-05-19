@@ -96,7 +96,14 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
             end
         end
 
-        n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
+        n = 0
+        try
+            n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
+        catch e
+            @warn "problem in Schedulers.jl elastic loop when computing the number of new machines to add"
+            showerror(stdout, e)
+        end
+
         @debug "add to the cluster?, n=$n, epmap_maxworkers-epmap_nworkers()=$(epmap_maxworkers-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
         if n > 0
             try
