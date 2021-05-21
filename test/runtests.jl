@@ -135,6 +135,25 @@ end
     end
 end
 
+@testset "pmap with init errors" begin
+    s = randstring(6)
+    function foo6(tsk)
+        sleep(1)
+        write(joinpath(tempdir(), "task-$s.txt"), "$tsk, $(myid())")
+    end
+    function bar1()
+        thisfunctiondoesnotexist()
+    end
+
+    epmap(foo6, 1:10;
+        epmap_init = pid->remotecall_fetch(bar1, pid),
+        epmap_maxerrors_init = 1,
+        epmap_maxworkers = 5)
+
+    @test isfile(joinpath(tempdir(), "task-$s.txt")) == false
+    rmprocs(workers())
+end
+
 @testset "pmapreduce, stable cluster test" begin
     addprocs(5)
     @everywhere using Distributed, Schedulers, Random
