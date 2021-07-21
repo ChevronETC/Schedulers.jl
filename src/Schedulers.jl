@@ -1,6 +1,6 @@
 module Schedulers
 
-using Distributed, DistributedOperations, Printf, Random, Serialization, Statistics
+using Dates, Distributed, DistributedOperations, Printf, Random, Serialization, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
@@ -15,6 +15,16 @@ function logerror(e)
     @warn String(take!(io))
     close(io)
 end
+
+function journal_init(tsks)
+    journal = Dict()
+    for tsk in tsks
+        journal[tsk] = Dict[]
+    end
+    journal
+end
+journal_start!(journal, tsk; pid, hostname) = push!(journal[tsk], Dict("pid"=>pid, "hostname"=>hostname, "start"=>Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")))
+journal_stop!(journal, tsk) = journal[tsk][end]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
 
 function load_modules_on_new_workers(pid)
     _names = names(Main; imported=true)
@@ -193,6 +203,8 @@ function epmap(f::Function, tasks, args...;
 
     _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
+    journal = journal_init(tasks)
+
     # work loop
     @sync while true
         interrupted && break
@@ -208,6 +220,7 @@ function epmap(f::Function, tasks, args...;
         else
             @warn "worker with pid=$pid is not registered"
         end
+        hostname = remotecall_fetch(gethostname, pid)
         @async while true
             interrupted && break
             try
@@ -235,7 +248,9 @@ function epmap(f::Function, tasks, args...;
             try
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 yield()
+                journal_start!(journal, tsk; pid, hostname)
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
+                journal_stop!(journal, tsk)
                 push!(tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo, tsk_pool_done=$tsk_pool_done -!"
                 yield()
@@ -283,7 +298,7 @@ function epmap(f::Function, tasks, args...;
     1 ∈ _workers && popfirst!(_workers)
     rmprocs(_workers[1:(length(_workers) - epmap_minworkers)])
 
-    nothing
+    journal
 end
 
 default_reducer!(x, y) = x .+= y
