@@ -6,6 +6,16 @@ epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
 epmap_default_init = pid->nothing
 
+function logerror(e)
+    io = IOBuffer()
+    for (exc, bt) in Base.catch_stack()
+        showerror(io, exc, bt)
+        println(io)
+    end
+    @warn String(take!(io))
+    close(io)
+end
+
 function load_modules_on_new_workers(pid)
     _names = names(Main; imported=true)
     for _name in _names
@@ -85,10 +95,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
                     put!(pid_channel, new_pid)
                 catch e
                     @warn "problem running epmap_init on $new_pid"
-                    for (exc, bt) in Base.catch_stack()
-                        showerror(stderr, exc, bt)
-                        println()
-                    end
+                    logerror(e)
                     isa(e, ProcessExitedException) && rmprocs(new_pid)
                     @warn "TODO"
                     showerror(stderr, e)
@@ -238,7 +245,7 @@ function epmap(f::Function, tasks, args...;
                 fails[pid] += 1
                 nerrors = sum(values(fails))
                 @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid..."
-                showerror(stderr, e)
+                logerror(e)
                 push!(tsk_pool_todo, tsk)
                 if isa(e, InterruptException)
                     interrupted = true

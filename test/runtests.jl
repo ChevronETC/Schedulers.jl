@@ -1,4 +1,4 @@
-using Distributed, Random, Test
+using Distributed, Logging, Random, Test
 
 @testset "pmap, stable cluster test" begin
     addprocs(5)
@@ -277,4 +277,17 @@ end
 
     @test x.y ≈ sum([a*tsk for tsk in 1:100])*ones(Float32,10)
     @test x.z ≈ sum([b*tsk for tsk in 1:100])*ones(Float32,10)
+end
+
+@testset "logerror" begin
+    try
+        notafunction()
+    catch e
+        io = IOBuffer()
+        with_logger(ConsoleLogger(io, Logging.Info)) do
+            Schedulers.logerror(e)
+        end
+        s = String(take!(io))
+        @test contains(s, "notafunction")
+    end
 end
