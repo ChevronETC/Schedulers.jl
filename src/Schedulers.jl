@@ -24,7 +24,11 @@ function journal_init(tsks)
     journal
 end
 journal_start!(journal, tsk; pid, hostname) = push!(journal[tsk], Dict("pid"=>pid, "hostname"=>hostname, "start"=>Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")))
-journal_stop!(journal, tsk) = journal[tsk][end]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
+
+function journal_stop!(journal, tsk; fault)
+    journal[tsk][end]["status"] = fault ? "failed" : "succeeded"
+    journal[tsk][end]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
+end
 
 function load_modules_on_new_workers(pid)
     _names = names(Main; imported=true)
@@ -250,11 +254,12 @@ function epmap(f::Function, tasks, args...;
                 yield()
                 journal_start!(journal, tsk; pid, hostname)
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
-                journal_stop!(journal, tsk)
+                journal_stop!(journal, tsk; fault=false)
                 push!(tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo, tsk_pool_done=$tsk_pool_done -!"
                 yield()
             catch e
+                journal_stop!(journal, tsk; fault=true)
                 fails[pid] += 1
                 nerrors = sum(values(fails))
                 @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid..."
