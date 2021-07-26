@@ -135,6 +135,44 @@ end
     end
 end
 
+@testset "pmap with interactive growing cluster" begin
+    addprocs(2)
+    @everywhere using Distributed, Schedulers
+    s = randstring(6)
+    @everywhere function foo2(tsk, s)
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk, $(myid())")
+        sleep(10)
+    end
+
+    _nworkers = 5
+
+    tsk = @async epmap(foo2, 1:100, s; epmap_maxworkers=()->_nworkers, epmap_minworkers=()->_nworkers)
+
+    sleep(15)
+    _nworkers = 10
+
+    wait(tsk)
+
+    h = Dict()
+    for w in workers()
+        h[w] = 0
+    end
+
+    rmprocs(workers())
+
+    for tsk = 1:100
+        r = read(joinpath(tempdir(), "task-$s-$tsk.txt"), String)
+        r_tsk, r_pid = split(r, ",")
+        h[parse(Int,r_pid)] += 1
+        @test r_tsk == "$tsk"
+        rm(joinpath(tempdir(), "task-$s-$tsk.txt"))
+    end
+
+    for (key,value) in h
+        @test value ∈ 5:25
+    end
+end
+
 @testset "pmapreduce, stable cluster test" begin
     addprocs(5)
     @everywhere using Distributed, Schedulers, Random
@@ -213,10 +251,10 @@ end
     result = epmap_zeros()
 
     checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, result, a, b;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
 
     tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers(), epmap_maxworkers=nworkers(), epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
 
     rmprocs(workers()[randperm(nworkers())[1]])
 
@@ -244,6 +282,41 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=10, epmap_scratch=tmpdir)
+    rmprocs(workers())
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+
+    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, interactive growing cluster test" begin
+    addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    s = randstring(6)
+    @everywhere function foo4(x, tsk, a, b)
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        sleep(5)
+        nothing
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    _nworkers = 10
+
+    local x
+    tsk = @async begin
+        x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=()->_nworkers, epmap_scratch=tmpdir)
+    end
+
+    sleep(20)
+    _nworkers = 10
+    sleep(20)
+    @test nworkers() == 10
+
+    wait(tsk)
+
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 

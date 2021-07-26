@@ -77,7 +77,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
         yield()
         interrupted && break
 
-        @debug "checking for new workers, nworkers=$(nworkers()), max=$epmap_maxworkers, #todo=$(length(tsk_pool_todo))"
+        @debug "checking for new workers, nworkers=$(nworkers()), max=$(epmap_maxworkers()), #todo=$(length(tsk_pool_todo))"
         yield()
 
         new_pids = Int[]
@@ -117,13 +117,13 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
 
         n = 0
         try
-            n = min(epmap_maxworkers-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
+            n = min(epmap_maxworkers()-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
         catch e
             @warn "problem in Schedulers.jl elastic loop when computing the number of new machines to add"
-            showerror(stdout, e)
+            logerror(e)
         end
 
-        @debug "add to the cluster?, n=$n, epmap_maxworkers-epmap_nworkers()=$(epmap_maxworkers-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
+        @debug "add to the cluster?, n=$n, epmap_maxworkers()-epmap_nworkers()=$(epmap_maxworkers()-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
         if n > 0
             try
                 epmap_addprocs(n)
@@ -143,7 +143,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
             _nworkers = 1 ∈ workers() ? nworkers()-1 : nworkers()
             @debug "removing worker $pid"
             yield()
-            if _nworkers > epmap_minworkers
+            if _nworkers > epmap_minworkers()
                 rmprocs(pid)
             end
         end
@@ -163,8 +163,8 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 ## pmap_kwargs
 * `epmap_retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `epmap_maxerrors=Inf` the maximum number of errors before we give-up and exit
-* `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
-* `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
+* `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
+* `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
@@ -182,8 +182,8 @@ Julia cluster.
 function epmap(f::Function, tasks, args...;
         epmap_retries = 0,
         epmap_maxerrors = Inf,
-        epmap_minworkers = nworkers(),
-        epmap_maxworkers = nworkers(),
+        epmap_minworkers = nworkers,
+        epmap_maxworkers = nworkers,
         epmap_usemaster = false,
         epmap_nworkers = nworkers,
         epmap_quantum = 32,
@@ -205,7 +205,10 @@ function epmap(f::Function, tasks, args...;
 
     interrupted = false
 
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+    _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
+    _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
+
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, _epmap_minworkers, _epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     journal = journal_init(tasks)
 
@@ -301,7 +304,7 @@ function epmap(f::Function, tasks, args...;
     # ensure we are left with epmap_minworkers
     _workers = workers()
     1 ∈ _workers && popfirst!(_workers)
-    rmprocs(_workers[1:(length(_workers) - epmap_minworkers)])
+    rmprocs(_workers[1:(length(_workers) - _epmap_minworkers())])
 
     journal
 end
@@ -318,8 +321,8 @@ with an assoicated partial reduction.
 ## epmap_kwargs
 * `epmap_reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
 * `epmap_zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
-* `epmap_minworkers=nworkers()` the minimum number of workers to elastically shrink to
-* `epmap_maxworkers=nworkers()` the maximum number of workers to elastically expand to
+* `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
+* `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=32` the maximum number of workers to elastically add at a time
@@ -363,8 +366,8 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_reducer! = default_reducer!,
         epmap_zeros = nothing,
         epmapreduce_id = randstring(6),
-        epmap_minworkers = nworkers(),
-        epmap_maxworkers = nworkers(),
+        epmap_minworkers = nworkers,
+        epmap_maxworkers = nworkers,
         epmap_usemaster = false,
         epmap_nworkers = nworkers,
         epmap_quantum = 32,
@@ -377,11 +380,15 @@ function epmapreduce!(result::T, f, tasks, args...;
     if epmap_zeros == nothing
         epmap_zeros = ()->zeros(eltype(result), size(result))::T
     end
+
+    _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
+    _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
+
     empty!(_timers)
     checkpoints = epmapreduce_map(f, tasks, result, args...;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, kwargs...)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, kwargs...)
     epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=epmap_minworkers, epmap_maxworkers=epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks)
 end
 
 function epmapreduce_map(f, tasks, results::T, args...;
@@ -639,7 +646,7 @@ function epmapreduce_reduce!(result::T, checkpoints;
     # ensure we are left with epmap_minworkers
     _workers = workers()
     1 ∈ _workers && popfirst!(_workers)
-    rmprocs(_workers[1:(length(_workers) - epmap_minworkers)])
+    rmprocs(_workers[1:(length(_workers) - epmap_minworkers())])
 
     epmap_reducer!(result, deserialize(checkpoints[1]))
     rm_checkpoint(checkpoints[1])
