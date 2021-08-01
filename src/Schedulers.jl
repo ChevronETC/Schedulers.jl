@@ -115,15 +115,17 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
             end
         end
 
+        _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = epmap_nworkers(),epmap_minworkers(),epmap_maxworkers(),epmap_quantum()
+
         n = 0
         try
-            n = min(epmap_maxworkers()-epmap_nworkers(), epmap_quantum, length(tsk_pool_todo))
+            n = min(_epmap_maxworkers-_epmap_nworkers, _epmap_quantum, length(tsk_pool_todo))
         catch e
             @warn "problem in Schedulers.jl elastic loop when computing the number of new machines to add"
             logerror(e)
         end
 
-        @debug "add to the cluster?, n=$n, epmap_maxworkers()-epmap_nworkers()=$(epmap_maxworkers()-epmap_nworkers()), epmap_quantum=$epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
+        @debug "add to the cluster?, n=$n, epmap_maxworkers()-epmap_nworkers()=$(_epmap_maxworkers-_epmap_nworkers), epmap_quantum=$_epmap_quantum, length(tsk_pool_todo)=$(length(tsk_pool_todo))"
         if n > 0
             try
                 epmap_addprocs(n)
@@ -143,7 +145,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
             _nworkers = 1 ∈ workers() ? nworkers()-1 : nworkers()
             @debug "removing worker $pid"
             yield()
-            if _nworkers > epmap_minworkers()
+            if _nworkers > _epmap_minworkers
                 rmprocs(pid)
             end
         end
@@ -167,7 +169,7 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 * `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
-* `epmap_quantum=32` the maximum number of workers to elastically add at a time
+* `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
@@ -186,7 +188,7 @@ function epmap(f::Function, tasks, args...;
         epmap_maxworkers = nworkers,
         epmap_usemaster = false,
         epmap_nworkers = nworkers,
-        epmap_quantum = 32,
+        epmap_quantum = ()->32,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,
@@ -207,8 +209,9 @@ function epmap(f::Function, tasks, args...;
 
     _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
     _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
+    _epmap_quantum = isa(epmap_quantum, Function) ? epmap_quantum : ()->epmap_quantum
 
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, _epmap_minworkers, _epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, _epmap_minworkers, _epmap_maxworkers, _epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     journal = journal_init(tasks)
 
@@ -325,7 +328,7 @@ with an assoicated partial reduction.
 * `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
-* `epmap_quantum=32` the maximum number of workers to elastically add at a time
+* `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
@@ -370,7 +373,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_maxworkers = nworkers,
         epmap_usemaster = false,
         epmap_nworkers = nworkers,
-        epmap_quantum = 32,
+        epmap_quantum = ()->32,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_scratch = "/scratch",
@@ -383,12 +386,13 @@ function epmapreduce!(result::T, f, tasks, args...;
 
     _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
     _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
+    _epmap_quantum = isa(epmap_quantum, Function) ? epmap_quantum : ()->epmap_quantum
 
     empty!(_timers)
     checkpoints = epmapreduce_map(f, tasks, result, args...;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, kwargs...)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=_epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, kwargs...)
     epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=_epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks)
 end
 
 function epmapreduce_map(f, tasks, results::T, args...;
