@@ -23,11 +23,11 @@ function journal_init(tsks)
     end
     journal
 end
-journal_start!(journal, tsk; pid, hostname) = push!(journal[tsk], Dict("pid"=>pid, "hostname"=>hostname, "start"=>Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")))
+journal_start!(journal, tsk; pid, hostname) = push!(journal[tsk], Dict("pid"=>pid, "hostname"=>hostname, "start"=>Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")))
 
 function journal_stop!(journal, tsk; fault)
     journal[tsk][end]["status"] = fault ? "failed" : "succeeded"
-    journal[tsk][end]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
+    journal[tsk][end]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
 end
 
 function load_modules_on_new_workers(pid)
