@@ -77,7 +77,16 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
         yield()
         interrupted && break
 
-        @debug "checking for new workers, nworkers=$(nworkers()), max=$(epmap_maxworkers()), #todo=$(length(tsk_pool_todo))"
+        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum
+        try
+            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = epmap_nworkers(),epmap_minworkers(),epmap_maxworkers(),epmap_quantum()
+        catch e
+            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers,quantum"
+            logerror(e)
+            continue
+        end
+
+        @debug "checking for new workers, nworkers=$(nworkers()), max=$_epmap_maxworkers, #todo=$(length(tsk_pool_todo))"
         yield()
 
         new_pids = Int[]
@@ -88,7 +97,7 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
             end
         end
 
-        @debug "new_pids=$new_pids, nworkers=$(nworkers()), epmap_nworkers=$(epmap_nworkers())"
+        @debug "new_pids=$new_pids, nworkers=$(nworkers()), epmap_nworkers=$_epmap_nworkers"
         yield()
 
         for new_pid in new_pids
@@ -115,8 +124,6 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
             end
         end
 
-        _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = epmap_nworkers(),epmap_minworkers(),epmap_maxworkers(),epmap_quantum()
-
         n = 0
         try
             n = min(_epmap_maxworkers-_epmap_nworkers, _epmap_quantum, length(tsk_pool_todo))
@@ -131,23 +138,28 @@ function elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo,
                 epmap_addprocs(n)
             catch e
                 @error "problem adding new processes"
-                showerror(stderr, e)
+                logerror(e)
             end
         end
 
         @debug "checking for workers to remove"
         yield()
-        while isready(rm_pid_channel)
-            pid = take!(rm_pid_channel)
-            @debug "making sure that $pid is initialized"
-            yield()
-            wait(init_tasks[pid])
-            _nworkers = 1 ∈ workers() ? nworkers()-1 : nworkers()
-            @debug "removing worker $pid"
-            yield()
-            if _nworkers > _epmap_minworkers
-                rmprocs(pid)
+        try
+            while isready(rm_pid_channel)
+                pid = take!(rm_pid_channel)
+                @debug "making sure that $pid is initialized"
+                yield()
+                wait(init_tasks[pid])
+                _nworkers = 1 ∈ workers() ? nworkers()-1 : nworkers()
+                @debug "removing worker $pid"
+                yield()
+                if _nworkers > _epmap_minworkers
+                    rmprocs(pid)
+                end
             end
+        catch e
+            @warn "problem in Schedulers.jl elastic loop when removing workers"
+            logerror(e)
         end
 
         sleep(10)
