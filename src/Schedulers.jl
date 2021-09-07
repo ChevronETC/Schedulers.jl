@@ -16,6 +16,29 @@ function logerror(e)
     close(io)
 end
 
+function handle_process_exited_exception(pid, wrkrs)
+    if haskey(Distributed.map_pid_wrkr, pid)
+        @debug "pid=$pid is known to Distributed, calling rmprocs"
+        rmprocs(pid)
+    else
+        @debug "pid=$pid is not known to Distributed, calling kill"
+        try
+            # required for cluster managers that require clean-up when the julia process on a worker dies:
+            Distributed.kill(wrkrs[pid].manager, pid, wrkrs[pid].config)
+        catch
+        end
+    end
+    delete!(wrkrs, pid)
+end
+
+function handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans)
+    handle_process_exited_exception(pid, wrkrs)
+    pop!(localresults, pid)
+    checkpoint = pop!(checkpoints, pid)
+    checkpoint == nothing || push!(orphans, checkpoint)
+    nothing
+end
+
 function journal_init(tsks)
     journal = Dict()
     for tsk in tsks
@@ -289,18 +312,7 @@ function epmap(f::Function, tasks, args...;
                     throw(e)
                 elseif isa(e, ProcessExitedException)
                     @warn "process with id=$pid exited, removing from process list"
-                    if haskey(Distributed.map_pid_wrkr, pid)
-                        @debug "pid=$pid is known to Distributed, calling rmprocs"
-                        rmprocs(pid)
-                    else
-                        @debug "pid=$pid is not known to Distributed, calling kill"
-                        try
-                            # required for cluster managers that require clean-up when the julia process on a worker dies:
-                            Distributed.kill(wrkrs[pid].manager, pid, wrkrs[pid].config)
-                        catch
-                        end
-                    end
-                    delete!(wrkrs, pid)
+                    handle_process_exited_exception(pid, wrkrs)
                     break
                 elseif nerrors >= epmap_maxerrors
                     interrupted = true
@@ -429,7 +441,13 @@ function epmapreduce_map(f, tasks, results::T, args...;
     pid_channel = Channel{Int}(32)
     rm_pid_channel = Channel{Int}(32)
 
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+    wrkrs = Dict{Int, Distributed.Worker}()
+
+    _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
+    _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
+    _epmap_quantum = isa(epmap_quantum, Function) ? epmap_quantum : ()->epmap_quantum
+
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, tsk_count, interrupted, _epmap_minworkers, _epmap_maxworkers, _epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     localresults = Dict{Int, Future}()
     checkpoints = Dict{Int, Any}()
@@ -448,6 +466,12 @@ function epmapreduce_map(f, tasks, results::T, args...;
         localresults[pid] = remotecall(epmap_zeros, pid)
         checkpoints[pid] = nothing
 
+        if haskey(Distributed.map_pid_wrkr, pid)
+            wrkrs[pid] = Distributed.map_pid_wrkr[pid]
+        else
+            @warn "worker with pid=$pid is not registered"
+        end
+
         _timers["map"][pid] = Dict("cumulative"=>0.0, "restart"=>0.0, "f"=>0.0, "checkpoint"=>0.0, "uptime"=>0.0)
 
         tic_cumulative[pid] = time()
@@ -465,8 +489,9 @@ function epmapreduce_map(f, tasks, results::T, args...;
                     _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(restart, pid, epmap_reducer!, orphan, localresults[pid], T)
                 catch e
                     @warn "caught restart error, reduce-in orhpan checkpoing"
+                    logerror(e)
                     push!(orphans_compute, orphan)
-                    isa(e, ProcessExitedException) && (rmprocs(pid); break)
+                    isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
                     error("TODO")
                     throw(e)
                 end
@@ -479,8 +504,9 @@ function epmapreduce_map(f, tasks, results::T, args...;
                     old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
                 catch e
                     @warn "caught restart error, checkpointing"
-                    showerror(stdout, e)
-                    isa(e, ProcessExitedException) && (push!(orphans_compute, orphan); rmprocs(pid); break)
+                    logerror(e)
+                    push!(orphans_compute, orphan)
+                    isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
                     error("TODO")
                     throw(e)
                 end
@@ -496,8 +522,9 @@ function epmapreduce_map(f, tasks, results::T, args...;
                     _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(rm_checkpoint, pid, orphan)
                 catch e
                     @warn "caught restart error, clean-up"
+                    logerror(e)
                     push!(orphans_remove, orphan)
-                    isa(e, ProcessExitedException) && (rmprocs(pid); break)
+                    isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
                     error("TODO")
                     throw(e)
                 end
@@ -520,13 +547,14 @@ function epmapreduce_map(f, tasks, results::T, args...;
             # compute and reduce
             try
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
+                yield()
                 _timers["map"][pid]["f"] += @elapsed remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
                 @debug "... task, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
             catch e
                 @warn "pid=$pid, task loop, caught exception during f eval"
+                logerror(e)
                 push!(tsk_pool_todo, tsk)
-                isa(e, ProcessExitedException) && (handle_process_exited(pid, localresults, checkpoints, orphans_compute); break)
-                showerror(stdout, e)
+                isa(e, ProcessExitedException) && (handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans_compute); break)
                 error("TODO")
                 throw(e)
             end
@@ -540,8 +568,8 @@ function epmapreduce_map(f, tasks, results::T, args...;
                 push!(tsk_pool_done, tsk)
             catch e
                 @warn "pid=$pid, task loop, caught exception during save_checkpoint"
-                isa(e, ProcessExitedException) && (push!(tsk_pool_todo, tsk); handle_process_exited(pid, localresults, checkpoints, orphans_compute); break)
-                showerror(stdout, e)
+                logerror(e)
+                isa(e, ProcessExitedException) && (push!(tsk_pool_todo, tsk); handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans_compute); break)
                 error("TODO")
                 throw(e)
             end
@@ -554,8 +582,9 @@ function epmapreduce_map(f, tasks, results::T, args...;
                 end
             catch e
                 @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
+                logerror(e)
                 old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
-                isa(e, ProcessExitedException) && (handle_process_exited(pid, localresults, checkpoints, orphans_remove); break)
+                isa(e, ProcessExitedException) && (handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans_remove); break)
                 error("TODO")
                 throw(e)
             end
@@ -588,8 +617,14 @@ function epmapreduce_reduce!(result::T, checkpoints;
 
     pid_channel = Channel{Int}(32)
     rm_pid_channel = Channel{Int}(32)
+
+    wrkrs = Dict{Int, Distributed.Worker}()
+
+    _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
+    _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
+    _epmap_quantum = isa(epmap_quantum, Function) ? epmap_quantum : ()->epmap_quantum
     
-    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, ntsks, interrupted, epmap_minworkers, epmap_maxworkers, epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
+    _elastic_loop = @async elastic_loop(pid_channel, rm_pid_channel, tsk_pool_done, tsk_pool_todo, ntsks, interrupted, _epmap_minworkers, _epmap_maxworkers, _epmap_quantum, epmap_addprocs, epmap_init, epmap_nworkers, epmap_usemaster)
 
     _timers["reduce"] = Dict{Int, Dict{String,Float64}}()
 
@@ -599,6 +634,12 @@ function epmapreduce_reduce!(result::T, checkpoints;
         pid = take!(pid_channel)
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
+
+        if haskey(Distributed.map_pid_wrkr, pid)
+            wrkrs[pid] = Distributed.map_pid_wrkr[pid]
+        else
+            @warn "worker with pid=$pid is not registered"
+        end
 
         _timers["reduce"][pid] = Dict("cumulative"=>0.0, "reduce"=>0.0, "IO"=>0.0, "cleanup"=>0.0, "uptime"=>0.0)
 
@@ -627,10 +668,10 @@ function epmapreduce_reduce!(result::T, checkpoints;
                 push!(tsk_pool_done, tsk)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during reduce"
-                showerror(stdout, e)
+                logerror(e)
                 push!(checkpoints, checkpoint1, checkpoint2)
                 push!(tsk_pool_todo, tsk)
-                isa(e, ProcessExitedException) && (rmprocs(pid); break)
+                isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
                 error("TODO")
                 throw(e)
             end
@@ -639,8 +680,9 @@ function epmapreduce_reduce!(result::T, checkpoints;
                 _timers["reduce"][pid]["cleanup"] += @elapsed remotecall_fetch(rm_checkpoint, pid, checkpoint1)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 1"
+                logerror(e)
                 push!(orphans_remove, checkpoint1, checkpoint2)
-                isa(e, ProcessExitedException) && (rmprocs(pid); break)
+                isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
                 error("TODO")
                 throw(e)
             end
@@ -649,8 +691,9 @@ function epmapreduce_reduce!(result::T, checkpoints;
                 _timers["reduce"][pid]["cleanup"] += @elapsed remotecall_fetch(rm_checkpoint, pid, checkpoint2)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 2"
+                logerror(e)
                 push!(orphans_remove, checkpoint2)
-                isa(e, ProcessExitedException) && (rmprocs(pid) && break)
+                isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
                 error("TODO")
                 throw(e)
             end
@@ -787,14 +830,6 @@ end
 save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
 restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
 rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
-
-function handle_process_exited(pid, localresults, checkpoints, orphans)
-    rmprocs(pid)
-    pop!(localresults, pid)
-    checkpoint = pop!(checkpoints, pid)
-    checkpoint == nothing || push!(orphans, checkpoint)
-    nothing
-end
 
 export epmap, epmapreduce!
 
