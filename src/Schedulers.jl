@@ -238,7 +238,7 @@ function epmap(f::Function, tasks, args...;
 
     fails = Dict{Int,Int}()
 
-    wrkrs = Dict{Int, Distributed.Worker}()
+    wrkrs = Dict{Int, Union{Distributed.LocalProcess, Distributed.Worker}}()
 
     interrupted = false
 
