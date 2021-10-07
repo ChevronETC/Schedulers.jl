@@ -191,7 +191,7 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
-@testset "pmapreduce, cluster with faults during tasks" begin
+@testset "pmapreduce, cluster with ProcessExitedException during tasks" begin
     # TODO, how do we excersie the differnt fault mechanisms in the task loop
     #       1. fault during a f eval
     #       2. fault during checkpoint
@@ -226,6 +226,65 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "pmapreduce, cluster with RemoteException during tasks" begin
+    addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    s = randstring(6)
+    @everywhere function foo5(x, tsk, a, b, toggle, fault_id)
+        _toggle = fetch(toggle)
+        if myid() == fault_id && _toggle[1]
+            _toggle[1] = false
+            error("throwing an error")
+        end
+
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        sleep(1)
+        nothing
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    _pid = workers()[randperm(nworkers())[1]]
+    toggle = remotecall_wait(()->[true], _pid)
+    x = epmapreduce!(zeros(Float32,10), foo5, 1:10, a, b, toggle, _pid; epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=Inf)
+
+    @test nworkers() == 5
+    rmprocs(workers())
+
+    @test x ≈ sum(a*b*[1:10;]) * ones(10)
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, cluster with RemoteException during tasks, and max errors triggered" begin
+    addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    s = randstring(6)
+    @everywhere function foo5(x, tsk, a, b, toggle, fault_id)
+        _toggle = fetch(toggle)
+        if myid() == fault_id && _toggle[1]
+            _toggle[1] = false
+            error("throwing an error")
+        end
+
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        sleep(1)
+        nothing
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    _pid = workers()[randperm(nworkers())[1]]
+    toggle = remotecall_wait(()->[true], _pid)
+    @test_throws Exception epmapreduce!(zeros(Float32,10), foo5, 1:10, a, b, toggle, _pid; epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
+
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "pmapreduce, cluster with faults during reduce" begin
     # TODO, how do we excersie the differnt fault mechanisms in the task loop
     #       1. fault during reduce
@@ -251,7 +310,7 @@ end
     result = epmap_zeros()
 
     checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, result, a, b;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
 
     tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints;
         epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)

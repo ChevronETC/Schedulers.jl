@@ -8,12 +8,23 @@ epmap_default_init = pid->nothing
 
 function logerror(e)
     io = IOBuffer()
+    showerror(io, e)
+    write(io, "\n\terror type: $(typeof(e))\n")
     for (exc, bt) in Base.catch_stack()
         showerror(io, exc, bt)
         println(io)
     end
     @warn String(take!(io))
     close(io)
+end
+
+handle_checkpoints!(pid, localresults::Nothing, checkpoints, orphans) = nothing
+
+function handle_checkpoints!(pid, localresults, checkpoints, orphans)
+    pop!(localresults, pid)
+    checkpoint = pop!(checkpoints, pid)
+    checkpoint == nothing || push!(orphans, checkpoint)
+    nothing
 end
 
 function handle_process_exited_exception(pid, wrkrs)
@@ -31,12 +42,47 @@ function handle_process_exited_exception(pid, wrkrs)
     delete!(wrkrs, pid)
 end
 
-function handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans)
-    handle_process_exited_exception(pid, wrkrs)
-    pop!(localresults, pid)
-    checkpoint = pop!(checkpoints, pid)
-    checkpoint == nothing || push!(orphans, checkpoint)
-    nothing
+function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans)
+    logerror(e)
+
+    fails[pid] += 1
+    nerrors = sum(values(fails))
+
+    r = (do_break=false, do_interrupt=false)
+
+    if isa(e, InterruptException)
+        r = (do_break=false, do_interrupt=true)
+        put!(pid_channel, -1)
+        throw(e)
+    elseif isa(e, ProcessExitedException)
+        handle_process_exited_exception(pid, wrkrs)
+        r = (do_break=true, do_interrupt=false)
+    elseif nerrors >= epmap_maxerrors
+        put!(pid_channel, -1)
+        error("too many errors, $nerrors errors")
+    elseif fails[pid] > epmap_retries+1
+        @warn "too many failures on process with id=$pid, removing from proces list"
+        rmprocs(pid)
+        delete!(wrkrs, pid)
+        r = (do_break=true, do_interrupt=false)
+    end
+
+    handle_checkpoints!(pid, localresults, checkpoints, orphans)
+    r
+end
+handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries) = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, nothing, nothing, nothing)
+
+function check_for_preempted(pid, epmap_preempted)
+    preempted = false
+    try
+        if remotecall_fetch(epmap_preempted, pid)
+            rmprocs(pid)
+            preempted = true
+        end
+    catch e
+        @debug "unable to call preempted method"
+    end
+    preempted
 end
 
 function journal_init(tsks)
@@ -268,14 +314,7 @@ function epmap(f::Function, tasks, args...;
         hostname = remotecall_fetch(gethostname, pid)
         @async while true
             interrupted && break
-            try
-                if remotecall_fetch(epmap_preempted, pid)
-                    rmprocs(pid)
-                    break
-                end
-            catch e
-                @debug "unable to call preempted method"
-            end
+            check_for_preempted(pid, epmap_preempted) && break
 
             isempty(tsk_pool_todo) && (put!(rm_pid_channel, pid); break)
             length(tsk_pool_done) == tsk_count && break
@@ -348,6 +387,8 @@ with an assoicated partial reduction.
 ## epmap_kwargs
 * `epmap_reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
 * `epmap_zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
+* `epmap_retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
+* `epmap_maxerrors=Inf` the maximum number of errors before we give-up and exit
 * `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
@@ -400,8 +441,11 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_quantum = ()->32,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
+        epmap_preempted = epmap_default_preempted,
         epmap_scratch = "/scratch",
         epmap_reporttasks = true,
+        epmap_maxerrors = Inf,
+        epmap_retries = 0,
         kwargs...) where {T,N}
     isdir(epmap_scratch) || mkpath(epmap_scratch)
     if epmap_zeros == nothing
@@ -414,7 +458,7 @@ function epmapreduce!(result::T, f, tasks, args...;
 
     empty!(_timers)
     checkpoints = epmapreduce_map(f, tasks, result, args...;
-        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=_epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, kwargs...)
+        epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=_epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_preempted=epmap_preempted, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks, epmap_maxerrors=epmap_maxerrors, epmap_retries=epmap_retries, kwargs...)
     epmapreduce_reduce!(result, checkpoints;
         epmapreduce_id=epmapreduce_id, epmap_reducer! = epmap_reducer!, epmap_minworkers=_epmap_minworkers, epmap_maxworkers=_epmap_maxworkers, epmap_usemaster=epmap_usemaster, epmap_nworkers=epmap_nworkers, epmap_quantum=_epmap_quantum, epmap_addprocs=epmap_addprocs, epmap_init=epmap_init, epmap_scratch=epmap_scratch, epmap_reporttasks=epmap_reporttasks)
 end
@@ -430,18 +474,24 @@ function epmapreduce_map(f, tasks, results::T, args...;
         epmap_quantum,
         epmap_addprocs,
         epmap_init,
+        epmap_preempted,
         epmap_scratch,
         epmap_reporttasks,
+        epmap_maxerrors,
+        epmap_retries,
         kwargs...) where {T}
     tsk_pool_todo = collect(tasks)
     tsk_pool_done = []
-    interrupted = false
     tsk_count = length(tsk_pool_todo)
 
     pid_channel = Channel{Int}(32)
     rm_pid_channel = Channel{Int}(32)
 
+    fails = Dict{Int,Int}()
+
     wrkrs = Dict{Int, Distributed.Worker}()
+
+    interrupted = false
 
     _epmap_minworkers = isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers
     _epmap_maxworkers = isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers
@@ -460,11 +510,16 @@ function epmapreduce_map(f, tasks, results::T, args...;
     # task loop
     epmap_reporttasks && @info "task loop..."
     @sync while true
+        interrupted && break
         pid = take!(pid_channel)
+
+        @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
         localresults[pid] = remotecall(epmap_zeros, pid)
         checkpoints[pid] = nothing
+
+        fails[pid] = 0
 
         if haskey(Distributed.map_pid_wrkr, pid)
             wrkrs[pid] = Distributed.map_pid_wrkr[pid]
@@ -476,6 +531,9 @@ function epmapreduce_map(f, tasks, results::T, args...;
 
         tic_cumulative[pid] = time()
         @async while true
+            interrupted && break
+            check_for_preempted(pid, epmap_preempted) && break
+
             isempty(tsk_pool_todo) && length(tsk_pool_done) == tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && break
             _timers["map"][pid]["uptime"] = time() - _pid_up_timestamp[pid]
             isempty(tsk_pool_todo) && length(tsk_pool_done) != tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && (yield(); continue)
@@ -485,30 +543,29 @@ function epmapreduce_map(f, tasks, results::T, args...;
             if !isempty(orphans_compute)
                 local orphan
                 try
+                    @debug "restart from check-point."
                     orphan = pop!(orphans_compute)
                     _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(restart, pid, epmap_reducer!, orphan, localresults[pid], T)
                 catch e
-                    @warn "caught restart error, reduce-in orhpan checkpoing"
-                    logerror(e)
+                    @warn "caught restart error, reduce-in orhpan check-point"
                     push!(orphans_compute, orphan)
-                    isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
-                    error("TODO")
-                    throw(e)
+                    r = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    interrupted = r.do_interrupt
                 end
                 
                 try
+                    @debug "check-point restart."
                     _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
                     _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                     old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
                     push!(orphans_remove, orphan)
                     old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
                 catch e
-                    @warn "caught restart error, checkpointing"
-                    logerror(e)
+                    @warn "caught restart error, creating check-point."
                     push!(orphans_compute, orphan)
-                    isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
-                    error("TODO")
-                    throw(e)
+                    r = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    interrupted = r.do_interrupt
+                    r.do_break && break
                 end
 
                 isempty(orphans_compute) || continue
@@ -518,15 +575,15 @@ function epmapreduce_map(f, tasks, results::T, args...;
             if !isempty(orphans_remove)
                 local orphan
                 try
+                    @debug "removing already reduced orphaned check-point"
                     orphan = pop!(orphans_remove)
                     _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(rm_checkpoint, pid, orphan)
                 catch e
                     @warn "caught restart error, clean-up"
-                    logerror(e)
                     push!(orphans_remove, orphan)
-                    isa(e, ProcessExitedException) && (handle_process_exited_exception(pid, wrkrs); break)
-                    error("TODO")
-                    throw(e)
+                    r = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    interrupted = r.do_interrupt
+                    r.do_break && break
                 end
 
                 isempty(orphans_remove) || continue
@@ -540,6 +597,7 @@ function epmapreduce_map(f, tasks, results::T, args...;
             try
                 tsk = popfirst!(tsk_pool_todo)
             catch
+                # just in case another green-thread does popfirst! before us (unlikely)
                 yield()
                 continue
             end
@@ -549,14 +607,14 @@ function epmapreduce_map(f, tasks, results::T, args...;
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 _timers["map"][pid]["f"] += @elapsed remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
-                @debug "... task, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo -!"
+                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$tsk_pool_todo, tsk_pool_done=$tsk_pool_done -!"
             catch e
-                @warn "pid=$pid, task loop, caught exception during f eval"
-                logerror(e)
                 push!(tsk_pool_todo, tsk)
-                isa(e, ProcessExitedException) && (handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans_compute); break)
-                error("TODO")
-                throw(e)
+                @warn "pid=$pid, task loop, caught exception during f eval"
+                r = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                interrupted = r.do_interrupt
+                r.do_break && break
+                continue # no need to checkpoint since the task failed
             end
 
             # checkpoint
@@ -568,10 +626,10 @@ function epmapreduce_map(f, tasks, results::T, args...;
                 push!(tsk_pool_done, tsk)
             catch e
                 @warn "pid=$pid, task loop, caught exception during save_checkpoint"
-                logerror(e)
-                isa(e, ProcessExitedException) && (push!(tsk_pool_todo, tsk); handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans_compute); break)
-                error("TODO")
-                throw(e)
+                push!(tsk_pool_todo, tsk)
+                r = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
+                interrupted = r.do_interrupt
+                r.do_break && break
             end
 
             # delete old checkpoint
@@ -582,11 +640,10 @@ function epmapreduce_map(f, tasks, results::T, args...;
                 end
             catch e
                 @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
-                logerror(e)
                 old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
-                isa(e, ProcessExitedException) && (handle_process_exited_exception_with_checkpoints(pid, wrkrs, localresults, checkpoints, orphans_remove); break)
-                error("TODO")
-                throw(e)
+                handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
+                interrupted = r.do_interrupt
+                r.do_break && break
             end
         end
     end
