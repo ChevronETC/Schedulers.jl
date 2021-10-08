@@ -47,6 +47,7 @@ end
         h[w] = 0
     end
 
+    @test nworkers() == 10
     rmprocs(workers())
 
     for tsk = 1:100
@@ -58,12 +59,13 @@ end
     end
 
     for (key,value) in h
-        @test value ∈ 5:25
+        @test value ∈ 5:15
     end
 end
 
 @testset "pmap, elastic cluster with faults" begin
     addprocs(10)
+    wrkrs = workers()
     @everywhere using Distributed, Schedulers
     s = randstring(6)
     @everywhere function foo3(tsk, s)
@@ -78,7 +80,8 @@ end
 
     wait(tsk)
     @test nworkers() == 10
-    w = workers()
+    _wrkrs = workers()
+    @test wrkrs != _wrkrs
 
     h = Dict()
 
@@ -97,8 +100,8 @@ end
     end
 
     for (key,value) in h
-        if key ∈ workers()
-            @test value ∈ 5:25
+        if key ∈ _wrkrs
+            @test value ∈ 5:15
         end
     end
 end
@@ -131,7 +134,7 @@ end
     end
 
     for (key,value) in h
-        @test value ∈ 5:25
+        @test value ∈ 5:15
     end
 end
 
@@ -152,6 +155,7 @@ end
     _nworkers = 10
 
     wait(tsk)
+    @test nworkers() == 10
 
     h = Dict()
     for w in workers()
@@ -169,7 +173,7 @@ end
     end
 
     for (key,value) in h
-        @test value ∈ 5:25
+        @test value ∈ 5:15
     end
 end
 
@@ -200,6 +204,7 @@ end
     #       5. fault when checkpoiting the reduced-in result
     #       6. fault when removing old orphaned checkpoints
     addprocs(5)
+    wrkrs = workers()
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo4(x, tsk, a, b)
@@ -212,12 +217,15 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    tsk = @async epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_scratch=tmpdir)
+    tsk = @async epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir)
 
     sleep(10)
     rmprocs(workers()[randperm(nworkers())[1]])
 
     x = fetch(tsk)
+    @test nworkers() == 5
+    _wrkrs = workers()
+    @test wrkrs != _wrkrs
 
     rmprocs(workers())
 
@@ -248,7 +256,7 @@ end
 
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
-    x = epmapreduce!(zeros(Float32,10), foo5, 1:10, a, b, toggle, _pid; epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=Inf)
+    x = epmapreduce!(zeros(Float32,10), foo5, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=Inf)
 
     @test nworkers() == 5
     rmprocs(workers())
@@ -280,18 +288,19 @@ end
 
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
-    @test_throws Exception epmapreduce!(zeros(Float32,10), foo6, 1:10, a, b, toggle, _pid; epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
+    @test_throws Exception epmapreduce!(zeros(Float32,10), foo6, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
 
     rm(tmpdir; recursive=true, force=true)
 end
 
-@testset "pmapreduce, cluster with ProcessExitedException during reduce" begin
+@testset "pmapreduce, cluster with ProcessExitedException during reduce" begin ### whoop!!!
     # TODO, how do we excersie the differnt fault mechanisms in the task loop
     #       1. fault during reduce
     #       2. fault during removal of checkpoint1
     #       3. fault during removal of checkpoint2
 
     addprocs(5)
+    __workers = workers()
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo7(x, tsk, a, b)
@@ -309,13 +318,48 @@ end
 
     result = epmap_zeros()
 
-    checkpoints = Schedulers.epmapreduce_map(foo7, 1:100, result, a, b;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
+    eloop = Schedulers.ElasticLoop(;
+        epmap_init = Schedulers.epmap_default_init,
+        epmap_addprocs = Schedulers.epmap_default_addprocs,
+        epmap_quantum = ()->32,
+        epmap_minworkers = nworkers(),
+        epmap_maxworkers = nworkers(),
+        epmap_nworkers = nworkers,
+        epmap_usemaster = false,
+        tasks = 1:100,
+        exit_on_empty = false)
 
-    tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
+    _elastic_loop = @async Schedulers.loop(eloop)
+
+    checkpoints = Schedulers.epmapreduce_map(foo7, result, eloop, a, b;
+        epmapreduce_id = id,
+        epmap_reducer! = Schedulers.default_reducer!,
+        epmap_zeros = epmap_zeros,
+        epmap_preempted = Schedulers.epmap_default_preempted,
+        epmap_scratch = tmpdir,
+        epmap_reporttasks = true,
+        epmap_maxerrors = Inf,
+        epmap_retries = 0)
+
+    empty!(eloop, [1:length(checkpoints)-1;])
+    eloop.exit_on_empty = true
+
+    tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints, eloop;
+        epmapreduce_id = id,
+        epmap_reducer! = Schedulers.default_reducer!,
+        epmap_preempted = Schedulers.epmap_default_preempted,
+        epmap_scratch = tmpdir,
+        epmap_reporttasks = true,
+        epmap_maxerrors = Inf,
+        epmap_retries = 0)
 
     rmprocs(workers()[randperm(nworkers())[1]])
+
+    fetch(_elastic_loop)
+    _workers = workers()
+    @test _workers != __workers
+    1 ∈ _workers && popfirst!(_workers)
+    rmprocs(_workers[1:(length(_workers) - eloop.epmap_minworkers())])
 
     x = fetch(tsk)
 
@@ -346,13 +390,6 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    epmap_zeros = ()->zeros(Float32,10)
-
-    result = epmap_zeros()
-
-    checkpoints = Schedulers.epmapreduce_map(foo8, 1:100, result, a, b;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
-
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
 
@@ -366,10 +403,14 @@ end
         nothing
     end
 
-    x = Schedulers.epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=id, epmap_reducer! = (x,y)->myreducer(x,y,toggle,_pid), epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
+    x = epmapreduce!(zeros(Float32,10), foo8, 1:20, a, b;
+        epmap_reducer! = (x,y)->myreducer(x,y,toggle,_pid),
+        epmap_maxworkers = 5,
+        epmap_scratch = tmpdir,
+        epmap_retries = 1,
+        epmap_maxerrors = Inf)
 
-    @test x ≈ sum(a*b*[1:100;])*ones(10)
+    @test x ≈ sum(a*b*[1:20;])*ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
@@ -410,19 +451,17 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    _nworkers = 10
+    _nworkers = 5
 
     local x
-    tsk = @async begin
-        x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=()->_nworkers, epmap_scratch=tmpdir)
-    end
+    tsk = @async epmapreduce!(zeros(Float32,10), foo4, 1:100, a, b; epmap_maxworkers=()->_nworkers, epmap_scratch=tmpdir)
 
     sleep(20)
     _nworkers = 10
     sleep(20)
     @test nworkers() == 10
 
-    wait(tsk)
+    x = fetch(tsk)
 
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
