@@ -262,7 +262,7 @@ end
     addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
-    @everywhere function foo5(x, tsk, a, b, toggle, fault_id)
+    @everywhere function foo6(x, tsk, a, b, toggle, fault_id)
         _toggle = fetch(toggle)
         if myid() == fault_id && _toggle[1]
             _toggle[1] = false
@@ -280,12 +280,12 @@ end
 
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
-    @test_throws Exception epmapreduce!(zeros(Float32,10), foo5, 1:10, a, b, toggle, _pid; epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
+    @test_throws Exception epmapreduce!(zeros(Float32,10), foo6, 1:10, a, b, toggle, _pid; epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
 
     rm(tmpdir; recursive=true, force=true)
 end
 
-@testset "pmapreduce, cluster with faults during reduce" begin
+@testset "pmapreduce, cluster with ProcessExitedException during reduce" begin
     # TODO, how do we excersie the differnt fault mechanisms in the task loop
     #       1. fault during reduce
     #       2. fault during removal of checkpoint1
@@ -294,7 +294,7 @@ end
     addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
-    @everywhere function foo5(x, tsk, a, b)
+    @everywhere function foo7(x, tsk, a, b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
         sleep(1)
         nothing
@@ -309,17 +309,65 @@ end
 
     result = epmap_zeros()
 
-    checkpoints = Schedulers.epmapreduce_map(foo5, 1:100, result, a, b;
+    checkpoints = Schedulers.epmapreduce_map(foo7, 1:100, result, a, b;
         epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
 
     tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints;
-        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_scratch=tmpdir, epmap_reporttasks=true)
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
 
     rmprocs(workers()[randperm(nworkers())[1]])
 
     x = fetch(tsk)
 
     rmprocs(workers())
+
+    @test x ≈ sum(a*b*[1:100;])*ones(10)
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, cluster with RemoteException during reduce" begin
+    # TODO, how do we excersie the different fault mechanisms in the task loop
+    #       1. fault during reduce
+    #       2. fault during removal of checkpoint1
+    #       3. fault during removal of checkpoint2
+
+    addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    s = randstring(6)
+    @everywhere function foo8(x, tsk, a, b)
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        sleep(1)
+        nothing
+    end
+
+    a,b = 2,3
+    id = randstring(6)
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    epmap_zeros = ()->zeros(Float32,10)
+
+    result = epmap_zeros()
+
+    checkpoints = Schedulers.epmapreduce_map(foo8, 1:100, result, a, b;
+        epmapreduce_id=id, epmap_reducer! = Schedulers.default_reducer!, epmap_zeros=epmap_zeros, epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
+
+    _pid = workers()[randperm(nworkers())[1]]
+    toggle = remotecall_wait(()->[true], _pid)
+
+    @everywhere function myreducer(x, y, toggle, _pid)
+        _toggle = fetch(toggle)
+        if _toggle[1] && _pid == myid()
+            _toggle[1] = false
+            error("this is an error")
+        end
+        x .+= y
+        nothing
+    end
+
+    x = Schedulers.epmapreduce_reduce!(result, checkpoints;
+        epmapreduce_id=id, epmap_reducer! = (x,y)->myreducer(x,y,toggle,_pid), epmap_minworkers=nworkers, epmap_maxworkers=nworkers, epmap_usemaster=false, epmap_nworkers=nworkers, epmap_quantum=()->32, epmap_addprocs=Schedulers.epmap_default_addprocs, epmap_init=Schedulers.epmap_default_init, epmap_preempted=Schedulers.epmap_default_preempted, epmap_scratch=tmpdir, epmap_reporttasks=true, epmap_maxerrors=Inf, epmap_retries=0)
 
     @test x ≈ sum(a*b*[1:100;])*ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
