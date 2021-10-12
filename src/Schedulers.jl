@@ -1,6 +1,6 @@
 module Schedulers
 
-using Dates, Distributed, DistributedOperations, Printf, Random, Serialization, Statistics
+using Dates, Distributed, DistributedOperations, JSON, Printf, Random, Serialization, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
@@ -82,18 +82,72 @@ function check_for_preempted(pid, epmap_preempted)
     preempted
 end
 
-function journal_init(tsks)
-    journal = Dict()
+function journal_init(tsks; reduce)
+    journal = reduce ? Dict{String,Any}("tasks"=>Dict(), "pids"=>Dict()) : Dict{String,Any}("tasks"=>Dict())
+    journal["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
     for tsk in tsks
-        journal[tsk] = Dict[]
+        journal["tasks"][tsk] = Dict[]
     end
     journal
 end
-journal_start!(journal, tsk; pid, hostname) = push!(journal[tsk], Dict("pid"=>pid, "hostname"=>hostname, "start"=>Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")))
 
-function journal_stop!(journal, tsk; fault)
-    journal[tsk][end]["status"] = fault ? "failed" : "succeeded"
-    journal[tsk][end]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+function journal_final(journal)
+    if haskey(journal, "pids")
+        for pid in keys(journal["pids"])
+            pop!(journal["pids"][pid], "tic")
+        end
+    end
+    journal["done"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+end
+
+function journal_write(journal, filename)
+    if !isempty(filename)
+        write(filename, json(journal))
+    end
+end
+
+function journal_start!(journal; stage, tsk, pid, hostname)
+    if stage ∈ ("task", "checkpoint")
+        push!(journal["tasks"][tsk],
+            Dict(
+                "pid" => pid,
+                "hostname" => hostname,
+                "task" => Dict(),
+                "checkpoint" => Dict()
+            )
+        )
+    elseif stage ∈ ("restart", "reduce") && pid ∉ keys(journal["pids"])
+        journal["pids"][pid] = Dict(
+            "restart" => Dict(
+                "elapsed" => 0.0,
+                "faults" => 0
+            ),
+            "reduce" => Dict(
+                "elapsed" => 0.0,
+                "faults" => 0
+            ),
+            "hostname" => hostname,
+            "tic" => time()
+        )
+    end
+
+    if stage ∈ ("task", "checkpoint")
+        journal["tasks"][tsk][end][stage]["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+    elseif stage ∈ ("restart", "reduce")
+        journal["pids"][pid]["tic"] = time()
+    end
+end
+
+function journal_stop!(journal; stage, tsk, pid, fault)
+    if stage ∈ ("task", "checkpoint")
+        journal["tasks"][tsk][end][stage]["status"] = fault ? "failed" : "succeeded"
+        journal["tasks"][tsk][end][stage]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+    elseif stage ∈ ("restart", "reduce")
+        journal["pids"][pid][stage]["elapsed"] += time() - journal["pids"][pid]["tic"]
+        if fault
+            journal["pids"][pid][stage]["faults"] += 1
+        end
+    end
 end
 
 function load_modules_on_new_workers(pid)
@@ -361,7 +415,7 @@ function epmap(f::Function, tasks, args...;
 
     _elastic_loop = @async loop(eloop)
 
-    journal = journal_init(tasks)
+    journal = journal_init(tasks; reduce=false)
 
     # work loop
     @sync while true
@@ -400,15 +454,15 @@ function epmap(f::Function, tasks, args...;
             try
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                journal_start!(journal, tsk; pid, hostname)
+                journal_start!(journal; stage="task", tsk, pid, hostname)
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
-                journal_stop!(journal, tsk; fault=false)
+                journal_stop!(journal; stage="task", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                 yield()
             catch e
                 @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid..."
-                journal_stop!(journal, tsk; fault=true)
+                journal_stop!(journal; stage="task", tsk, pid, fault=true)
                 push!(eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 eloop.interrupted = r.do_interrupt
@@ -422,6 +476,8 @@ function epmap(f::Function, tasks, args...;
     _workers = workers()
     1 ∈ _workers && popfirst!(_workers)
     rmprocs(_workers[1:(length(_workers) - eloop.epmap_minworkers())])
+
+    journal_final(journal)
 
     journal
 end
@@ -449,6 +505,7 @@ with an assoicated partial reduction.
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
 * `epmap_reporttasks=true` log task assignment
+* `epmap_journalfile=""` write a journal showing what was computed where to a json file
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -497,13 +554,16 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_reporttasks = true,
         epmap_maxerrors = Inf,
         epmap_retries = 0,
+        epmap_journalfile = "",
         kwargs...) where {T,N}
     isdir(epmap_scratch) || mkpath(epmap_scratch)
     if epmap_zeros == nothing
         epmap_zeros = ()->zeros(eltype(result), size(result))::T
     end
 
-    eloop = ElasticLoop(;
+    epmap_journal = journal_init(tasks; reduce=true)
+
+    epmap_eloop = ElasticLoop(;
         epmap_init,
         epmap_addprocs,
         epmap_quantum,
@@ -514,10 +574,9 @@ function epmapreduce!(result::T, f, tasks, args...;
         tasks,
         exit_on_empty = false)
 
-    _elastic_loop = @async loop(eloop)
+    _elastic_loop = @async loop(epmap_eloop)
 
-    empty!(_timers)
-    checkpoints = epmapreduce_map(f, result, eloop, args...;
+    checkpoints = epmapreduce_map(f, result, epmap_eloop, epmap_journal, args...;
         epmapreduce_id,
         epmap_reducer!,
         epmap_zeros,
@@ -528,10 +587,10 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_retries,
         kwargs...)
 
-    empty!(eloop, [1:length(checkpoints)-1;])
-    eloop.exit_on_empty = true
+    empty!(epmap_eloop, [1:length(checkpoints)-1;])
+    epmap_eloop.exit_on_empty = true
 
-    result = epmapreduce_reduce!(result, checkpoints, eloop;
+    result = epmapreduce_reduce!(result, checkpoints, epmap_eloop, epmap_journal;
         epmapreduce_id,
         epmap_reducer!,
         epmap_preempted,
@@ -545,12 +604,15 @@ function epmapreduce!(result::T, f, tasks, args...;
     # ensure we are left with epmap_minworkers
     _workers = workers()
     1 ∈ _workers && popfirst!(_workers)
-    rmprocs(_workers[1:(length(_workers) - eloop.epmap_minworkers())])
+    rmprocs(_workers[1:(length(_workers) - epmap_eloop.epmap_minworkers())])
+
+    journal_final(epmap_journal)
+    journal_write(epmap_journal, epmap_journalfile)
 
     result
 end
 
-function epmapreduce_map(f, results::T, eloop, args...;
+function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         epmapreduce_id,
         epmap_reducer!,
         epmap_zeros,
@@ -569,14 +631,11 @@ function epmapreduce_map(f, results::T, eloop, args...;
     orphans_compute = Set{Any}()
     orphans_remove = Set{Any}()
 
-    _timers["map"] = Dict{Int, Dict{String,Float64}}()
-    tic_cumulative = Dict{Int,Float64}()
-
     # task loop
     epmap_reporttasks && @info "task loop..."
     @sync while true
-        eloop.interrupted && break
-        pid = take!(eloop.pid_channel)
+        epmap_eloop.interrupted && break
+        pid = take!(epmap_eloop.pid_channel)
 
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
@@ -592,18 +651,13 @@ function epmapreduce_map(f, results::T, eloop, args...;
         else
             @warn "worker with pid=$pid is not registered"
         end
-
-        _timers["map"][pid] = Dict("cumulative"=>0.0, "restart"=>0.0, "f"=>0.0, "checkpoint"=>0.0, "uptime"=>0.0)
-
-        tic_cumulative[pid] = time()
+        hostname = remotecall_fetch(gethostname, pid)
         @async while true
-            eloop.interrupted && break
+            epmap_eloop.interrupted && break
             check_for_preempted(pid, epmap_preempted) && break
 
-            isempty(eloop.tsk_pool_todo) && length(eloop.tsk_pool_done) == eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && break
-            _timers["map"][pid]["uptime"] = time() - _pid_up_timestamp[pid]
-            isempty(eloop.tsk_pool_todo) && length(eloop.tsk_pool_done) != eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && (yield(); continue)
-            _timers["map"][pid]["cumulative"] = time() - tic_cumulative[pid]
+            isempty(epmap_eloop.tsk_pool_todo) && length(epmap_eloop.tsk_pool_done) == epmap_eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && break
+            isempty(epmap_eloop.tsk_pool_todo) && length(epmap_eloop.tsk_pool_done) != epmap_eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && (yield(); continue)
 
             # re-start logic, reduce-in orphaned check-points
             if !isempty(orphans_compute)
@@ -611,27 +665,33 @@ function epmapreduce_map(f, results::T, eloop, args...;
                 try
                     @debug "restart from check-point."
                     orphan = pop!(orphans_compute)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(restart, pid, epmap_reducer!, orphan, localresults[pid], T)
+                    journal_start!(epmap_journal; stage="restart", tsk=0, pid, hostname)
+                    remotecall_fetch(restart, pid, epmap_reducer!, orphan, localresults[pid], T)
+                    journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=false)
                 catch e
                     @warn "caught restart error, reduce-in orphan check-point"
+                    journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=true)
                     push!(orphans_compute, orphan)
-                    r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                    eloop.interrupted = r.do_interrupt
+                    r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    epmap_eloop.interrupted = r.do_interrupt
                     r.do_break && break
                 end
                 
                 try
                     @debug "check-point restart."
                     _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                    journal_start!(epmap_journal; stage="restart", tsk=0, pid, hostname)
+                    remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                    journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=false)
                     old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
                     push!(orphans_remove, orphan)
                     old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
                 catch e
                     @warn "caught restart error, creating check-point."
+                    journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=true)
                     push!(orphans_compute, orphan)
-                    r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                    eloop.interrupted = r.do_interrupt
+                    r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    epmap_eloop.interrupted = r.do_interrupt
                     r.do_break && break
                 end
 
@@ -644,25 +704,28 @@ function epmapreduce_map(f, results::T, eloop, args...;
                 try
                     @debug "removing already reduced orphaned check-point"
                     orphan = pop!(orphans_remove)
-                    _timers["map"][pid]["restart"] += @elapsed remotecall_fetch(rm_checkpoint, pid, orphan)
+                    journal_start!(epmap_journal; stage="restart", tsk=0, pid)
+                    remotecall_fetch(rm_checkpoint, pid, orphan)
+                    journal_stop!(epmap_journal; stage="retart", tsk=0, pid, fault=false)
                 catch e
                     @warn "caught restart error, clean-up"
+                    journal_stop!(epmap_journal; stage="retart", tsk=0, pid, fault=true)
                     push!(orphans_remove, orphan)
-                    r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                    eloop.interrupted = r.do_interrupt
+                    r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    epmap_eloop.interrupted = r.do_interrupt
                     r.do_break && break
                 end
 
                 isempty(orphans_remove) || continue
             end
 
-            length(eloop.tsk_pool_done) == eloop.tsk_count && break
-            isempty(eloop.tsk_pool_todo) && (yield(); continue)
+            length(epmap_eloop.tsk_pool_done) == epmap_eloop.tsk_count && break
+            isempty(epmap_eloop.tsk_pool_todo) && (yield(); continue)
 
             # get next task
             local tsk
             try
-                tsk = popfirst!(eloop.tsk_pool_todo)
+                tsk = popfirst!(epmap_eloop.tsk_pool_todo)
             catch
                 # just in case another green-thread does popfirst! before us (unlikely)
                 yield()
@@ -671,15 +734,18 @@ function epmapreduce_map(f, results::T, eloop, args...;
 
             # compute and reduce
             try
-                epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                _timers["map"][pid]["f"] += @elapsed remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
-                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
+                journal_start!(epmap_journal; stage="task", tsk, pid, hostname)
+                remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
+                journal_stop!(epmap_journal; stage="task", tsk, pid, fault=false)
+                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
-                push!(eloop.tsk_pool_todo, tsk)
                 @warn "pid=$pid, task loop, caught exception during f eval"
-                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                eloop.interrupted = r.do_interrupt
+                journal_stop!(epmap_journal; stage="task", tsk, pid, fault=false)
+                push!(epmap_eloop.tsk_pool_todo, tsk)
+                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
                 continue # no need to checkpoint since the task failed
             end
@@ -687,15 +753,18 @@ function epmapreduce_map(f, results::T, eloop, args...;
             # checkpoint
             _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
             try
-                @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
-                _timers["map"][pid]["checkpoint"] += @elapsed remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
-                @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo) -!"
-                push!(eloop.tsk_pool_done, tsk)
+                @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
+                remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
+                @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
+                push!(epmap_eloop.tsk_pool_done, tsk)
             catch e
                 @warn "pid=$pid, task loop, caught exception during save_checkpoint"
-                push!(eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
-                eloop.interrupted = r.do_interrupt
+                journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
+                push!(epmap_eloop.tsk_pool_todo, tsk)
+                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
+                epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
 
@@ -703,13 +772,16 @@ function epmapreduce_map(f, results::T, eloop, args...;
             old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
             try
                 if old_checkpoint != nothing
-                    _timers["map"][pid]["checkpoint"] += @elapsed remotecall_fetch(rm_checkpoint, pid, old_checkpoint)
+                    journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
+                    remotecall_fetch(rm_checkpoint, pid, old_checkpoint)
+                    journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
                 end
             catch e
                 @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
+                journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
                 old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
-                handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
-                eloop.interrupted = r.do_interrupt
+                handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
+                epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
         end
@@ -718,7 +790,7 @@ function epmapreduce_map(f, results::T, eloop, args...;
     filter!(checkpoint->checkpoint != nothing, [collect(values(checkpoints)); orphans_compute...])
 end
 
-function epmapreduce_reduce!(result::T, checkpoints, eloop;
+function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
         epmapreduce_id,
         epmap_reducer!,
         epmap_preempted,
@@ -730,14 +802,12 @@ function epmapreduce_reduce!(result::T, checkpoints, eloop;
 
     wrkrs = Dict{Int, Distributed.Worker}()
 
-    _timers["reduce"] = Dict{Int, Dict{String,Float64}}()
-
     orphans_remove = Set{String}()
 
     epmap_reporttasks && @info "reduce loop..."
     @sync while true
-        eloop.interrupted && break
-        pid = take!(eloop.pid_channel)
+        epmap_eloop.interrupted && break
+        pid = take!(epmap_eloop.pid_channel)
 
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
@@ -750,20 +820,29 @@ function epmapreduce_reduce!(result::T, checkpoints, eloop;
             @warn "worker with pid=$pid is not registered"
         end
 
-        _timers["reduce"][pid] = Dict("cumulative"=>0.0, "reduce"=>0.0, "IO"=>0.0, "cleanup"=>0.0, "uptime"=>0.0)
-
-        tic_cumulative = time()
+        hostname = ""
+        try
+            hostname = remotecall_fetch(gethostname, pid)
+        catch
+            @warn "unable to get hostname for pid=$pid"
+        end
         @async while true
-            eloop.interrupted && break
+            epmap_eloop.interrupted && break
             check_for_preempted(pid, epmap_preempted) && break
 
-            _timers["reduce"][pid]["cumulative"] = time() - tic_cumulative
-            _timers["reduce"][pid]["uptime"] = time() - _pid_up_timestamp[pid]
-
-            length(eloop.tsk_pool_done) == eloop.tsk_count && break
+            length(epmap_eloop.tsk_pool_done) == epmap_eloop.tsk_count && break
             length(checkpoints) < 2 && (yield(); continue)
 
-            tsk = popfirst!(eloop.tsk_pool_todo)
+            if isempty(epmap_eloop.tsk_pool_todo)
+                continue
+            end
+
+            local tsk
+            try
+                tsk = popfirst!(epmap_eloop.tsk_pool_todo)
+            catch
+                continue
+            end
 
             local checkpoint1,checkpoint2,checkpoint3
             try
@@ -773,39 +852,46 @@ function epmapreduce_reduce!(result::T, checkpoints, eloop;
             end
             
             try
-                t_io,t_sum = remotecall_fetch(reduce, pid, epmap_reducer!, checkpoint1, checkpoint2, checkpoint3, T)
-                _timers["reduce"][pid]["IO"] += t_io
-                _timers["reduce"][pid]["reduce"] += t_sum
+                journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                remotecall_fetch(reduce, pid, epmap_reducer!, checkpoint1, checkpoint2, checkpoint3, T)
+                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(checkpoints, checkpoint3)
-                push!(eloop.tsk_pool_done, tsk)
+                push!(epmap_eloop.tsk_pool_done, tsk)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during reduce"
+                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(checkpoints, checkpoint1, checkpoint2)
-                push!(eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                eloop.interrupted = r.do_interrupt
+                push!(epmap_eloop.tsk_pool_todo, tsk)
+                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
                 continue
             end
 
             try
-                _timers["reduce"][pid]["cleanup"] += @elapsed remotecall_fetch(rm_checkpoint, pid, checkpoint1)
+                journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                remotecall_fetch(rm_checkpoint, pid, checkpoint1)
+                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 1"
+                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(orphans_remove, checkpoint1, checkpoint2)
-                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                eloop.interrupted = r.do_interrupt
+                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
                 continue
             end
             
             try
-                _timers["reduce"][pid]["cleanup"] += @elapsed remotecall_fetch(rm_checkpoint, pid, checkpoint2)
+                journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                remotecall_fetch(rm_checkpoint, pid, checkpoint2)
+                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 2"
+                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(orphans_remove, checkpoint2)
-                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
-                eloop.interrupted = r.do_interrupt
+                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
         end
@@ -819,102 +905,6 @@ function epmapreduce_reduce!(result::T, checkpoints, eloop;
     result
 end
 
-const _timers = Dict{String,Dict{Int,Dict{String,Float64}}}()
-
-function timers_analysis_map(filename)
-    pids = collect(keys(Schedulers._timers["map"]))
-
-    f = [Schedulers._timers["map"][pid]["f"] for pid in pids]
-    μ_f = mean(f)
-    σ_f = sqrt(var(f))
-
-    checkpoint = [Schedulers._timers["map"][pid]["checkpoint"] for pid in pids]
-    μ_checkpoint = mean(checkpoint)
-    σ_checkpoint = sqrt(var(checkpoint))
-
-    restart = [Schedulers._timers["map"][pid]["restart"] for pid in pids]
-    μ_restart = mean(restart)
-    σ_restart = sqrt(var(restart))
-
-    cumulative = [Schedulers._timers["map"][pid]["cumulative"] for pid in pids]
-    μ_cumulative = mean(cumulative)
-    σ_cumulative = sqrt(var(cumulative))
-
-    uptime = [Schedulers._timers["map"][pid]["uptime"] for pid in pids]
-    μ_uptime = mean(uptime)
-    σ_uptime = sqrt(var(uptime))
-
-    utilization = (f .+ checkpoint .+ restart) ./ cumulative
-    μ_utilization = mean(utilization)
-    σ_utilization = sqrt(var(utilization))
-
-    utilization_f = f ./ cumulative
-    μ_utilization_f = mean(utilization_f)
-    σ_utilization_f = sqrt(var(utilization_f))
-
-    x = """
-    | pid      | f    | checkpoint    | restart    | cumulative    | uptime         | utilization   | utilization_f    | 
-    |----------|------|---------------|------------|---------------|----------------|---------------|------------------|
-    """
-    for (ipid,pid) in enumerate(pids)
-        x *= """
-        | $pid | $(@sprintf("%.2f",f[ipid])) | $(@sprintf("%.2f",checkpoint[ipid])) | $(@sprintf("%.2f",restart[ipid])) | $(@sprintf("%.2f",cumulative[ipid])) | $(@sprintf("%.2f",uptime[ipid])) | $(@sprintf("%.2f",utilization[ipid])) | $(@sprintf("%.2f",utilization_f[ipid])) |
-        """
-    end
-    x *= """
-    | **mean**     | $(@sprintf("%.2f",μ_f)) | $(@sprintf("%.2f",μ_checkpoint)) | $(@sprintf("%.2f",μ_restart)) | $(@sprintf("%.2f",μ_cumulative)) | $(@sprintf("%.2f",μ_uptime)) | $(@sprintf("%.2f",μ_utilization)) | $(@sprintf("%.2f",μ_utilization_f)) |
-    | **variance** | $(@sprintf("%.2f",σ_f)) | $(@sprintf("%.2f",σ_checkpoint)) | $(@sprintf("%.2f",σ_restart)) | $(@sprintf("%.2f",σ_cumulative)) | $(@sprintf("%.2f",σ_uptime)) | $(@sprintf("%.2f",σ_utilization)) | $(@sprintf("%.2f",σ_utilization_f)) |
-    """
-    write(filename, x)
-end
-
-function timers_analysis_reduce(filename)
-    pids = collect(keys(Schedulers._timers["reduce"]))
-
-    reduce = [Schedulers._timers["reduce"][pid]["reduce"] for pid in pids]
-    μ_reduce = mean(reduce)
-    σ_reduce = sqrt(var(reduce))
-
-    io = [Schedulers._timers["reduce"][pid]["IO"] for pid in pids]
-    μ_io = mean(io)
-    σ_io = sqrt(var(io))
-
-    cleanup = [Schedulers._timers["reduce"][pid]["cleanup"] for pid in pids]
-    μ_cleanup = mean(cleanup)
-    σ_cleanup = sqrt(var(cleanup))
-
-    cumulative = [Schedulers._timers["reduce"][pid]["cumulative"] for pid in pids]
-    μ_cumulative = mean(cumulative)
-    σ_cumulative = sqrt(var(cumulative))
-
-    uptime = [Schedulers._timers["reduce"][pid]["uptime"] for pid in pids]
-    μ_uptime = mean(uptime)
-    σ_uptime = sqrt(var(uptime))
-
-    utilization = (reduce .+ io .+ cleanup) ./ cumulative
-    μ_utilization = mean(utilization)
-    σ_utilization = sqrt(var(utilization))
-
-    utilization_reduce = reduce ./ cumulative
-    μ_utilization_reduce = mean(utilization_reduce)
-    σ_utilization_reduce = sqrt(var(utilization_reduce))
-
-    x = """
-    | pid      | reduce | IO | cleanup | cumulative | uptime | utilization   | utilization_reduce |
-    |----------|--------|----|---------|------------|--------|---------------|--------------------|
-    """
-    for (ipid,pid) in enumerate(pids)
-        x *= """
-        | $pid | $(@sprintf("%.2f",reduce[ipid])) | $(@sprintf("%.2f",io[ipid])) | $(@sprintf("%.2f",cleanup[ipid])) | $(@sprintf("%.2f",cumulative[ipid])) | $(@sprintf("%.2f",uptime[ipid])) | $(@sprintf("%.2f",utilization[ipid])) | $(@sprintf("%.2f",utilization_reduce[ipid])) |
-        """
-    end
-    x *= """
-    | **mean**     | $(@sprintf("%.2f",μ_reduce)) | $(@sprintf("%.2f",μ_io)) | $(@sprintf("%.2f",μ_cleanup)) | $(@sprintf("%.2f",μ_cumulative)) | $(@sprintf("%.2f",μ_uptime)) | $(@sprintf("%.2f",μ_utilization)) | $(@sprintf("%.2f",μ_utilization_reduce)) |
-    | **variance** | $(@sprintf("%.2f",σ_reduce)) | $(@sprintf("%.2f",σ_io)) | $(@sprintf("%.2f",σ_cleanup)) | $(@sprintf("%.2f",σ_cumulative)) | $(@sprintf("%.2f",σ_uptime)) | $(@sprintf("%.2f",σ_utilization)) | $(@sprintf("%.2f",σ_utilization_reduce)) |
-    """
-    write(filename, x)
-end
-
 let CID::Int = 1
     global next_checkpoint_id
     next_checkpoint_id() = (id = CID; CID += 1; id)
@@ -922,15 +912,11 @@ end
 next_checkpoint(id, scratch) = joinpath(scratch, string("checkpoint-", id, "-", next_checkpoint_id()))
 
 function reduce(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
-    t_io = @elapsed begin
-        c1 = deserialize(checkpoint1)::T
-        c2 = deserialize(checkpoint2)::T
-    end
-    t_sum = @elapsed begin
-        reducer!(c2, c1)
-    end
-    t_io += @elapsed serialize(checkpoint3, c2)
-    t_io, t_sum
+    c1 = deserialize(checkpoint1)::T
+    c2 = deserialize(checkpoint2)::T
+    reducer!(c2, c1)
+    serialize(checkpoint3, c2)
+    nothing
 end
 
 save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)

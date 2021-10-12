@@ -318,6 +318,8 @@ end
 
     result = epmap_zeros()
 
+    journal = Schedulers.journal_init(1:100; reduce=true)
+
     eloop = Schedulers.ElasticLoop(;
         epmap_init = Schedulers.epmap_default_init,
         epmap_addprocs = Schedulers.epmap_default_addprocs,
@@ -331,7 +333,7 @@ end
 
     _elastic_loop = @async Schedulers.loop(eloop)
 
-    checkpoints = Schedulers.epmapreduce_map(foo7, result, eloop, a, b;
+    checkpoints = Schedulers.epmapreduce_map(foo7, result, eloop, journal, a, b;
         epmapreduce_id = id,
         epmap_reducer! = Schedulers.default_reducer!,
         epmap_zeros = epmap_zeros,
@@ -344,7 +346,7 @@ end
     empty!(eloop, [1:length(checkpoints)-1;])
     eloop.exit_on_empty = true
 
-    tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints, eloop;
+    tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints, eloop, journal;
         epmapreduce_id = id,
         epmap_reducer! = Schedulers.default_reducer!,
         epmap_preempted = Schedulers.epmap_default_preempted,
@@ -362,6 +364,8 @@ end
     rmprocs(_workers[1:(length(_workers) - eloop.epmap_minworkers())])
 
     x = fetch(tsk)
+
+    Schedulers.journal_final(journal)
 
     rmprocs(workers())
 
