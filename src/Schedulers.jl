@@ -27,21 +27,6 @@ function handle_checkpoints!(pid, localresults, checkpoints, orphans)
     nothing
 end
 
-function handle_process_exited_exception(pid, wrkrs)
-    if haskey(Distributed.map_pid_wrkr, pid)
-        @debug "pid=$pid is known to Distributed, calling rmprocs"
-        rmprocs(pid)
-    else
-        @debug "pid=$pid is not known to Distributed, calling kill"
-        try
-            # required for cluster managers that require clean-up when the julia process on a worker dies:
-            Distributed.kill(wrkrs[pid].manager, pid, wrkrs[pid].config)
-        catch
-        end
-    end
-    delete!(wrkrs, pid)
-end
-
 function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans)
     logerror(e)
 
@@ -55,7 +40,19 @@ function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, ep
         put!(pid_channel, -1)
         throw(e)
     elseif isa(e, ProcessExitedException)
-        handle_process_exited_exception(pid, wrkrs)
+        @warn "process with id=$pid exited, removing from process list."
+        if haskey(Distributed.map_pid_wrkr, pid)
+            @debug "pid=$pid is known to Distributed, calling rmprocs"
+            rmprocs(pid)
+        else
+            @debug "pid=$pid is not known to Distributed, calling kill"
+            try
+                # required for cluster managers that require clean-up when the julia process on a worker dies:
+                Distributed.kill(wrkrs[pid].manager, pid, wrkrs[pid].config)
+            catch
+            end
+        end
+        delete!(wrkrs, pid)
         r = (do_break=true, do_interrupt=false)
     elseif nerrors >= epmap_maxerrors
         put!(pid_channel, -1)
@@ -410,29 +407,12 @@ function epmap(f::Function, tasks, args...;
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                 yield()
             catch e
-                journal_stop!(journal, tsk; fault=true)
-                fails[pid] += 1
-                nerrors = sum(values(fails))
                 @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid..."
-                logerror(e)
+                journal_stop!(journal, tsk; fault=true)
                 push!(eloop.tsk_pool_todo, tsk)
-                if isa(e, InterruptException)
-                    eloop.interrupted = true
-                    put!(eloop.pid_channel, -1)
-                    throw(e)
-                elseif isa(e, ProcessExitedException)
-                    @warn "process with id=$pid exited, removing from process list"
-                    handle_process_exited_exception(pid, wrkrs)
-                    break
-                elseif nerrors >= epmap_maxerrors
-                    eloop.interrupted = true
-                    put!(pid_channel, -1)
-                    error("too many errors, $nerrors errors")
-                elseif fails[pid] > epmap_retries
-                    @warn "too many failures on process with id=$pid, removing from process list"
-                    rmprocs(pid)
-                    break
-                end
+                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                eloop.interrupted = r.do_interrupt
+                r.do_break && break
             end
         end
     end
