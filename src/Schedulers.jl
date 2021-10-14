@@ -503,7 +503,7 @@ with an assoicated partial reduction.
 * `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
-* `epmap_scratch="/scratch"` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)
+* `epmap_scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
 * `epmap_reporttasks=true` log task assignment
 * `epmap_journalfile=""` write a journal showing what was computed where to a json file
 
@@ -512,6 +512,8 @@ with an assoicated partial reduction.
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
 [2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
+[3] If more than one scratch location is selected, then check-point files will be distributed across those locations.
+This can be useful if you are, for example, constrained by cloud storage through-put limits.
 
 # Examples
 ## Example 1
@@ -550,13 +552,17 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,
-        epmap_scratch = "/scratch",
+        epmap_scratch = ["/scratch"],
         epmap_reporttasks = true,
         epmap_maxerrors = Inf,
         epmap_retries = 0,
         epmap_journalfile = "",
+        epmap_keepcheckpoints = false, # used for unit testing / debugging
         kwargs...) where {T,N}
-    isdir(epmap_scratch) || mkpath(epmap_scratch)
+    epmap_scratches = isa(epmap_scratch, AbstractArray) ? epmap_scratch : [epmap_scratch]
+    for scratch in epmap_scratches
+        isdir(scratch) || mkpath(scratch)
+    end
     if epmap_zeros == nothing
         epmap_zeros = ()->zeros(eltype(result), size(result))::T
     end
@@ -581,10 +587,11 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_reducer!,
         epmap_zeros,
         epmap_preempted,
-        epmap_scratch,
+        epmap_scratches,
         epmap_reporttasks,
         epmap_maxerrors,
         epmap_retries,
+        epmap_keepcheckpoints,
         kwargs...)
 
     empty!(epmap_eloop, [1:length(checkpoints)-1;])
@@ -594,10 +601,11 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmapreduce_id,
         epmap_reducer!,
         epmap_preempted,
-        epmap_scratch,
+        epmap_scratches,
         epmap_reporttasks,
         epmap_maxerrors,
-        epmap_retries)
+        epmap_retries,
+        epmap_keepcheckpoints)
 
     fetch(_elastic_loop)
 
@@ -617,10 +625,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         epmap_reducer!,
         epmap_zeros,
         epmap_preempted,
-        epmap_scratch,
+        epmap_scratches,
         epmap_reporttasks,
         epmap_maxerrors,
         epmap_retries,
+        epmap_keepcheckpoints,
         kwargs...) where {T}
     fails = Dict{Int,Int}()
 
@@ -679,7 +688,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 
                 try
                     @debug "check-point restart."
-                    _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
+                    _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratches)
                     journal_start!(epmap_journal; stage="restart", tsk=0, pid, hostname)
                     remotecall_fetch(save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                     journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=false)
@@ -705,7 +714,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                     @debug "removing already reduced orphaned check-point"
                     orphan = pop!(orphans_remove)
                     journal_start!(epmap_journal; stage="restart", tsk=0, pid)
-                    remotecall_fetch(rm_checkpoint, pid, orphan)
+                    epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, orphan)
                     journal_stop!(epmap_journal; stage="retart", tsk=0, pid, fault=false)
                 catch e
                     @warn "caught restart error, clean-up"
@@ -751,7 +760,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             end
 
             # checkpoint
-            _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratch)
+            _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratches)
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
@@ -773,7 +782,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             try
                 if old_checkpoint != nothing
                     journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
-                    remotecall_fetch(rm_checkpoint, pid, old_checkpoint)
+                    epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -794,10 +803,11 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
         epmapreduce_id,
         epmap_reducer!,
         epmap_preempted,
-        epmap_scratch,
+        epmap_scratches,
         epmap_reporttasks,
         epmap_maxerrors,
-        epmap_retries) where {T}
+        epmap_retries,
+        epmap_keepcheckpoints) where {T}
     fails = Dict{Int,Int}()
 
     wrkrs = Dict{Int, Distributed.Worker}()
@@ -846,7 +856,7 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
 
             local checkpoint1,checkpoint2,checkpoint3
             try
-                checkpoint1,checkpoint2,checkpoint3 = popfirst!(checkpoints),popfirst!(checkpoints),next_checkpoint(epmapreduce_id, epmap_scratch)
+                checkpoint1,checkpoint2,checkpoint3 = popfirst!(checkpoints),popfirst!(checkpoints),next_checkpoint(epmapreduce_id, epmap_scratches)
             catch
                 continue
             end
@@ -870,7 +880,7 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
 
             try
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_fetch(rm_checkpoint, pid, checkpoint1)
+                epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 1"
@@ -884,7 +894,7 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
             
             try
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_fetch(rm_checkpoint, pid, checkpoint2)
+                epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
                 @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 2"
@@ -899,8 +909,10 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
     epmap_reporttasks && @info "...done reduce loop."
 
     epmap_reducer!(result, deserialize(checkpoints[1]))
-    rm_checkpoint(checkpoints[1])
-    rm_checkpoint.(orphans_remove)
+    if !epmap_keepcheckpoints
+        rm_checkpoint(checkpoints[1])
+        rm_checkpoint.(orphans_remove)
+    end
 
     result
 end
@@ -909,7 +921,13 @@ let CID::Int = 1
     global next_checkpoint_id
     next_checkpoint_id() = (id = CID; CID += 1; id)
 end
-next_checkpoint(id, scratch) = joinpath(scratch, string("checkpoint-", id, "-", next_checkpoint_id()))
+let SID::Int = 1
+    global next_scratch_index
+    next_scratch_index(n) = (id = SID; SID = id == n ? 1 : id+1; id)
+end
+function next_checkpoint(id, scratch)
+    joinpath(scratch[next_scratch_index(length(scratch))], string("checkpoint-", id, "-", next_checkpoint_id()))
+end
 
 function reduce(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
     c1 = deserialize(checkpoint1)::T

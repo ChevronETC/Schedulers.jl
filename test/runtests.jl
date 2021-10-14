@@ -1,7 +1,15 @@
 using Distributed, Logging, Random, Test
 
+function safe_addprocs(n)
+    try
+        length(addprocs(n))
+    catch
+        @warn "problem calling addprocs, nworkers=$(nworkers())"
+    end
+end
+
 @testset "pmap, stable cluster test" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers
     s = randstring(6)
     @everywhere function foo1(tsk, s)
@@ -32,7 +40,7 @@ using Distributed, Logging, Random, Test
 end
 
 @testset "pmap, growing cluster test" begin
-    addprocs(2)
+    safe_addprocs(2)
     @everywhere using Distributed, Schedulers
     s = randstring(6)
     @everywhere function foo2(tsk, s)
@@ -64,7 +72,7 @@ end
 end
 
 @testset "pmap, elastic cluster with faults" begin
-    addprocs(10)
+    safe_addprocs(10)
     wrkrs = workers()
     @everywhere using Distributed, Schedulers
     s = randstring(6)
@@ -107,7 +115,7 @@ end
 end
 
 @testset "pmap with shrinking cluster" begin
-    addprocs(10)
+    safe_addprocs(10)
     @everywhere using Distributed, Schedulers
     s = randstring(6)
     @everywhere function foo3(tsk, s)
@@ -139,7 +147,7 @@ end
 end
 
 @testset "pmap with interactive growing cluster" begin
-    addprocs(2)
+    safe_addprocs(2)
     @everywhere using Distributed, Schedulers
     s = randstring(6)
     @everywhere function foo2(tsk, s)
@@ -178,7 +186,7 @@ end
 end
 
 @testset "pmapreduce, stable cluster test" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     @everywhere function foo4(x, tsk, a; b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
@@ -203,7 +211,7 @@ end
     #       4. fault when reducing-in an ophan
     #       5. fault when checkpoiting the reduced-in result
     #       6. fault when removing old orphaned checkpoints
-    addprocs(5)
+    safe_addprocs(5)
     wrkrs = workers()
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
@@ -235,7 +243,7 @@ end
 end
 
 @testset "pmapreduce, cluster with RemoteException during tasks" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo5(x, tsk, a, b, toggle, fault_id)
@@ -267,7 +275,7 @@ end
 end
 
 @testset "pmapreduce, cluster with RemoteException during tasks, and max errors triggered" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo6(x, tsk, a, b, toggle, fault_id)
@@ -298,8 +306,7 @@ end
     #       1. fault during reduce
     #       2. fault during removal of checkpoint1
     #       3. fault during removal of checkpoint2
-
-    addprocs(5)
+    safe_addprocs(5)
     __workers = workers()
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
@@ -338,10 +345,11 @@ end
         epmap_reducer! = Schedulers.default_reducer!,
         epmap_zeros = epmap_zeros,
         epmap_preempted = Schedulers.epmap_default_preempted,
-        epmap_scratch = tmpdir,
+        epmap_scratches = [tmpdir],
         epmap_reporttasks = true,
         epmap_maxerrors = Inf,
-        epmap_retries = 0)
+        epmap_retries = 0,
+        epmap_keepcheckpoints = false)
 
     empty!(eloop, [1:length(checkpoints)-1;])
     eloop.exit_on_empty = true
@@ -350,10 +358,11 @@ end
         epmapreduce_id = id,
         epmap_reducer! = Schedulers.default_reducer!,
         epmap_preempted = Schedulers.epmap_default_preempted,
-        epmap_scratch = tmpdir,
+        epmap_scratches = [tmpdir],
         epmap_reporttasks = true,
         epmap_maxerrors = Inf,
-        epmap_retries = 0)
+        epmap_retries = 0,
+        epmap_keepcheckpoints = false)
 
     rmprocs(workers()[randperm(nworkers())[1]])
 
@@ -380,7 +389,7 @@ end
     #       2. fault during removal of checkpoint1
     #       3. fault during removal of checkpoint2
 
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo8(x, tsk, a, b)
@@ -420,7 +429,7 @@ end
 end
 
 @testset "pmapreduce, growing cluster test" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo4(x, tsk, a, b)
@@ -442,7 +451,7 @@ end
 end
 
 @testset "pmapreduce, interactive growing cluster test" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo4(x, tsk, a, b)
@@ -475,7 +484,7 @@ end
 end
 
 @testset "pmapreduce, structured data test" begin
-    addprocs(5)
+    safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo5(x, tsk, a, b)
@@ -500,6 +509,31 @@ end
 
     @test x.y ≈ sum([a*tsk for tsk in 1:100])*ones(Float32,10)
     @test x.z ≈ sum([b*tsk for tsk in 1:100])*ones(Float32,10)
+end
+
+@testset "pmapreduce, multiple scratch locations" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere function foo4(x, tsk, a; b)
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        nothing
+    end
+
+    tmpdirs = [mktempdir(;cleanup=false) for i=1:3]
+
+    a,b = 2,3
+    x = epmapreduce!(zeros(Float32,10), foo4, 1:100, a; b=b, epmap_scratch=tmpdirs, epmap_keepcheckpoints=true)
+
+    ncheckpoints = [length(readdir(tmpdir)) for tmpdir in tmpdirs]
+    ncheckpoints_average = sum(ncheckpoints) / 3
+    for i = 1:3
+        @test ncheckpoints[i] > 0
+        @test (ncheckpoints[i] - ncheckpoints_average) < .1*ncheckpoints_average
+    end
+
+    rmprocs(workers())
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+    rm.(tmpdirs; recursive=true, force=true)
 end
 
 @testset "logerror" begin
