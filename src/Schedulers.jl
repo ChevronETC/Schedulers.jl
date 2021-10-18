@@ -717,7 +717,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 try
                     @debug "removing already reduced orphaned check-point"
                     orphan = pop!(orphans_remove)
-                    journal_start!(epmap_journal; stage="restart", tsk=0, pid)
+                    journal_start!(epmap_journal; stage="restart", tsk=0, pid, hostname)
                     epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, orphan)
                     journal_stop!(epmap_journal; stage="retart", tsk=0, pid, fault=false)
                 catch e
