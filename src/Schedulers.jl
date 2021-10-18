@@ -272,6 +272,7 @@ function loop(eloop::ElasticLoop)
         yield()
 
         for new_pid in new_pids
+            push!(eloop.used_pids, new_pid)
             init_tasks[new_pid] = @async begin
                 try
                     if new_pid ∉ eloop.initialized_pids
@@ -291,9 +292,12 @@ function loop(eloop::ElasticLoop)
                     end
                     @debug "putting pid $new_pid onto channel"
                     put!(eloop.pid_channel, new_pid)
-                    push!(eloop.used_pids, new_pid)
                 catch e
                     @warn "problem initializing $new_pid, removing $new_pid from cluster."
+                    used_pid_index = findfirst(used_pid->used_pid == new_pid, eloop.used_pids)
+                    if i != nothing
+                        deleteat!(eloop.used_pids, used_pid_index)
+                    end
                     logerror(e)
                     rmprocs(new_pid)
                 end
