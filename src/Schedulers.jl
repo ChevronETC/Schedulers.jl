@@ -295,7 +295,7 @@ function loop(eloop::ElasticLoop)
                 catch e
                     @warn "problem initializing $new_pid, removing $new_pid from cluster."
                     used_pid_index = findfirst(used_pid->used_pid == new_pid, eloop.used_pids)
-                    if i != nothing
+                    if used_pid_index != nothing
                         deleteat!(eloop.used_pids, used_pid_index)
                     end
                     logerror(e)
