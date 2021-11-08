@@ -325,7 +325,7 @@ end
 
     result = epmap_zeros()
 
-    journal = Schedulers.journal_init(1:100; reduce=true)
+    journal = Schedulers.journal_init(1:100, tsks->nothing; reduce=true)
 
     eloop = Schedulers.ElasticLoop(;
         epmap_init = Schedulers.epmap_default_init,
@@ -349,7 +349,8 @@ end
         epmap_reporttasks = true,
         epmap_maxerrors = Inf,
         epmap_retries = 0,
-        epmap_keepcheckpoints = false)
+        epmap_keepcheckpoints = false,
+        epmap_journal_task_callback = tsk->nothing)
 
     empty!(eloop, [1:length(checkpoints)-1;])
     eloop.exit_on_empty = true
