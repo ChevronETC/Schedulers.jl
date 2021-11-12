@@ -84,7 +84,7 @@ end
 
 function journal_init(tsks, epmap_journal_init_callback; reduce)
     journal = reduce ? Dict{String,Any}("tasks"=>Dict(), "pids"=>Dict()) : Dict{String,Any}("tasks"=>Dict())
-    journal["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+    journal["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
     for tsk in tsks
         journal["tasks"][tsk] = Dict("id"=>"$tsk", "trials"=>Dict[])
     end
@@ -98,7 +98,7 @@ function journal_final(journal)
             pop!(journal["pids"][pid], "tic")
         end
     end
-    journal["done"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+    journal["done"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
 end
 
 function journal_write(journal, filename)
@@ -133,7 +133,7 @@ function journal_start!(journal, epmap_journal_task_callback=tsk->nothing; stage
     end
 
     if stage ∈ ("task", "checkpoint")
-        journal["tasks"][tsk]["trials"][end][stage]["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+        journal["tasks"][tsk]["trials"][end][stage]["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
     elseif stage ∈ ("restart", "reduce")
         journal["pids"][pid]["tic"] = time()
     end
@@ -146,7 +146,7 @@ end
 function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage, tsk, pid, fault)
     if stage ∈ ("task", "checkpoint")
         journal["tasks"][tsk]["trials"][end][stage]["status"] = fault ? "failed" : "succeeded"
-        journal["tasks"][tsk]["trials"][end][stage]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+        journal["tasks"][tsk]["trials"][end][stage]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
     elseif stage ∈ ("restart", "reduce")
         journal["pids"][pid][stage]["elapsed"] += time() - journal["pids"][pid]["tic"]
         if fault
