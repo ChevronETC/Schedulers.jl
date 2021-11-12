@@ -82,12 +82,13 @@ function check_for_preempted(pid, epmap_preempted)
     preempted
 end
 
-function journal_init(tsks; reduce)
+function journal_init(tsks, epmap_journal_init_callback; reduce)
     journal = reduce ? Dict{String,Any}("tasks"=>Dict(), "pids"=>Dict()) : Dict{String,Any}("tasks"=>Dict())
-    journal["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+    journal["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
     for tsk in tsks
-        journal["tasks"][tsk] = Dict[]
+        journal["tasks"][tsk] = Dict("id"=>"$tsk", "trials"=>Dict[])
     end
+    epmap_journal_init_callback(tsks)
     journal
 end
 
@@ -97,7 +98,7 @@ function journal_final(journal)
             pop!(journal["pids"][pid], "tic")
         end
     end
-    journal["done"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+    journal["done"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
 end
 
 function journal_write(journal, filename)
@@ -106,9 +107,9 @@ function journal_write(journal, filename)
     end
 end
 
-function journal_start!(journal; stage, tsk, pid, hostname)
+function journal_start!(journal, epmap_journal_task_callback=tsk->nothing; stage, tsk, pid, hostname)
     if stage ∈ ("task", "checkpoint")
-        push!(journal["tasks"][tsk],
+        push!(journal["tasks"][tsk]["trials"],
             Dict(
                 "pid" => pid,
                 "hostname" => hostname,
@@ -132,21 +133,29 @@ function journal_start!(journal; stage, tsk, pid, hostname)
     end
 
     if stage ∈ ("task", "checkpoint")
-        journal["tasks"][tsk][end][stage]["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+        journal["tasks"][tsk]["trials"][end][stage]["start"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
     elseif stage ∈ ("restart", "reduce")
         journal["pids"][pid]["tic"] = time()
     end
+
+    if stage == "task"
+        epmap_journal_task_callback(journal["tasks"][tsk])
+    end
 end
 
-function journal_stop!(journal; stage, tsk, pid, fault)
+function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage, tsk, pid, fault)
     if stage ∈ ("task", "checkpoint")
-        journal["tasks"][tsk][end][stage]["status"] = fault ? "failed" : "succeeded"
-        journal["tasks"][tsk][end][stage]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS")
+        journal["tasks"][tsk]["trials"][end][stage]["status"] = fault ? "failed" : "succeeded"
+        journal["tasks"][tsk]["trials"][end][stage]["stop"] = Dates.format(now(Dates.UTC), "yyyy-mm-ddTHH:MM:SSZ")
     elseif stage ∈ ("restart", "reduce")
         journal["pids"][pid][stage]["elapsed"] += time() - journal["pids"][pid]["tic"]
         if fault
             journal["pids"][pid][stage]["faults"] += 1
         end
+    end
+
+    if stage == "task"
+        epmap_journal_task_callback(journal["tasks"][tsk])
     end
 end
 
@@ -382,6 +391,8 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
 * `epmap_reporttasks=true` log task assignment
+* `epmap_journal_init_callback=tsks->nothing` additional method when intializing the journal
+* `epmap_journal_task_callback=tsk->nothing` additional method when journaling a task
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -401,6 +412,8 @@ function epmap(f::Function, tasks, args...;
         epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,
         epmap_reporttasks = true,
+        epmap_journal_init_callback = tsks->nothing,
+        epmap_journal_task_callback = tsk->nothing,
         kwargs...)
     fails = Dict{Int,Int}()
 
@@ -419,7 +432,7 @@ function epmap(f::Function, tasks, args...;
 
     _elastic_loop = @async loop(eloop)
 
-    journal = journal_init(tasks; reduce=false)
+    journal = journal_init(tasks, epmap_journal_init_callback; reduce=false)
 
     # work loop
     @sync while true
@@ -458,15 +471,15 @@ function epmap(f::Function, tasks, args...;
             try
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                journal_start!(journal; stage="task", tsk, pid, hostname)
+                journal_start!(journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
-                journal_stop!(journal; stage="task", tsk, pid, fault=false)
+                journal_stop!(journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                 yield()
             catch e
                 @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid..."
-                journal_stop!(journal; stage="task", tsk, pid, fault=true)
+                journal_stop!(journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=true)
                 push!(eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 eloop.interrupted = r.do_interrupt
@@ -510,6 +523,8 @@ with an assoicated partial reduction.
 * `epmap_scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
 * `epmap_reporttasks=true` log task assignment
 * `epmap_journalfile=""` write a journal showing what was computed where to a json file
+* `epmap_journal_init_callback=tsks->nothing` additional method when intializing the journal
+* `epmap_journal_task_callback=tsk->nothing` additional method when journaling a task
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -562,6 +577,8 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_retries = 0,
         epmap_journalfile = "",
         epmap_keepcheckpoints = false, # used for unit testing / debugging
+        epmap_journal_init_callback=tsks->nothing, # additional method when intializing the journal
+        epmap_journal_task_callback=tsk->nothing, # additional method when journaling a task
         kwargs...) where {T,N}
     epmap_scratches = isa(epmap_scratch, AbstractArray) ? epmap_scratch : [epmap_scratch]
     for scratch in epmap_scratches
@@ -571,7 +588,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_zeros = ()->zeros(eltype(result), size(result))::T
     end
 
-    epmap_journal = journal_init(tasks; reduce=true)
+    epmap_journal = journal_init(tasks, epmap_journal_init_callback; reduce=true)
 
     epmap_eloop = ElasticLoop(;
         epmap_init,
@@ -596,6 +613,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_maxerrors,
         epmap_retries,
         epmap_keepcheckpoints,
+        epmap_journal_task_callback,
         kwargs...)
 
     empty!(epmap_eloop, [1:length(checkpoints)-1;])
@@ -634,6 +652,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         epmap_maxerrors,
         epmap_retries,
         epmap_keepcheckpoints,
+        epmap_journal_task_callback,
         kwargs...) where {T}
     fails = Dict{Int,Int}()
 
@@ -749,13 +768,13 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             try
                 epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                journal_start!(epmap_journal; stage="task", tsk, pid, hostname)
+                journal_start!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
                 remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
-                journal_stop!(epmap_journal; stage="task", tsk, pid, fault=false)
+                journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
                 @warn "pid=$pid, task loop, caught exception during f eval"
-                journal_stop!(epmap_journal; stage="task", tsk, pid, fault=false)
+                journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
                 push!(epmap_eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 epmap_eloop.interrupted = r.do_interrupt

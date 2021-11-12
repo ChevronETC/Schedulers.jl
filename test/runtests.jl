@@ -297,6 +297,7 @@ end
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
     @test_throws Exception epmapreduce!(zeros(Float32,10), foo9, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
+    rmprocs(workers())
 
     rm(tmpdir; recursive=true, force=true)
 end
@@ -325,7 +326,7 @@ end
 
     result = epmap_zeros()
 
-    journal = Schedulers.journal_init(1:100; reduce=true)
+    journal = Schedulers.journal_init(1:100, tsks->nothing; reduce=true)
 
     eloop = Schedulers.ElasticLoop(;
         epmap_init = Schedulers.epmap_default_init,
@@ -349,7 +350,8 @@ end
         epmap_reporttasks = true,
         epmap_maxerrors = Inf,
         epmap_retries = 0,
-        epmap_keepcheckpoints = false)
+        epmap_keepcheckpoints = false,
+        epmap_journal_task_callback = tsk->nothing)
 
     empty!(eloop, [1:length(checkpoints)-1;])
     eloop.exit_on_empty = true
@@ -422,6 +424,8 @@ end
         epmap_scratch = tmpdir,
         epmap_retries = 1,
         epmap_maxerrors = Inf)
+
+    rmprocs(workers())
 
     @test x ≈ sum(a*b*[1:20;])*ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -506,6 +510,8 @@ end
         epmap_scratch = tmpdir,
         epmap_zeros = my_zeros,
         epmap_reducer! = (x,y)->(x.y .+= y.y; x.z .+= y.z; nothing))
+
+    rmprocs(workers())
 
     @test x.y ≈ sum([a*tsk for tsk in 1:100])*ones(Float32,10)
     @test x.z ≈ sum([b*tsk for tsk in 1:100])*ones(Float32,10)
