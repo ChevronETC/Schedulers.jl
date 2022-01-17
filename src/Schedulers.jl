@@ -27,7 +27,7 @@ function handle_checkpoints!(pid, localresults, checkpoints, orphans)
     nothing
 end
 
-function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans)
+function handle_exception(e, pid, hostname, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans)
     logerror(e)
 
     fails[pid] += 1
@@ -40,12 +40,12 @@ function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, ep
         put!(pid_channel, -1)
         throw(e)
     elseif isa(e, ProcessExitedException)
-        @warn "process with id=$pid exited, removing from process list."
+        @warn "process with id=$pid ($hostname) exited, removing from process list."
         if haskey(Distributed.map_pid_wrkr, pid)
-            @debug "pid=$pid is known to Distributed, calling rmprocs"
+            @debug "pid=$pid ($hostname) is known to Distributed, calling rmprocs"
             rmprocs(pid)
         else
-            @debug "pid=$pid is not known to Distributed, calling kill"
+            @debug "pid=$pid ($hostname) is not known to Distributed, calling kill"
             try
                 # required for cluster managers that require clean-up when the julia process on a worker dies:
                 Distributed.kill(wrkrs[pid].manager, pid, wrkrs[pid].config)
@@ -56,9 +56,9 @@ function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, ep
         r = (do_break=true, do_interrupt=false)
     elseif nerrors >= epmap_maxerrors
         put!(pid_channel, -1)
-        error("too many errors, $nerrors errors")
+        error("too many errors on process with id=$pid ($hostname), $nerrors errors")
     elseif fails[pid] > epmap_retries+1
-        @warn "too many failures on process with id=$pid, removing from proces list"
+        @warn "too many failures on process with id=$pid ($hostname), removing from proces list"
         rmprocs(pid)
         delete!(wrkrs, pid)
         r = (do_break=true, do_interrupt=false)
@@ -67,7 +67,7 @@ function handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, ep
     handle_checkpoints!(pid, localresults, checkpoints, orphans)
     r
 end
-handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries) = handle_exception(e, pid, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, nothing, nothing, nothing)
+handle_exception(e, pid, hostname, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries) = handle_exception(e, pid, hostname, pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, nothing, nothing, nothing)
 
 function check_for_preempted(pid, epmap_preempted)
     preempted = false
@@ -469,7 +469,7 @@ function epmap(f::Function, tasks, args...;
             end
 
             try
-                epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                epmap_reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
@@ -478,10 +478,10 @@ function epmap(f::Function, tasks, args...;
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                 yield()
             catch e
-                @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid..."
+                @warn "caught an exception, there have been $(fails[pid]) failure(s) on process $pid ($hostname)..."
                 journal_stop!(journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=true)
                 push!(eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
@@ -704,7 +704,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                     @warn "caught restart error, reduce-in orphan check-point"
                     journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=true)
                     push!(orphans_compute, orphan)
-                    r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                     epmap_eloop.interrupted = r.do_interrupt
                     r.do_break && break
                 end
@@ -722,7 +722,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                     @warn "caught restart error, creating check-point."
                     journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=true)
                     push!(orphans_compute, orphan)
-                    r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                     epmap_eloop.interrupted = r.do_interrupt
                     r.do_break && break
                 end
@@ -743,7 +743,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                     @warn "caught restart error, clean-up"
                     journal_stop!(epmap_journal; stage="retart", tsk=0, pid, fault=true)
                     push!(orphans_remove, orphan)
-                    r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                     epmap_eloop.interrupted = r.do_interrupt
                     r.do_break && break
                 end
@@ -766,17 +766,17 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
 
             # compute and reduce
             try
-                epmap_reporttasks && @info "running task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                epmap_reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
                 remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
-                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
+                @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
-                @warn "pid=$pid, task loop, caught exception during f eval"
+                @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
                 journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
                 push!(epmap_eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
                 continue # no need to checkpoint since the task failed
@@ -795,7 +795,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 @warn "pid=$pid, task loop, caught exception during save_checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
                 push!(epmap_eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
@@ -812,7 +812,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
                 old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
-                handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
+                handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
@@ -847,18 +847,19 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
 
         fails[pid] = 0
 
-        if haskey(Distributed.map_pid_wrkr, pid)
-            wrkrs[pid] = Distributed.map_pid_wrkr[pid]
-        else
-            @warn "worker with pid=$pid is not registered"
-        end
-
         hostname = ""
         try
             hostname = remotecall_fetch(gethostname, pid)
         catch
-            @warn "unable to get hostname for pid=$pid"
+            @warn "unable to get hostname for pid=$pid ($hostname)"
         end
+
+        if haskey(Distributed.map_pid_wrkr, pid)
+            wrkrs[pid] = Distributed.map_pid_wrkr[pid]
+        else
+            @warn "worker with pid=$pid ($hostname) is not registered"
+        end
+
         @async while true
             epmap_eloop.interrupted && break
             check_for_preempted(pid, epmap_preempted) && break
@@ -891,11 +892,11 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
                 push!(checkpoints, checkpoint3)
                 push!(epmap_eloop.tsk_pool_done, tsk)
             catch e
-                @warn "pid=$pid, reduce loop, caught exception during reduce"
+                @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(checkpoints, checkpoint1, checkpoint2)
                 push!(epmap_eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
                 continue
@@ -906,10 +907,10 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
                 epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
-                @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 1"
+                @warn "pid=$pid ($hostname), reduce loop, caught exception during rm_checkpoint 1"
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(orphans_remove, checkpoint1, checkpoint2)
-                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
                 continue
@@ -920,10 +921,10 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
                 epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
-                @warn "pid=$pid, reduce loop, caught exception during rm_checkpoint 2"
+                @warn "pid=$pid ($hostname), reduce loop, caught exception during rm_checkpoint 2"
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(orphans_remove, checkpoint2)
-                r = handle_exception(e, pid, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
             end
