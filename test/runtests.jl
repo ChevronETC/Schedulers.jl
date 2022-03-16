@@ -3,7 +3,8 @@ using Distributed, Logging, Random, Test, Logging
 function safe_addprocs(n)
     try
         length(addprocs(n))
-    catch
+    catch e
+        Schedulers.logerror(e)
         @warn "problem calling addprocs, nworkers=$(nworkers())"
     end
 end
@@ -230,11 +231,29 @@ end
     end
 end
 
-@testset "pmapreduce, stable cluster test" begin
+@testset "pmapreduce, stable cluster test, backwards compatability" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     @everywhere function foo6(x, tsk, a; b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    a,b = 2,3
+    x = epmapreduce!(zeros(Float32,10), foo6, 1:100, a; b=b, epmap_scratch=tmpdir)
+    rmprocs(workers())
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, stable cluster test" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere function foo6(x, tsk, a; b)
+        x .+= a*b*tsk
         nothing
     end
 
@@ -260,7 +279,7 @@ end
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo7(x, tsk, a, b)
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         sleep(1)
         nothing
     end
@@ -332,7 +351,7 @@ end
             error("throwing an error")
         end
 
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         sleep(1)
         nothing
     end
@@ -364,7 +383,7 @@ end
             error("throwing an error")
         end
 
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         sleep(1)
         nothing
     end
@@ -391,7 +410,7 @@ end
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo10(x, tsk, a, b)
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         sleep(1)
         nothing
     end
@@ -478,7 +497,7 @@ end
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo11(x, tsk, a, b)
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         sleep(1)
         nothing
     end
@@ -520,7 +539,8 @@ end
     @everywhere using Distributed, Schedulers, Random, Test
     s = randstring(6)
     @everywhere function foo12(x, tsk, a, b)
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
+        sleep(5)
         nothing
     end
 
@@ -528,7 +548,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir)
+    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir, epmap_addprocs=safe_addprocs)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
@@ -548,7 +568,7 @@ end
             sleep(5)
         end
         if tsk == 100
-            @test nworkers() == 11
+            @test nworkers() < 11
         end
         nothing
     end
@@ -570,7 +590,7 @@ end
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo13(x, tsk, a, b)
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         sleep(5)
         nothing
     end
@@ -603,8 +623,8 @@ end
     @everywhere using Distributed, Schedulers, Random
     s = randstring(6)
     @everywhere function foo14(x, tsk, a, b)
-        fetch(x).y::Vector{Float32} .+= a*tsk
-        fetch(x).z::Vector{Float32} .+= b*tsk
+        x.y .+= a*tsk
+        x.z .+= b*tsk
         sleep(1)
         nothing
     end
@@ -632,7 +652,7 @@ end
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     @everywhere function foo15(x, tsk, a; b)
-        fetch(x)::Vector{Float32} .+= a*b*tsk
+        x .+= a*b*tsk
         nothing
     end
 
