@@ -26,7 +26,7 @@ handle_checkpoints!(pid, localresults::Nothing, checkpoints, orphans) = nothing
 function handle_checkpoints!(pid, localresults, checkpoints, orphans)
     pop!(localresults, pid)
     checkpoint = pop!(checkpoints, pid)
-    checkpoint == nothing || push!(orphans, checkpoint)
+    checkpoint === nothing || push!(orphans, checkpoint)
     nothing
 end
 
@@ -307,7 +307,7 @@ function loop(eloop::ElasticLoop)
                 catch e
                     @warn "problem initializing $new_pid, removing $new_pid from cluster."
                     used_pid_index = findfirst(used_pid->used_pid == new_pid, eloop.used_pids)
-                    if used_pid_index != nothing
+                    if used_pid_index !== nothing
                         deleteat!(eloop.used_pids, used_pid_index)
                     end
                     logerror(e)
@@ -350,7 +350,7 @@ function loop(eloop::ElasticLoop)
                 end
                 @debug "removing worker $pid from used pids"
                 deleteat_index = findfirst(used_pid->used_pid==pid, eloop.used_pids)
-                if deleteat_index != nothing
+                if deleteat_index !== nothing
                     deleteat!(eloop.used_pids, deleteat_index)
                 end
             end
@@ -587,7 +587,7 @@ function epmapreduce!(result::T, f, tasks, args...;
     for scratch in epmap_scratches
         isdir(scratch) || mkpath(scratch)
     end
-    if epmap_zeros == nothing
+    if epmap_zeros === nothing
         epmap_zeros = ()->zeros(eltype(result), size(result))::T
     end
 
@@ -720,7 +720,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                     journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=false)
                     old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
                     push!(orphans_remove, orphan)
-                    old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
+                    old_checkpoint === nothing || push!(orphans_remove, old_checkpoint)
                 catch e
                     @warn "caught restart error, creating check-point."
                     journal_stop!(epmap_journal; stage="restart", tsk=0, pid, fault=true)
@@ -806,7 +806,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             # delete old checkpoint
             old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
             try
-                if old_checkpoint != nothing
+                if old_checkpoint !== nothing
                     journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
                     epmap_keepcheckpoints || remotecall_fetch(rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
@@ -814,7 +814,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             catch e
                 @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
-                old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
+                old_checkpoint === nothing || push!(orphans_remove, old_checkpoint)
                 handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
                 epmap_eloop.interrupted = r.do_interrupt
                 r.do_break && break
@@ -822,7 +822,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         end
     end
     epmap_reporttasks && @info "...done task loop"
-    filter!(checkpoint->checkpoint != nothing, [collect(values(checkpoints)); orphans_compute...])
+    filter!(checkpoint->checkpoint !== nothing, [collect(values(checkpoints)); orphans_compute...])
 end
 
 function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
