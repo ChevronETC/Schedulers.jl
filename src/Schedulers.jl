@@ -795,7 +795,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
             catch e
-                @warn "pid=$pid, task loop, caught exception during save_checkpoint"
+                @warn "pid=$pid ($hostname), task loop, caught exception during save_checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
                 push!(epmap_eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
@@ -804,7 +804,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             end
 
             # delete old checkpoint
-            old_checkpoint,checkpoints[pid] = checkpoints[pid],_next_checkpoint
+            old_checkpoint,checkpoints[pid] = get(checkpoints, pid, nothing),_next_checkpoint
             try
                 if old_checkpoint != nothing
                     journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
@@ -812,7 +812,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                     journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
                 end
             catch e
-                @warn "pid=$pid, task loop, caught exception during rm_checkpoint"
+                @warn "pid=$pid ($hostname), task loop, caught exception during rm_checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
                 old_checkpoint == nothing || push!(orphans_remove, old_checkpoint)
                 handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries, localresults, checkpoints, orphans_compute)
