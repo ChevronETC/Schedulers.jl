@@ -521,6 +521,7 @@ with an assoicated partial reduction.
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
+* `epmap_accordion=true` shrink, and re-grow the cluster when making the transition from map to reduce
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
@@ -571,6 +572,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_usemaster = false,
         epmap_nworkers = nworkers,
         epmap_quantum = ()->32,
+        epmap_accordion = true,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,
@@ -608,6 +610,7 @@ function epmapreduce!(result::T, f, tasks, args...;
 
     checkpoints = epmapreduce_map(f, result, epmap_eloop, epmap_journal, args...;
         epmapreduce_id,
+        epmap_accordion,
         epmap_reducer!,
         epmap_zeros,
         epmap_preempted,
@@ -647,6 +650,7 @@ end
 
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         epmapreduce_id,
+        epmap_accordion,
         epmap_reducer!,
         epmap_zeros,
         epmap_preempted,
@@ -691,7 +695,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             epmap_eloop.interrupted && break
             check_for_preempted(pid, epmap_preempted) && break
 
-            isempty(epmap_eloop.tsk_pool_todo) && length(epmap_eloop.tsk_pool_done) == epmap_eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && break
+            if isempty(epmap_eloop.tsk_pool_todo) && isempty(orphans_compute) && isempty(orphans_remove)
+                epmap_accordion && put!(epmap_eloop.rm_pid_channel, pid)
+                break
+            end
+            length(epmap_eloop.tsk_pool_done) == epmap_eloop.tsk_count && break
             isempty(epmap_eloop.tsk_pool_todo) && length(epmap_eloop.tsk_pool_done) != epmap_eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && (yield(); continue)
 
             # re-start logic, reduce-in orphaned check-points

@@ -343,6 +343,7 @@ end
 
     checkpoints = Schedulers.epmapreduce_map(foo10, result, eloop, journal, a, b;
         epmapreduce_id = id,
+        epmap_accordion = false,
         epmap_reducer! = Schedulers.default_reducer!,
         epmap_zeros = epmap_zeros,
         epmap_preempted = Schedulers.epmap_default_preempted,
@@ -434,11 +435,18 @@ end
 
 @testset "pmapreduce, growing cluster test" begin
     safe_addprocs(5)
-    @everywhere using Distributed, Schedulers, Random
+    @everywhere using Distributed, Schedulers, Random, Test
     s = randstring(6)
     @everywhere function foo12(x, tsk, a, b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
-        sleep(5)
+        if tsk == 100
+            sleep(20)
+        else
+            sleep(5)
+        end
+        if tsk == 100
+            @test nworkers() < 11
+        end
         nothing
     end
 
@@ -446,7 +454,36 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_maxworkers=10, epmap_scratch=tmpdir)
+    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir)
+    rmprocs(workers())
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+
+    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, growing cluster test, no accordion" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random, Test
+    s = randstring(6)
+    @everywhere function foo12(x, tsk, a, b)
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        if tsk == 100
+            sleep(20)
+        else
+            sleep(5)
+        end
+        if tsk == 100
+            @test nworkers() == 11
+        end
+        nothing
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir, epmap_accordion=false)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
