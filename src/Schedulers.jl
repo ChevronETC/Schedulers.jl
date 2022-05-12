@@ -371,7 +371,7 @@ end
 
 function Base.empty!(eloop::ElasticLoop, tsk_pool_todo)
     empty!(eloop.used_pids)
-    if eloop.epmap_use_master
+    if !(eloop.epmap_use_master)
         push!(eloop.used_pids, 1)
     end
     eloop.tsk_pool_todo = tsk_pool_todo
@@ -671,7 +671,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         kwargs...) where {T}
     fails = Dict{Int,Int}()
 
-    wrkrs = Dict{Int, Distributed.Worker}()
+    wrkrs = Dict{Int, Union{Distributed.LocalProcess, Distributed.Worker}}()
 
     localresults = Dict{Int, Future}()
     checkpoints = Dict{Int, Any}()
@@ -852,7 +852,7 @@ function epmapreduce_reduce!(result::T, checkpoints, epmap_eloop, epmap_journal;
         epmap_keepcheckpoints) where {T}
     fails = Dict{Int,Int}()
 
-    wrkrs = Dict{Int, Distributed.Worker}()
+    wrkrs = Dict{Int, Union{Distributed.LocalProcess, Distributed.Worker}}()
 
     orphans_remove = Set{String}()
 
