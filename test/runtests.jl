@@ -337,7 +337,8 @@ end
         epmap_nworkers = nworkers,
         epmap_usemaster = false,
         tasks = 1:100,
-        exit_on_empty = false)
+        exit_on_empty = false,
+        run_init = true)
 
     _elastic_loop = @async Schedulers.loop(eloop)
 
@@ -356,6 +357,7 @@ end
 
     empty!(eloop, [1:length(checkpoints)-1;])
     eloop.exit_on_empty = true
+    eloop.run_init = false
 
     tsk = @async Schedulers.epmapreduce_reduce!(result, checkpoints, eloop, journal;
         epmapreduce_id = id,

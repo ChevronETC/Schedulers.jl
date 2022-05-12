@@ -210,6 +210,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     epmap_quantum::FQuantum
     epmap_nworkers::FNWorkers
     exit_on_empty::Bool
+    run_init::Bool
     tsk_pool_todo::Vector{T}
     tsk_pool_done::Vector{T}
     tsk_count::Int
@@ -224,6 +225,7 @@ function ElasticLoop(;
         epmap_nworkers,
         epmap_usemaster,
         exit_on_empty,
+        run_init,
         tasks)
     _tsk_pool_todo = vec(collect(tasks))
 
@@ -240,6 +242,7 @@ function ElasticLoop(;
         isa(epmap_quantum, Function) ? epmap_quantum : ()->epmap_quantum,
         epmap_nworkers,
         exit_on_empty,
+        run_init,
         _tsk_pool_todo,
         empty(_tsk_pool_todo),
         length(_tsk_pool_todo),
@@ -296,7 +299,9 @@ function loop(eloop::ElasticLoop)
                         load_functions_on_new_workers(new_pid)
                         @debug "calling init on new worker"
                         yield()
-                        eloop.epmap_init(new_pid)
+                        if eloop.run_init
+                            eloop.epmap_init(new_pid)
+                        end
                         @debug "done loading functions modules, and calling init on $new_pid"
                         yield()
                         _pid_up_timestamp[new_pid] = time()
@@ -431,7 +436,8 @@ function epmap(f::Function, tasks, args...;
         epmap_nworkers,
         epmap_usemaster,
         tasks,
-        exit_on_empty = true)
+        exit_on_empty = true,
+        run_init = true)
 
     _elastic_loop = @async loop(eloop)
 
@@ -604,7 +610,8 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_nworkers,
         epmap_usemaster,
         tasks,
-        exit_on_empty = false)
+        exit_on_empty = false,
+        run_init = true)
 
     _elastic_loop = @async loop(epmap_eloop)
 
@@ -624,6 +631,7 @@ function epmapreduce!(result::T, f, tasks, args...;
 
     empty!(epmap_eloop, [1:length(checkpoints)-1;])
     epmap_eloop.exit_on_empty = true
+    epmap_eloop.run_init = false
 
     result = epmapreduce_reduce!(result, checkpoints, epmap_eloop, epmap_journal;
         epmapreduce_id,
