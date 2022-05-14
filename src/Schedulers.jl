@@ -688,7 +688,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
         pid ∈ keys(localresults) && break # task loop has already run for this pid
 
-        localresults[pid] = remotecall(epmap_zeros, pid)
+        localresults[pid] = remotecall_wait(epmap_zeros, pid)
         checkpoints[pid] = nothing
 
         fails[pid] = 0
@@ -707,7 +707,6 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 epmap_accordion && put!(epmap_eloop.rm_pid_channel, pid)
                 break
             end
-            length(epmap_eloop.tsk_pool_done) == epmap_eloop.tsk_count && break
             isempty(epmap_eloop.tsk_pool_todo) && length(epmap_eloop.tsk_pool_done) != epmap_eloop.tsk_count && isempty(orphans_compute) && isempty(orphans_remove) && (yield(); continue)
 
             # re-start logic, reduce-in orphaned check-points
