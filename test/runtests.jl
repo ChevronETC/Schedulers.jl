@@ -1,4 +1,4 @@
-using Distributed, Logging, Random, Test
+using Distributed, Logging, Random, Test, Logging
 
 function safe_addprocs(n)
     try
@@ -204,13 +204,12 @@ end
 end
 
 @testset "pmapreduce, cluster with ProcessExitedException during tasks" begin
-    # TODO, how do we excersie the differnt fault mechanisms in the task loop
+    # TODO, how do we excersie the different fault mechanisms in the task loop
     #       1. fault during a f eval
-    #       2. fault during checkpoint
-    #       3. fault when removing old checkpoint
-    #       4. fault when reducing-in an ophan
-    #       5. fault when checkpoiting the reduced-in result
-    #       6. fault when removing old orphaned checkpoints
+    #       2. fault when removing old checkpoint
+    #       3. fault when reducing-in an ophan
+    #       4. fault when checkpoiting the reduced-in result
+    #       5. fault when removing old orphaned checkpoints
     safe_addprocs(5)
     wrkrs = workers()
     @everywhere using Distributed, Schedulers, Random
@@ -234,6 +233,41 @@ end
     @test nworkers() == 5
     _wrkrs = workers()
     @test wrkrs != _wrkrs
+
+    rmprocs(workers())
+
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, cluster with ErrorException during checkpoint" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere wrkrs = workers()
+
+    s = randstring(6)
+    @everywhere function foo7b(x, tsk, a, b)
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        sleep(1)
+        nothing
+    end
+
+    flg = remotecall_wait(()->[true], workers()[1])
+    
+    @everywhere function test_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T}
+        x = rand()
+        if x > 0.8
+            error("foo,x=$x")
+        end
+        Schedulers.default_save_checkpoint(checkpoint, localresult, T)
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    x = epmapreduce!(zeros(Float32,10), foo7b, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_save_checkpoint = test_save_checkpoint, epmap_retries=0)
 
     rmprocs(workers())
 
@@ -343,6 +377,7 @@ end
     _elastic_loop = @async Schedulers.loop(eloop)
 
     checkpoints = Schedulers.epmapreduce_map(foo10, result, eloop, journal, a, b;
+        epmap_save_checkpoint = Schedulers.default_save_checkpoint,
         epmapreduce_id = id,
         epmap_accordion = false,
         epmap_reducer! = Schedulers.default_reducer!,
