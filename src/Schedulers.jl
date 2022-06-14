@@ -244,6 +244,8 @@ function loop(eloop::ElasticLoop)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     init_tasks = Dict{Int,Task}()
 
+    tsk_addprocs = @async nothing
+
     while true
         @debug "checking pool, length=$(length(eloop.tsk_pool_done)), count=$(eloop.tsk_count)"
         yield()
@@ -322,11 +324,23 @@ function loop(eloop::ElasticLoop)
 
         @debug "add to the cluster?, n=$n, epmap_maxworkers()-epmap_nworkers()=$(_epmap_maxworkers-_epmap_nworkers), epmap_quantum=$_epmap_quantum, length(tsk_pool_todo)=$(length(eloop.tsk_pool_todo))"
         if n > 0
-            try
-                eloop.epmap_addprocs(n)
-            catch e
-                @error "problem adding new processes"
-                logerror(e)
+            if istaskfailed(tsk_addprocs)
+                try
+                    fetch(tsk_addprocs)
+                catch e
+                    logerror(e)
+                end
+            end
+
+            if istaskdone(tsk_addprocs)
+                tsk_addprocs = @async begin
+                    try
+                        eloop.epmap_addprocs(n)
+                    catch e
+                        @error "problem adding new processes"
+                        logerror(e)
+                    end
+                end
             end
         end
 
