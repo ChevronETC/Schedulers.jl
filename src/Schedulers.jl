@@ -10,9 +10,13 @@ function logerror(e)
     io = IOBuffer()
     showerror(io, e)
     write(io, "\n\terror type: $(typeof(e))\n")
-    for (exc, bt) in Base.catch_stack()
-        showerror(io, exc, bt)
-        println(io)
+    if VERSION >= v"1.7"
+        show(io, current_exceptions())
+    else
+        for (exc, bt) in Base.catch_stack()
+            showerror(io, exc, bt)
+            println(io)
+        end
     end
     @warn String(take!(io))
     close(io)
