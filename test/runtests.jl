@@ -662,6 +662,7 @@ end
 end
 
 @testset "logerror" begin
+    using Schedulers
     try
         notafunction()
     catch e
