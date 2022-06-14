@@ -185,6 +185,51 @@ end
     end
 end
 
+@testset "pmap with blocking addprocs" begin
+    using Distributed, Schedulers
+
+    s = randstring(6)
+    function foo5b(tsk, s)
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk, $(myid())")
+        sleep(1)
+    end
+
+    i = 0
+    function myaddprocs(n)
+        i += 1
+        @info "nworkers()=$(nworkers()), i=$i"
+        if i == 1
+            addprocs(n, "foo")
+        elseif i == 5
+            sleep(9999999) # block
+        else
+            sleep(2)
+            addprocs(n)
+        end
+    end
+
+    epmap(foo5b, 1:100, s; epmap_maxworkers=5, epmap_addprocs=myaddprocs, epmap_quantum=1)
+
+    h = Dict()
+    for w in workers()
+        h[w] = 0
+    end
+
+    rmprocs(workers())
+
+    for tsk = 1:100
+        r = read(joinpath(tempdir(), "task-$s-$tsk.txt"), String)
+        r_tsk, r_pid = split(r, ",")
+        h[parse(Int,r_pid)] += 1
+        @test r_tsk == "$tsk"
+        rm(joinpath(tempdir(), "task-$s-$tsk.txt"))
+    end
+    
+    for (key,value) in h
+        @test value ∈ 20:40
+    end
+end
+
 @testset "pmapreduce, stable cluster test" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
