@@ -536,7 +536,7 @@ with an assoicated partial reduction.
 * `epmap_usemaster=false` assign tasks to the master process?
 * `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
 * `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
-* `epmap_accordion=true` shrink, and re-grow the cluster when making the transition from map to reduce
+* `epmap_accordion=false` shrink, and re-grow the cluster when making the transition from map to reduce
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
 * `epmap_scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
@@ -588,7 +588,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_usemaster = false,
         epmap_nworkers = nworkers,
         epmap_quantum = ()->32,
-        epmap_accordion = true,
+        epmap_accordion = false,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
         epmap_preempted = epmap_default_preempted,

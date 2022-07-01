@@ -521,14 +521,6 @@ end
     s = randstring(6)
     @everywhere function foo12(x, tsk, a, b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
-        if tsk == 100
-            sleep(20)
-        else
-            sleep(5)
-        end
-        if tsk == 100
-            @test nworkers() < 11
-        end
         nothing
     end
 
@@ -544,7 +536,7 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
-@testset "pmapreduce, growing cluster test, no accordion" begin
+@testset "pmapreduce, growing cluster test, with accordion" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random, Test
     s = randstring(6)
@@ -565,7 +557,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir, epmap_accordion=false)
+    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir, epmap_accordion=true)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
