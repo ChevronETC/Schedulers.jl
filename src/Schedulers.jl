@@ -523,8 +523,8 @@ default_reducer!(x, y) = (x .+= y; nothing)
 
 where f is the map function, and `tasks` are an iterable set of tasks to map over.  The
 positional arguments `args` and the named arguments `kwargs` are passed to `f` which has
-the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is a Future
-with an assoicated partial reduction.
+the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is
+the assoicated partial reduction contribution to `result`.
 
 ## epmap_kwargs
 * `epmap_reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
@@ -560,7 +560,7 @@ With the assumption that `/scratch` is accesible from all workers:
 using Distributed
 addprocs(2)
 @everywhere using Distributed, Schedulers
-@everywhere f(x, tsk) = (fetch(x)::Vector{Float32} .+= tsk; nothing)
+@everywhere f(x, tsk) = x .+= tsk; nothing)
 result = epmapreduce!(zeros(Float32,10), f, 1:100)
 rmprocs(workers())
 ```
@@ -573,7 +573,7 @@ container = AzContainer("scratch"; storageaccount="mystorageaccount")
 mkpath(container)
 addprocs(2)
 @everywhere using Distributed, Schedulers
-@everywhere f(x, tsk) = (fetch(x)::Vector{Float32} .+= tsk; nothing)
+@everywhere f(x, tsk) = x .+= tsk; nothing)
 result = epmapreduce!(zeros(Float32,10), f, 1:100; epmap_scratch=container)
 rmprocs(workers())
 ```
@@ -667,6 +667,12 @@ function epmapreduce!(result::T, f, tasks, args...;
     result
 end
 
+function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+    localresult = fetch(_localresult)::T
+    f(localresult, itsk, args...; kwargs...)
+    nothing
+end
+
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         epmap_save_checkpoint,
         epmapreduce_id,
@@ -700,17 +706,31 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
         pid ∈ keys(localresults) && break # task loop has already run for this pid
 
-        localresults[pid] = remotecall_wait(epmap_zeros, pid)
-        checkpoints[pid] = nothing
-
         fails[pid] = 0
+
+        local hostname
+        try
+            hostname = remotecall_fetch(gethostname, pid)
+        catch e
+            r = handle_exception(e, pid, "unknown", epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+            continue
+        end
+
+        try
+            localresults[pid] = remotecall_wait(epmap_zeros, pid)
+        catch e
+            haskey(localresults, pid) && deleteat!(localresults, pid)
+            r = handle_exception(e, pid, hostname, epmap_eloop.pid_channel, wrkrs, fails, epmap_maxerrors, epmap_retries)
+            epmap_eloop.interrupted = r.do_interrupt
+            continue
+        end
+        checkpoints[pid] = nothing
 
         if haskey(Distributed.map_pid_wrkr, pid)
             wrkrs[pid] = Distributed.map_pid_wrkr[pid]
         else
             @warn "worker with pid=$pid is not registered"
         end
-        hostname = remotecall_fetch(gethostname, pid)
         @async while true
             epmap_eloop.interrupted && break
             check_for_preempted(pid, epmap_preempted) && break
@@ -805,7 +825,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 epmap_reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
-                remotecall_fetch(f, pid, localresults[pid], tsk, args...; kwargs...)
+                remotecall_fetch(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
