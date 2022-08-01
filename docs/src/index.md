@@ -18,7 +18,8 @@ to check-point local reductions.  This check-pointing is what allows for fault t
 elasticity.  However, it is important to note that it comes at the cost of IO operations.  It would be useful
 to investigate alternatives ideas that avoid IO such as resilient distributed data from Spark.
 
-# Important note
-Note that the error handling in the `epmapreduce!` method is, as of Schedulers 0.1.0, limited to the case where
-a worker is removed, throwing a `ProcessExitedException`.  In future versions, we will work to expand the scope
-of the error handling.
+The map and the reduce in the `epmapreduce!` method are asynchronous.  The map is prioritized, but when the
+number of tasks that need to be mapped over is less than the number of machines, the reduction over available
+check-points can begin.  In certain cases this can help to hide the cost of the reduction by overlapping with
+the map.  In addition, it can make better use of the cluster such that machines that would otherwise be idle
+can be used for the reduction.
