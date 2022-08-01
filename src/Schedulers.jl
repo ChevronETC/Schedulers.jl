@@ -166,7 +166,6 @@ function load_modules_on_new_workers(pid)
             end
         catch e
             @debug "caught error in load_modules_on_new_workers"
-            throw(e)
         end
     end
     nothing
@@ -186,7 +185,6 @@ function load_functions_on_new_workers(pid)
             if _name ∉ (Symbol("@enter"), Symbol("@run"), :ans, :vscodedisplay)
                 @debug "caught error in load_functions_on_new_workers for function $_name"
             end
-            throw(e)
         end
     end
 end
