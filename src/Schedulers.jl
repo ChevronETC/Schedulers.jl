@@ -519,7 +519,7 @@ takes the positional arguments `args`, and the keyword arguments `f_args`.  The 
 * `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
-* `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
+* `epmap_nworkers=()->nprocs()-1` the number of machines currently provisioned for work[1]
 * `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
@@ -540,7 +540,7 @@ function epmap(f::Function, tasks, args...;
         epmap_minworkers = nworkers,
         epmap_maxworkers = nworkers,
         epmap_usemaster = false,
-        epmap_nworkers = nworkers,
+        epmap_nworkers = ()->nprocs()-1,
         epmap_quantum = ()->32,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,
@@ -648,7 +648,7 @@ the assoicated partial reduction contribution to `result`.
 * `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `epmap_usemaster=false` assign tasks to the master process?
-* `epmap_nworkers=nworkers` the number of machines currently provisioned for work[1]
+* `epmap_nworkers=()->nprocs()-1` the number of machines currently provisioned for work[1]
 * `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
 * `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
@@ -700,7 +700,7 @@ function epmapreduce!(result::T, f, tasks, args...;
         epmap_minworkers = nworkers,
         epmap_maxworkers = nworkers,
         epmap_usemaster = false,
-        epmap_nworkers = nworkers,
+        epmap_nworkers = ()->nprocs()-1,
         epmap_quantum = ()->32,
         epmap_addprocs = epmap_default_addprocs,
         epmap_init = epmap_default_init,

@@ -19,7 +19,7 @@ end
         write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk,$(myid())")
         sleep(10)
     end
-    epmap(foo1, 1:10, s; epmap_nworkers=()->nprocs()-1)
+    epmap(foo1, 1:10, s)
 
     h = Dict()
     for w in workers()
@@ -51,7 +51,7 @@ end
         sleep(10)
     end
 
-    epmap(foo2, 1:100, s; epmap_maxworkers=10, epmap_minworkers=10, epmap_nworkers=()->nprocs()-1)
+    epmap(foo2, 1:100, s; epmap_maxworkers=10, epmap_minworkers=10)
 
     h = Dict()
     for w in workers()
@@ -83,7 +83,7 @@ end
         write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk, $(myid())")
         sleep(10)
     end
-    tsk = @async epmap(foo3, 1:100, s; epmap_maxworkers=10, epmap_nworkers=()->nprocs()-1)
+    tsk = @async epmap(foo3, 1:100, s; epmap_maxworkers=10)
 
     sleep(15)
     faulty_pids = workers()[randperm(length(workers()))[1:2]]
@@ -130,7 +130,7 @@ end
         h[w] = 0
     end
 
-    epmap(foo4, 1:105, s; epmap_maxworkers=10, epmap_minworkers=4, epmap_nworkers=()->nprocs()-1)
+    epmap(foo4, 1:105, s; epmap_maxworkers=10, epmap_minworkers=4)
 
     @test nworkers() == 4
     rmprocs(workers())
@@ -159,7 +159,7 @@ end
 
     _nworkers = 5
 
-    tsk = @async epmap(foo5, 1:100, s; epmap_maxworkers=()->_nworkers, epmap_minworkers=()->_nworkers, epmap_nworkers=()->nprocs()-1)
+    tsk = @async epmap(foo5, 1:100, s; epmap_maxworkers=()->_nworkers, epmap_minworkers=()->_nworkers)
 
     sleep(15)
     _nworkers = 10
@@ -210,7 +210,7 @@ end
         end
     end
 
-    epmap(foo5b, 1:100, s; epmap_maxworkers=5, epmap_addprocs=myaddprocs, epmap_quantum=1, epmap_nworkers=()->nprocs()-1)
+    epmap(foo5b, 1:100, s; epmap_maxworkers=5, epmap_addprocs=myaddprocs, epmap_quantum=1)
 
     h = Dict()
     for w in workers()
@@ -243,7 +243,7 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     a,b = 2,3
-    x = epmapreduce!(zeros(Float32,10), foo6, 1:100, a; b=b, epmap_scratch=tmpdir, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo6, 1:100, a; b=b, epmap_scratch=tmpdir)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
@@ -261,7 +261,7 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     a,b = 2,3
-    x = epmapreduce!(zeros(Float32,10), foo6, 1:100, a; b=b, epmap_scratch=tmpdir, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo6, 1:100, a; b=b, epmap_scratch=tmpdir)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
@@ -283,7 +283,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    tsk = @async epmapreduce!(zeros(Float32,10), foo7, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_nworkers=()->nprocs()-1)
+    tsk = @async epmapreduce!(zeros(Float32,10), foo7, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir)
 
     sleep(10)
     rmprocs(workers()[randperm(nworkers())[1]])
@@ -324,7 +324,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo7b, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_save_checkpoint = test_save_checkpoint, epmap_retries=0, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo7b, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_save_checkpoint = test_save_checkpoint, epmap_retries=0)
 
     rmprocs(workers())
 
@@ -353,7 +353,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo7c, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=0, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo7c, 1:100, a, b; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=0)
 
     rmprocs(workers())
 
@@ -384,7 +384,7 @@ end
 
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
-    x = epmapreduce!(zeros(Float32,10), foo8, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=Inf, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo8, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=Inf)
 
     @test nworkers() == 5
     rmprocs(workers())
@@ -416,7 +416,7 @@ end
 
     _pid = workers()[randperm(nworkers())[1]]
     toggle = remotecall_wait(()->[true], _pid)
-    @test_throws Exception epmapreduce!(zeros(Float32,10), foo9, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1, epmap_nworkers=()->nprocs()-1)
+    @test_throws Exception epmapreduce!(zeros(Float32,10), foo9, 1:10, a, b, toggle, _pid; epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_retries=1, epmap_maxerrors=1)
     rmprocs(workers())
 
     rm(tmpdir; recursive=true, force=true)
@@ -445,7 +445,7 @@ end
 
     a,b = 2,3
     tmpdir = mktempdir(;cleanup=false)
-    x = epmapreduce!(zeros(Float32,10), foo9b, 1:10, a, b, epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_reducer! = myreducer!, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo9b, 1:10, a, b, epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_reducer! = myreducer!)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:10;]) * ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -471,7 +471,7 @@ end
 
     a,b = 2,3
     tmpdir = mktempdir(;cleanup=false)
-    x = epmapreduce!(zeros(Float32,10), foo9c, 1:10, a, b, epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_reducer! = myreducer!, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo9c, 1:10, a, b, epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_reducer! = myreducer!)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:10;]) * ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -497,7 +497,7 @@ end
 
     a,b = 2,3
     tmpdir = mktempdir(;cleanup=false)
-    x = epmapreduce!(zeros(Float32,10), foo9d, 1:10, a, b, epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_rm_checkpoint = myrm, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo9d, 1:10, a, b, epmap_maxworkers=5, epmap_scratch=tmpdir, epmap_rm_checkpoint = myrm)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:10;]) * ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -518,7 +518,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir, epmap_addprocs=safe_addprocs, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo12, 1:100, a, b; epmap_minworkers=5, epmap_maxworkers=11, epmap_scratch=tmpdir, epmap_addprocs=safe_addprocs)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
@@ -544,7 +544,7 @@ end
     _nworkers = 5
 
     local x
-    tsk = @async epmapreduce!(zeros(Float32,10), foo13, 1:100, a, b; epmap_maxworkers=()->_nworkers, epmap_scratch=tmpdir, epmap_nworkers=()->nprocs()-1)
+    tsk = @async epmapreduce!(zeros(Float32,10), foo13, 1:100, a, b; epmap_maxworkers=()->_nworkers, epmap_scratch=tmpdir)
 
     sleep(20)
     _nworkers = 10
@@ -579,7 +579,6 @@ end
     x = my_zeros()
 
     epmapreduce!(x, foo14, 1:100, a, b;
-        epmap_nworkers=()->nprocs()-1,
         epmap_maxworkers = 10,
         epmap_scratch = tmpdir,
         epmap_zeros = my_zeros,
@@ -602,7 +601,7 @@ end
     tmpdirs = [mktempdir(;cleanup=false) for i=1:3]
 
     a,b = 2,3
-    x = epmapreduce!(zeros(Float32,10), foo15, 1:100, a; b=b, epmap_scratch=tmpdirs, epmap_keepcheckpoints=true, epmap_nworkers=()->nprocs()-1)
+    x = epmapreduce!(zeros(Float32,10), foo15, 1:100, a; b=b, epmap_scratch=tmpdirs, epmap_keepcheckpoints=true)
 
     ncheckpoints = [length(readdir(tmpdir)) for tmpdir in tmpdirs]
     ncheckpoints_average = sum(ncheckpoints) / 3
