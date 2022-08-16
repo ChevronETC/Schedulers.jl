@@ -1,4 +1,4 @@
-using Distributed, Logging, Random, Schedulers, Test, Logging
+using Distributed, Logging, Random, Schedulers, Test
 
 ENV["JULIA_WORKER_TIMEOUT"] = "120"
 
