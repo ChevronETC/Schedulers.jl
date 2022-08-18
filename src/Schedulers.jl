@@ -1,6 +1,6 @@
 module Schedulers
 
-using Dates, Distributed, DistributedOperations, JSON, Logging, Printf, Random, Serialization, Statistics
+using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
