@@ -148,7 +148,7 @@ end
 # for performance metrics, track when the pid is started
 const _pid_up_timestamp = Dict{Int, Float64}()
 
-mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FNWorkers<:Function,FQuantum<:Function,T,C}
+mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
     epmap_use_master::Bool
     initialized_pids::Set{Int}
     used_pids::Set{Int}
@@ -156,8 +156,12 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     pid_channel_map_remove::Channel{Tuple{Int,Bool}}
     pid_channel_reduce_add::Channel{Int}
     pid_channel_reduce_remove::Channel{Tuple{Int,Bool}}
+    reduce_trigger_channel::Channel{Bool}
     epmap_addprocs::FAddProcs
     epmap_init::FInit
+    is_reduce_triggered::Bool
+    epmap_reduce_trigger::FTrigger
+    epmap_save_partial_reduction::FSave
     epmap_minworkers::FMinWorkers
     epmap_maxworkers::FMaxWorkers
     epmap_quantum::FQuantum
@@ -183,8 +187,12 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         Channel{Tuple{Int,Bool}}(32),
         Channel{Int}(32),
         Channel{Tuple{Int,Bool}}(32),
+        Channel{Bool}(1),
         options.addprocs,
         options.init,
+        false,
+        options.reduce_trigger,
+        options.save_partial_reduction,
         options.minworkers,
         options.maxworkers,
         options.quantum,
@@ -240,6 +248,48 @@ function reduce_checkpoints_is_dirty(eloop::ElasticLoop)
         end
     end
     false
+end
+
+function save_partial_reduction(eloop)
+    if isempty(eloop.reduce_checkpoints)
+        @warn "reduction is empty, nothing to save."
+    else
+        try
+            x = deserialize(eloop.reduce_checkpoints[1])
+            eloop.epmap_save_partial_reduction(x)
+        catch e
+            @error "problem running user-supplied save_partial_reduction"
+            logerror(e, Logging.Error)
+        end
+    end
+end
+
+function reduce_trigger(eloop::ElasticLoop)
+    @debug "running user reduce trigger"
+    try
+        eloop.epmap_reduce_trigger(eloop.reduce_trigger_channel)
+    catch e
+        @error "problem running user-supplied reduce trigger"
+        logerror(e, Logging.Error)
+    end
+
+    @debug "checking for reduce trigger"
+    if !isempty(eloop.reduce_trigger_channel)
+        @info "reduce_trigger_channel is not empty"
+        take!(eloop.reduce_trigger_channel)
+        @info "done taking from reduce_trigger_channel"
+        eloop.is_reduce_triggered = true
+    end
+
+    @debug "eloop.is_reduce_triggered=$(eloop.is_reduce_triggered), length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))"
+    if eloop.is_reduce_triggered && length(eloop.checkpoints) == 0 && length(eloop.reduce_checkpoints) == 1
+        @info "saving partial reduction, length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))"
+        save_partial_reduction(eloop)
+        @debug "done saving partial reduction"
+        eloop.is_reduce_triggered = false
+    end
+    @debug "foo"
+    eloop.is_reduce_triggered
 end
 
 function loop(eloop::ElasticLoop, tsk_map, tsk_reduce)
@@ -314,6 +364,10 @@ function loop(eloop::ElasticLoop, tsk_map, tsk_reduce)
         @debug "workers()=$(workers()), new_pids=$new_pids, used_pids=$(eloop.used_pids), bad_pids=$bad_pids"
         yield()
 
+        @debug "checking for reduction trigger"
+        reduce_trigger(eloop)
+        @debug "trigger=$(eloop.is_reduce_triggered)"
+
         for new_pid in new_pids
             push!(eloop.used_pids, new_pid)
             init_tasks[new_pid] = @async begin
@@ -343,7 +397,10 @@ function loop(eloop::ElasticLoop, tsk_map, tsk_reduce)
                         new_pid ∈ eloop.used_pids && pop!(eloop.used_pids, new_pid)
                     else
                         wrkrs[new_pid] = Distributed.map_pid_wrkr[new_pid]
-                        if is_more_tasks
+                        # TODO - can we be clever about overlapping compute with partial reduction
+                        # _is_reduce = eloop.is_reduce_triggered && reduce_active_pid_count < length(eloop.checkpoints) + length(eloop.reduce_checkpoints) - 1
+                        @info "eloop.is_reduce_triggered=$(eloop.is_reduce_triggered)"
+                        if is_more_tasks && !(eloop.is_reduce_triggered)
                             @debug "putting pid=$new_pid onto map channel"
                             put!(eloop.pid_channel_map_add, new_pid)
                         elseif is_more_checkpoints
@@ -386,7 +443,7 @@ function loop(eloop::ElasticLoop, tsk_map, tsk_reduce)
                     while !isempty(bad_pids)
                         bad_pid = pop!(bad_pids)
                         if haskey(Distributed.map_pid_wrkr, bad_pid)
-                            @debug "bad pid=$bad_pid is know to Distributed, calling rmprocs"
+                            @debug "bad pid=$bad_pid is known to Distributed, calling rmprocs"
                             rmprocs(bad_pid)
                         else
                             @debug "bad pid=$bad_pid is not known to Distributed, calling kill"
@@ -436,7 +493,7 @@ function loop(eloop::ElasticLoop, tsk_map, tsk_reduce)
         try
             while isready(eloop.pid_channel_map_remove)
                 pid,isbad = take!(eloop.pid_channel_map_remove)
-                @debug "map channel, received pid=$pid, making sure that it is initialized"
+                @info "map channel, received pid=$pid, making sure that it is initialized"
                 yield()
                 wait(init_tasks[pid])
                 isbad && push!(bad_pids, pid)
@@ -533,6 +590,8 @@ mutable struct SchedulerOptions{C}
     id::String
     save_checkpoint::Function
     rm_checkpoint::Function
+    reduce_trigger::Function
+    save_partial_reduction::Function
 end
 
 function SchedulerOptions(;
@@ -557,7 +616,9 @@ function SchedulerOptions(;
         scratch = ["/scratch"],
         id = randstring(6),
         save_checkpoint = default_save_checkpoint,
-        rm_checkpoint = default_rm_checkpoint)
+        rm_checkpoint = default_rm_checkpoint,
+        reduce_trigger = channel->nothing,
+        save_partial_reduction = checkpoint->nothing)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -579,7 +640,9 @@ function SchedulerOptions(;
         isa(scratch, AbstractArray) ? scratch : [scratch],
         id,
         save_checkpoint,
-        rm_checkpoint)
+        rm_checkpoint,
+        reduce_trigger,
+        save_partial_reduction)
 end
 
 """
@@ -836,8 +899,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         @async while true
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
+            @info "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
             is_preempted = check_for_preempted(pid, options.preempted)
-            if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted
+            if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || epmap_eloop.is_reduce_triggered
                 if epmap_eloop.checkpoints[pid] !== nothing
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                 end
