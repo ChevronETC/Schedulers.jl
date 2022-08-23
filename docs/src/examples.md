@@ -63,19 +63,16 @@ x = epmapreduce!(my_zeros(), foo, 1:10;
     epmap_reducer! = my_reducer!)
 ```
 
-## Parallel map with elasticity
-Both `epmap` and `epmapreduce` can accept `epmap_minworkers` and
-`epmap_maxworkers` key-word arguments to control the elasticity.  In
-addition the `epmap_quantum` and `epmap_addprocs` arguments are used to
-control how workers are added.  `Distributed.rmprocs` is used to shrink
-the number of workers.  Finally, note that the `epmap_nworkers` method
-allows you to specify a method that returns the current number of allocated
-workers.  This is useful for cloud computing where there is latency associated
-with provisioning.  See for example the `nworkers_provisioned` method in
-[AzManagers.jl](https://github.com/ChevronETC/AzManagers.jl).  As an example of
-elasticity, the number of workers will shrink when the number of remaining tasks
-is less than the number of Julia workers, or when a worker is deemed not usable
-due to fault handling.
+## Parameterization
+Both `epmap` and `epmapreduce!` can be controled by a parameter-set
+defined in `options::SchedulerOptions`, and that can be passed as the
+first argument to `epmap` or `epmapreduce`.  The parameters that can be set
+are described in the `epmap` and `epmapreduce!` documentation.
+
+### Parallel map with elasticity
+As an example of parameterizing `epmap`, we consider allow the compute cluster
+to grow and shrink during the map.  `options::SchedulerOptions` include
+`options.minworkers` and `options.maxworkers` to control elasticity.
 ```julia
 using Distributed
 
@@ -86,8 +83,18 @@ addprocs(10)
     sleep(60)
 end
 
-epmap(foo, 1:20; emap_minworkers=5, emap_maxworkers=15, emap_addprocs=addprocs)
+epmap(SchedulerOptions(;minworkers=5, maxworkers=15), foo, 1:20)
 rmprocs(workers())
 ```
-Note that as epmap elastically adds workers, methods and packages that are defined
-in `Main` will automatically be loaded on the added workers.
+
+In addition `options.quantum` and `options.addprocs` can be
+used to control how workers are added.  `Distributed.rmprocs` is used to shrink
+the number of workers.  Further, note that the `epmap_nworkers` method
+allows you to specify a method that returns the current number of allocated
+workers.  This is useful for cloud computing where there is latency associated
+with provisioning.  See for example the `nworkers_provisioned` method in
+[AzManagers.jl](https://github.com/ChevronETC/AzManagers.jl).  As an example of
+elasticity, the number of workers will shrink when the number of remaining tasks
+is less than the number of Julia workers, or when a worker is deemed not usable
+due to fault handling. Note that as epmap elastically adds workers, methods 
+and packages that are defined in `Main` will automatically be loaded on the added workers.

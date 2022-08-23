@@ -172,32 +172,23 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     errored::Bool
     pid_failures::Dict{Int,Int}
 end
-function ElasticLoop(::Type{C};
-        epmap_init,
-        epmap_addprocs,
-        epmap_quantum,
-        epmap_minworkers,
-        epmap_maxworkers,
-        epmap_nworkers,
-        epmap_usemaster,
-        tasks,
-        isreduce) where {C}
+function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
 
     eloop = ElasticLoop(
-        epmap_usemaster,
-        epmap_usemaster ? Set{Int}() : Set(1),
-        epmap_usemaster ? Set{Int}() : Set(1),
+        options.usemaster,
+        options.usemaster ? Set{Int}() : Set(1),
+        options.usemaster ? Set{Int}() : Set(1),
         Channel{Int}(32),
         Channel{Tuple{Int,Bool}}(32),
         Channel{Int}(32),
         Channel{Tuple{Int,Bool}}(32),
-        epmap_addprocs,
-        epmap_init,
-        isa(epmap_minworkers, Function) ? epmap_minworkers : ()->epmap_minworkers,
-        isa(epmap_maxworkers, Function) ? epmap_maxworkers : ()->epmap_maxworkers,
-        isa(epmap_quantum, Function) ? epmap_quantum : ()->epmap_quantum,
-        epmap_nworkers,
+        options.addprocs,
+        options.init,
+        options.minworkers,
+        options.maxworkers,
+        options.quantum,
+        options.nworkers,
         _tsk_pool_todo,
         empty(_tsk_pool_todo),
         length(_tsk_pool_todo),
@@ -506,27 +497,102 @@ function loop(eloop::ElasticLoop)
     nothing
 end
 
+default_reducer!(x, y) = (x .+= y; nothing)
+
+mutable struct SchedulerOptions{C}
+    retries::Int
+    maxerrors::Int
+    minworkers::Function
+    maxworkers::Function
+    nworkers::Function
+    usemaster::Bool
+    quantum::Function
+    addprocs::Function
+    init::Function
+    preempted::Function
+    reporttasks::Bool
+    keepcheckpoints::Bool
+    journalfile::String
+    journal_init_callback::Function
+    journal_task_callback::Function
+    # reduce specific:
+    reducer!::Function
+    zeros::Function
+    scratch::Vector{C}
+    id::String
+    save_checkpoint::Function
+    rm_checkpoint::Function
+end
+
+function SchedulerOptions(;
+        retries = 0,
+        maxerrors = typemax(Int),
+        minworkers = Distributed.nworkers,
+        maxworkers = Distributed.nworkers,
+        nworkers = ()->Distributed.nprocs()-1,
+        usemaster = false,
+        quantum = ()->32,
+        addprocs = Distributed.addprocs,
+        init = epmap_default_init,
+        preempted = epmap_default_preempted,
+        reporttasks = true,
+        keepcheckpoints = false,
+        journalfile = "",
+        journal_init_callback = tsks->nothing,
+        journal_task_callback = tsk->nothing,
+        # reduce specific
+        reducer!::Function = default_reducer!,
+        zeros = ()->nothing,
+        scratch = ["/scratch"],
+        id = randstring(6),
+        save_checkpoint = default_save_checkpoint,
+        rm_checkpoint = default_rm_checkpoint)
+    SchedulerOptions(
+        retries,
+        maxerrors,
+        isa(minworkers, Function) ? minworkers : ()->minworkers,
+        isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
+        nworkers,
+        usemaster,
+        isa(quantum, Function) ? quantum : ()->quantum,
+        addprocs,
+        init,
+        preempted,
+        reporttasks,
+        keepcheckpoints,
+        journalfile,
+        journal_init_callback,
+        journal_task_callback,
+        reducer!,
+        zeros,
+        isa(scratch, AbstractArray) ? scratch : [scratch],
+        id,
+        save_checkpoint,
+        rm_checkpoint)
+end
+
 """
-    epmap(f, tasks, args...; pmap_kwargs..., f_kwargs...)
+    epmap([options,] f, tasks, args...; kwargs...)
 
 where `f` is the map function, and `tasks` is an iterable collection of tasks.  The function `f`
-takes the positional arguments `args`, and the keyword arguments `f_args`.  The optional arguments
-`pmap_kwargs` are as follows.
+takes the positional arguments `args`, and the keyword arguments `kwargs`.  `epmap` is parameterized
+using `options::SchedulerOptions` and can be built using `options=SchedulerOptions(;epmap_kwargs...)`
+and `pmap_kwargs` are as follows.
 
-## pmap_kwargs
-* `epmap_retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
-* `epmap_maxerrors=Inf` the maximum number of errors before we give-up and exit
-* `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
-* `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
-* `epmap_usemaster=false` assign tasks to the master process?
-* `epmap_nworkers=()->nprocs()-1` the number of machines currently provisioned for work[1]
-* `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
-* `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
-* `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
-* `epmap_preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
-* `epmap_reporttasks=true` log task assignment
-* `epmap_journal_init_callback=tsks->nothing` additional method when intializing the journal
-* `epmap_journal_task_callback=tsk->nothing` additional method when journaling a task
+## epmap_kwargs
+* `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
+* `maxerrors=Inf` the maximum number of errors before we give-up and exit
+* `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
+* `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
+* `usemaster=false` assign tasks to the master process?
+* `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[1]
+* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
+* `init=pid->nothing` after starting a worker, this method is run on that worker.
+* `preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
+* `reporttasks=true` log task assignment
+* `journal_init_callback=tsks->nothing` additional method when intializing the journal
+* `journal_task_callback=tsk->nothing` additional method when journaling a task
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -534,35 +600,12 @@ some cluster managers, there may be a delay between the provisioining of a machi
 Julia cluster.
 [2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
 """
-function epmap(f::Function, tasks, args...;
-        epmap_retries = 0,
-        epmap_maxerrors = Inf,
-        epmap_minworkers = nworkers,
-        epmap_maxworkers = nworkers,
-        epmap_usemaster = false,
-        epmap_nworkers = ()->nprocs()-1,
-        epmap_quantum = ()->32,
-        epmap_addprocs = epmap_default_addprocs,
-        epmap_init = epmap_default_init,
-        epmap_preempted = epmap_default_preempted,
-        epmap_reporttasks = true,
-        epmap_journal_init_callback = tsks->nothing,
-        epmap_journal_task_callback = tsk->nothing,
-        kwargs...)
-    eloop = ElasticLoop(Nothing;
-        epmap_init,
-        epmap_addprocs,
-        epmap_quantum,
-        epmap_minworkers,
-        epmap_maxworkers,
-        epmap_nworkers,
-        epmap_usemaster,
-        tasks,
-        isreduce = false)
+function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...)
+    eloop = ElasticLoop(Nothing, tasks, options; isreduce=false)
 
     tsk_eloop = @async loop(eloop)
 
-    journal = journal_init(tasks, epmap_journal_init_callback; reduce=false)
+    journal = journal_init(tasks, options.journal_init_callback; reduce=false)
 
     # work loop
     @sync while true
@@ -583,7 +626,7 @@ function epmap(f::Function, tasks, args...;
         end
 
         @async while true
-            is_preempted = check_for_preempted(pid, epmap_preempted)
+            is_preempted = check_for_preempted(pid, options.preempted)
             if is_preempted || length(eloop.tsk_pool_done) == eloop.tsk_count || eloop.interrupted
                 @debug "putting $pid onto map_remove channel"
                 put!(eloop.pid_channel_map_remove, (pid,is_preempted))
@@ -601,19 +644,19 @@ function epmap(f::Function, tasks, args...;
             end
 
             try
-                epmap_reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                journal_start!(journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
+                journal_start!(journal, options.journal_task_callback; stage="task", tsk, pid, hostname)
                 remotecall_fetch(f, pid, tsk, args...; kwargs...)
-                journal_stop!(journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
+                journal_stop!(journal, options.journal_task_callback; stage="task", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                 yield()
             catch e
                 @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
-                journal_stop!(journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=true)
+                journal_stop!(journal, options.journal_task_callback; stage="task", tsk, pid, fault=true)
                 push!(eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, hostname, eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
                 if r.do_break || r.do_interrupt
                     put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
                 end
@@ -631,32 +674,36 @@ function epmap(f::Function, tasks, args...;
     journal
 end
 
-default_reducer!(x, y) = (x .+= y; nothing)
-"""
-    epmapreduce!(result, f, tasks, args...; epmap_kwargs..., kwargs...) -> result
+epmap(f::Function, tasks, args...; kwargs...) = epmap(SchedulerOptions(), f, tasks, args..., kwargs...)
 
-where f is the map function, and `tasks` are an iterable set of tasks to map over.  The
+"""
+    epmapreduce!(result, [options], f, tasks, args...; kwargs...) -> result
+
+where `f` is the map function, and `tasks` are an iterable set of tasks to map over.  The
 positional arguments `args` and the named arguments `kwargs` are passed to `f` which has
 the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is
-the assoicated partial reduction contribution to `result`.
+the assoicated partial reduction contribution to `result`.  `epmapreduce!` is parameterized
+by `options::SchedulerOptions` and can be built using `options=SchedulerOptions(;epmap_kwargs...)`
+and `epmap_kwargs` are as follows.
 
 ## epmap_kwargs
-* `epmap_reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
-* `epmap_zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
-* `epmap_retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
-* `epmap_maxerrors=Inf` the maximum number of errors before we give-up and exit
-* `epmap_minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
-* `epmap_maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
-* `epmap_usemaster=false` assign tasks to the master process?
-* `epmap_nworkers=()->nprocs()-1` the number of machines currently provisioned for work[1]
-* `epmap_quantum=()->32` the maximum number of workers to elastically add at a time
-* `epmap_addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
-* `epmap_init=pid->nothing` after starting a worker, this method is run on that worker.
-* `epmap_scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
-* `epmap_reporttasks=true` log task assignment
-* `epmap_journalfile=""` write a journal showing what was computed where to a json file
-* `epmap_journal_init_callback=tsks->nothing` additional method when intializing the journal
-* `epmap_journal_task_callback=tsk->nothing` additional method when journaling a task
+* `reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
+* `zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
+* `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
+* `maxerrors=Inf` the maximum number of errors before we give-up and exit
+* `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
+* `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
+* `usemaster=false` assign tasks to the master process?
+* `nworkers=nworkers` the number of machines currently provisioned for work[1]
+* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
+* `init=pid->nothing` after starting a worker, this method is run on that worker.
+* `scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
+* `reporttasks=true` log task assignment
+* `journalfile=""` write a journal showing what was computed where to a json file
+* `journal_init_callback=tsks->nothing` additional method when intializing the journal
+* `journal_task_callback=tsk->nothing` additional method when journaling a task
+* `id=randstring(6)` identifier used for the scratch files
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -687,79 +734,28 @@ mkpath(container)
 addprocs(2)
 @everywhere using Distributed, Schedulers
 @everywhere f(x, tsk) = x .+= tsk; nothing)
-result = epmapreduce!(zeros(Float32,10), f, 1:100; epmap_scratch=container)
+result = epmapreduce!(zeros(Float32,10), SchedulerOptions(;scratch=container), f, 1:100)
 rmprocs(workers())
 ```
 """
-function epmapreduce!(result::T, f, tasks, args...;
-        epmap_reducer! = default_reducer!,
-        epmap_zeros = nothing,
-        epmap_save_checkpoint = default_save_checkpoint,
-        epmap_rm_checkpoint = default_rm_checkpoint,
-        epmapreduce_id = randstring(6),
-        epmap_minworkers = nworkers,
-        epmap_maxworkers = nworkers,
-        epmap_usemaster = false,
-        epmap_nworkers = ()->nprocs()-1,
-        epmap_quantum = ()->32,
-        epmap_addprocs = epmap_default_addprocs,
-        epmap_init = epmap_default_init,
-        epmap_preempted = epmap_default_preempted,
-        epmap_scratch = ["/scratch"],
-        epmap_reporttasks = true,
-        epmap_maxerrors = Inf,
-        epmap_retries = 0,
-        epmap_journalfile = "",
-        epmap_keepcheckpoints = false, # used for unit testing / debugging
-        epmap_journal_init_callback=tsks->nothing, # additional method when intializing the journal
-        epmap_journal_task_callback=tsk->nothing, # additional method when journaling a task
-        kwargs...) where {T,N}
-    epmap_scratches = isa(epmap_scratch, AbstractArray) ? epmap_scratch : [epmap_scratch]
-    for scratch in epmap_scratches
+function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
+    for scratch in options.scratch
         isdir(scratch) || mkpath(scratch)
     end
-    if epmap_zeros === nothing
-        epmap_zeros = ()->zeros(eltype(result), size(result))::T
+
+    if options.zeros() === nothing
+        options.zeros = ()->zeros(eltype(result), size(result))::T
     end
 
-    epmap_journal = journal_init(tasks, epmap_journal_init_callback; reduce=true)
+    epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
 
-    epmap_eloop = ElasticLoop(typeof(next_checkpoint(epmapreduce_id, epmap_scratches));
-        epmap_init,
-        epmap_addprocs,
-        epmap_quantum,
-        epmap_minworkers,
-        epmap_maxworkers,
-        epmap_nworkers,
-        epmap_usemaster,
-        tasks,
-        isreduce = true)
+    epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
 
     tsk_loop = @async loop(epmap_eloop)
 
-    tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, args...;
-        epmap_save_checkpoint,
-        epmap_rm_checkpoint,
-        epmapreduce_id,
-        epmap_zeros,
-        epmap_preempted,
-        epmap_scratches,
-        epmap_reporttasks,
-        epmap_maxerrors,
-        epmap_retries,
-        epmap_keepcheckpoints,
-        epmap_journal_task_callback,
-        kwargs...)
+    tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
 
-    tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal;
-        epmapreduce_id,
-        epmap_reducer!,
-        epmap_preempted,
-        epmap_scratches,
-        epmap_maxerrors,
-        epmap_retries,
-        epmap_rm_checkpoint,
-        epmap_keepcheckpoints)
+    tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
     @debug "waiting for tsk_map"
     wait(tsk_map)
@@ -770,10 +766,12 @@ function epmapreduce!(result::T, f, tasks, args...;
     @debug "finished waiting for tsk_reduce"
 
     journal_final(epmap_journal)
-    journal_write(epmap_journal, epmap_journalfile)
+    journal_write(epmap_journal, options.journalfile)
 
     result
 end
+
+epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
 function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
     localresult = fetch(_localresult)::T
@@ -781,19 +779,7 @@ function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwar
     nothing
 end
 
-function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
-        epmap_save_checkpoint,
-        epmap_rm_checkpoint,
-        epmapreduce_id,
-        epmap_zeros,
-        epmap_preempted,
-        epmap_scratches,
-        epmap_reporttasks,
-        epmap_maxerrors,
-        epmap_retries,
-        epmap_keepcheckpoints,
-        epmap_journal_task_callback,
-        kwargs...) where {T}
+function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
 
     checkpoint_orphans = Any[]
@@ -824,10 +810,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
         end
 
         try
-            localresults[pid] = remotecall_wait(epmap_zeros, pid)
+            localresults[pid] = remotecall_wait(options.zeros, pid)
         catch e
             @warn "unable to initialize local reduction"
-            r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+            r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
             epmap_eloop.interrupted = r.do_interrupt
             epmap_eloop.errored = r.do_error
             haskey(localresults, pid) && deleteat!(localresults, pid)
@@ -841,7 +827,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
 
         @async while true
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
-            is_preempted = check_for_preempted(pid, epmap_preempted)
+            is_preempted = check_for_preempted(pid, options.preempted)
             if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted
                 if epmap_eloop.checkpoints[pid] !== nothing
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
@@ -863,17 +849,17 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
 
             # compute and reduce
             try
-                epmap_reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                journal_start!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, hostname)
+                journal_start!(epmap_journal, options.journal_task_callback; stage="task", tsk, pid, hostname)
                 remotecall_fetch(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
-                journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
+                journal_stop!(epmap_journal, options.journal_task_callback; stage="task", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
                 @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
-                journal_stop!(epmap_journal, epmap_journal_task_callback; stage="task", tsk, pid, fault=false)
+                journal_stop!(epmap_journal, options.journal_task_callback; stage="task", tsk, pid, fault=false)
                 push!(epmap_eloop.tsk_pool_todo, tsk)
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
@@ -889,11 +875,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
             end
 
             # checkpoint
-            _next_checkpoint = next_checkpoint(epmapreduce_id, epmap_scratches)
+            _next_checkpoint = next_checkpoint(options.id, options.scratch)
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
-                remotecall_fetch(epmap_save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                remotecall_fetch(options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -903,7 +889,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 @debug "pushing task onto tsk_pool_todo list"
                 push!(epmap_eloop.tsk_pool_todo, tsk)
                 @debug "handling exception"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 @debug "done handling exception"
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
@@ -931,14 +917,14 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="checkpoint", tsk, pid, hostname)
-                    epmap_keepcheckpoints || remotecall_fetch(epmap_rm_checkpoint, pid, old_checkpoint)
+                    options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=false)
                 end
             catch e
                 @warn "pid=$pid ($hostname), task loop, caught exception during remove checkpoint, there may be stray check-point files that will be deleted later"
                 push!(checkpoint_orphans, old_checkpoint)
                 journal_stop!(epmap_journal; stage="checkpoint", tsk, pid, fault=true)
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
@@ -957,21 +943,13 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, args...;
     empty!(epmap_eloop.checkpoints)
 
     @debug "map, emptied the checkpoints"
-    isempty(checkpoint_orphans) || epmap_rm_checkpoint.(checkpoint_orphans)
+    isempty(checkpoint_orphans) || options.rm_checkpoint.(checkpoint_orphans)
     @debug "map, deleted the orphaned checkpoints"
 
     nothing
 end
 
-function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
-        epmapreduce_id,
-        epmap_reducer!,
-        epmap_preempted,
-        epmap_scratches,
-        epmap_maxerrors,
-        epmap_retries,
-        epmap_rm_checkpoint,
-        epmap_keepcheckpoints) where {T}
+function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) where {T}
     @debug "entered the reduce method"
     orphans_remove = Set{String}()
 
@@ -998,7 +976,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
         @async while true
             @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
             epmap_eloop.interrupted && break
-            check_for_preempted(pid, epmap_preempted) && break
+            check_for_preempted(pid, options.preempted) && break
 
             epmap_eloop.reduce_checkpoints_is_dirty[pid] = true
 
@@ -1042,7 +1020,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
 
                 local checkpoint3
                 try
-                    checkpoint3 = next_checkpoint(epmapreduce_id, epmap_scratches)
+                    checkpoint3 = next_checkpoint(options.id, options.scratch)
                 catch e
                     @warn "reduce, unable to create checkpoint 3"
                     logerror(e, Logging.Warn)
@@ -1062,13 +1040,13 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
 
             try
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_fetch(reduce, pid, epmap_reducer!, checkpoint1, checkpoint2, checkpoint3, T)
+                remotecall_fetch(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
             catch e
                 push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
@@ -1085,11 +1063,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
             # remove checkpoint 1
             try
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                epmap_keepcheckpoints || remotecall_fetch(epmap_rm_checkpoint, pid, checkpoint1)
+                options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(orphans_remove, checkpoint1, checkpoint2)
                 epmap_eloop.interrupted = r.do_interrupt
@@ -1107,11 +1085,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
             # remove checkpoint 2
             try
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                epmap_keepcheckpoints || remotecall_fetch(epmap_rm_checkpoint, pid, checkpoint2)
+                options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             catch e
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, epmap_maxerrors, epmap_retries)
+                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                 push!(orphans_remove, checkpoint2)
                 epmap_eloop.interrupted = r.do_interrupt
@@ -1131,7 +1109,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
 
     for i in 1:10
         try
-            epmap_reducer!(result, deserialize(epmap_eloop.reduce_checkpoints[1]))
+            options.reducer!(result, deserialize(epmap_eloop.reduce_checkpoints[1]))
             break
         catch e
             s = min(2.0^(i-1), 60.0) + rand()
@@ -1145,14 +1123,14 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal;
     end
     @debug "reduce, finished final reduction on master"
 
-    if !epmap_keepcheckpoints
+    if !(options.keepcheckpoints)
         try
-            epmap_rm_checkpoint(epmap_eloop.reduce_checkpoints[1])
+            options.rm_checkpoint(epmap_eloop.reduce_checkpoints[1])
         catch
             @warn "unable to remove final checkpoint $(epmap_eloop.reduce_checkpoints[1])"
         end
         try
-            epmap_rm_checkpoint.(orphans_remove)
+            options.rm_checkpoint.(orphans_remove)
         catch
             @warn "unable to remove orphaned checkpoints: $(orphans_remove)"
         end
@@ -1186,6 +1164,6 @@ default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (seriali
 restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
-export epmap, epmapreduce!
+export SchedulerOptions, epmap, epmapreduce!
 
 end
