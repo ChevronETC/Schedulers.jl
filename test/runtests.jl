@@ -627,6 +627,41 @@ end
     rm.(tmpdirs; recursive=true, force=true)
 end
 
+@testset "pmapreduce, partial reduction" begin
+    using Distributed, Schedulers
+
+    function foo16(r, i)
+        r .+= i
+        sleep(5)
+        nothing
+        end
+
+    function my_reduce_trigger(eloop, ntasks)
+        if length(complete_tasks(eloop)) - ntasks[] > 50
+            trigger_reduction!(eloop)
+            ntasks[] = length(complete_tasks(eloop))
+        end
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    tmpfile = tempname()
+
+    ntasks = Ref(0)
+    options = SchedulerOptions(;maxworkers=10, scratch=tmpdir, reduce_trigger=eloop->my_reduce_trigger(eloop, ntasks), save_partial_reduction=input->write(tmpfile, input))
+    r = epmapreduce!(zeros(10), options, foo16, 1:100)
+
+    @test r ≈ sum([1:100;]) * ones(10)
+
+    x = read!(tmpfile, zeros(10))
+    @test x[1] >= sum([1:50;])
+    for i in eachindex(x)
+        @test x[i] ≈ x[1]
+    end
+
+    rm(tmpfile)
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "logerror" begin
     try
         notafunction()
