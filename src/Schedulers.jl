@@ -242,7 +242,7 @@ function reduce_checkpoints_is_dirty(eloop::ElasticLoop)
     false
 end
 
-function loop(eloop::ElasticLoop)
+function loop(eloop::ElasticLoop, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     init_tasks = Dict{Int,Task}()
 
@@ -286,6 +286,17 @@ function loop(eloop::ElasticLoop)
                 put!(eloop.pid_channel_reduce_add, -1)
                 is_reduce_done_message_sent = true
             end
+        end
+
+        @debug "check for complete map and reduce tasks, map: $(istaskdone(tsk_map)), reduce: $(istaskdone(tsk_reduce))"
+        yield()
+        if istaskdone(tsk_map) && istaskdone(tsk_reduce)
+            close(eloop.pid_channel_map_add)
+            close(eloop.pid_channel_map_remove)
+            isopen(eloop.pid_channel_reduce_add) && close(eloop.pid_channel_reduce_add)
+            isopen(eloop.pid_channel_reduce_remove) && close(eloop.pid_channel_reduce_remove)
+            istaskfailed(tsk_map) && @error "map task failed"
+            istaskfailed(tsk_reduce) && @error "reduce task failed"
             break
         end
 
@@ -602,9 +613,11 @@ Julia cluster.
 """
 function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...)
     eloop = ElasticLoop(Nothing, tasks, options; isreduce=false)
+    tsk_map = @async epmap_map(options, f, tasks, eloop, args...; kwargs...)
+    loop(eloop, tsk_map, @async nothing)
+end
 
-    tsk_eloop = @async loop(eloop)
-
+function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, args...; kwargs...)
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
 
     # work loop
@@ -667,7 +680,6 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
         end
     end
     @debug "exiting the map loop"
-    fetch(tsk_eloop)
 
     journal_final(journal)
 
@@ -751,19 +763,16 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
 
     epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
 
-    tsk_loop = @async loop(epmap_eloop)
 
     tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
 
     tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
-    @debug "waiting for tsk_map"
-    wait(tsk_map)
     @debug "waiting for tsk_loop"
-    wait(tsk_loop)
-    @debug "waiting for tsk_reduce"
+    loop(epmap_eloop, tsk_map, tsk_reduce)
+    @debug "fetching from tsk_reduce"
     result = fetch(tsk_reduce)
-    @debug "finished waiting for tsk_reduce"
+    @debug "finished fetching from tsk_reduce"
 
     journal_final(epmap_journal)
     journal_write(epmap_journal, options.journalfile)
@@ -980,22 +989,28 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             epmap_eloop.reduce_checkpoints_is_dirty[pid] = true
 
+            @debug "reduce, pid=$pid, at exit condition, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
             if length(epmap_eloop.reduce_checkpoints) < 2
+                @debug "reduce, popping pid=$pid from dirty list"
                 pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                @debug "reduce, putting $pid onto reduce remove channel"
                 put!(epmap_eloop.pid_channel_reduce_remove, (pid,false))
-                epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
+                @debug "reduce, done putting $pid onto reduce remove channel"
                 break
             end
 
+            @debug "reduce, waiting for lock on pid=$pid"
             lock(l)
-            @info "reducing from $(length(epmap_eloop.reduce_checkpoints)) checkpoints using process $pid ($(nworkers()) workers)."
 
             # reduce two checkpoints into a third checkpoint
-            @debug "reduce, waiting for lock on pid=$pid"
+            @debug "reduce, got lock on pid=$pid"
             if length(epmap_eloop.reduce_checkpoints) > 1
+                @info "reducing from $(length(epmap_eloop.reduce_checkpoints)) checkpoints using process $pid ($(nworkers()) workers)."
+
                 local checkpoint1
                 try
                     checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints)
+                    @debug "reduce, popped first checkpoint=$checkpoint1"
                 catch e
                     @warn "reduce, unable to pop checkpoint 1"
                     logerror(e, Logging.Warn)
@@ -1008,6 +1023,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 local checkpoint2
                 try
                     checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints)
+                    @debug "reduce, popped second checkpoint=$checkpoint2"
                 catch e
                     @warn "reduce, unable to pop checkpoint 2"
                     logerror(e, Logging.Warn)
@@ -1021,6 +1037,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 local checkpoint3
                 try
                     checkpoint3 = next_checkpoint(options.id, options.scratch)
+                    @debug "reduce, got third checkpoint=$checkpoint3"
                 catch e
                     @warn "reduce, unable to create checkpoint 3"
                     logerror(e, Logging.Warn)
@@ -1033,16 +1050,19 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             else
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                 unlock(l)
+                @debug "reduce, no checkpoints to reduce, released lock on pid=$pid"
                 continue
             end
             unlock(l)
             @debug "reduce, released lock on pid=$pid"
 
             try
+                @debug "reducing into checkpoint3=$checkpoint3"
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 remotecall_fetch(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
+                @debug "pushed reduced checkpoint3=$checkpoint3"
             catch e
                 push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
@@ -1062,9 +1082,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             # remove checkpoint 1
             try
+                options.keepcheckpoints || @debug "removing checkpoint 1=$checkpoint1"
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+                options.keepcheckpoints || @debug "removed checkpoint 1=$checkpoint1"
             catch e
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
@@ -1084,9 +1106,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             # remove checkpoint 2
             try
+                options.keepcheckpoints || @debug "removing checkpoint 2=$checkpoint2"
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+                options.keepcheckpoints || @debug "removed checkpoint 2=$checkpoint2"
             catch e
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
