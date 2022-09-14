@@ -796,7 +796,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_fetch(f, pid, tsk, args...; kwargs...)
+                remotecall_wait(f, pid, tsk, args...; kwargs...)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -1019,7 +1019,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_fetch(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1046,7 +1046,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                remotecall_fetch(options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                remotecall_wait(options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1084,7 +1084,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, old_checkpoint)
+                    options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -1232,7 +1232,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 @debug "reducing into checkpoint3=$checkpoint3"
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_fetch(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
+                remotecall_wait(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1259,7 +1259,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 1=$checkpoint1"
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, checkpoint1)
+                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 1=$checkpoint1"
             catch e
@@ -1283,7 +1283,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 2=$checkpoint2"
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_fetch(options.rm_checkpoint, pid, checkpoint2)
+                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 2=$checkpoint2"
             catch e
