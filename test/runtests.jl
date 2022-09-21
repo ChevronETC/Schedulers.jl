@@ -662,6 +662,15 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "copy SchedulerOptions" begin
+    options = SchedulerOptions()
+    _options = copy(options)
+
+    for fieldname in fieldnames(SchedulerOptions)
+        @test getfield(options, fieldname) == getfield(_options, fieldname)
+    end
+end
+
 @testset "logerror" begin
     try
         notafunction()

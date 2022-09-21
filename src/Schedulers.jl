@@ -718,6 +718,33 @@ function SchedulerOptions(;
         save_partial_reduction)
 end
 
+function Base.copy(options::SchedulerOptions)
+    SchedulerOptions(
+        options.retries,
+        options.maxerrors,
+        options.minworkers,
+        options.maxworkers,
+        options.nworkers,
+        options.usemaster,
+        options.quantum,
+        options.addprocs,
+        options.init,
+        options.preempted,
+        options.reporttasks,
+        options.keepcheckpoints,
+        options.journalfile,
+        options.journal_init_callback,
+        options.journal_task_callback,
+        options.reducer!,
+        options.zeros,
+        copy(options.scratch),
+        options.id,
+        options.save_checkpoint,
+        options.rm_checkpoint,
+        options.reduce_trigger,
+        options.save_partial_reduction)
+end
+
 """
     epmap([options,] f, tasks, args...; kwargs...)
 
