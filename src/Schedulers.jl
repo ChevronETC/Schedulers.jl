@@ -101,7 +101,7 @@ end
 
 function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage, tsk, pid, fault)
     if stage ∈ ("tasks", "checkpoints", "rmcheckpoints")
-        journal[stage][tsk]["trials"][end]["status"] = fault ? "failed" : "suceeded"
+        journal[stage][tsk]["trials"][end]["status"] = fault ? "failed" : "succeeded"
         journal[stage][tsk]["trials"][end]["stop"] = now_formatted()
     elseif stage == "reduced"
         journal["tasks"][tsk]["trials"][end]["reduced"] = true
