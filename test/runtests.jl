@@ -237,6 +237,86 @@ end
     end
 end
 
+@testset "pmap journal with linear indices" begin
+    using Distributed, Schedulers
+
+    function foo5c(tsk)
+        @info "foo5c: task $tsk"
+    end
+
+    alltasks = []
+    mytasks = []
+
+    function my_journal_init_callback(tsks)
+        push!(alltasks, tsks...)
+    end
+
+    function my_journal_task_callback(tsk, mytasks)
+        push!(mytasks, tsk)
+    end
+
+    options = SchedulerOptions(;
+        maxworkers=5,
+        journal_init_callback=my_journal_init_callback,
+        journal_task_callback=tsk->my_journal_task_callback(tsk, mytasks)
+    )
+
+    journal = epmap(options, foo5c, 1:10)
+
+    taskids = parse.(Int, get.(mytasks, "id", "0"))
+
+    @test journal["tasklist"] == 1:10
+    for i = 1:10
+        @test haskey(journal["tasks"][1]["trials"][1], "start")
+        @test haskey(journal["tasks"][1]["trials"][1], "stop")
+        @test journal["tasks"][1]["trials"][1]["status"] == "suceeded"
+        @test i ∈ taskids
+    end
+    @test alltasks ≈ [1:10;]
+
+    rmprocs(workers())
+end
+
+@testset "pmap jouranl with cartesian indices" begin
+    using Distributed, Schedulers
+
+    function foo5c(tsk)
+        @info "foo5c: task $tsk"
+    end
+
+    alltasks = []
+    mytasks = []
+
+    function my_journal_init_callback(tsks)
+        push!(alltasks, tsks...)
+    end
+
+    function my_journal_task_callback(tsk, mytasks)
+        push!(mytasks, tsk)
+    end
+
+    options = SchedulerOptions(;
+        maxworkers=5,
+        journal_init_callback=my_journal_init_callback,
+        journal_task_callback=tsk->my_journal_task_callback(tsk, mytasks)
+    )
+
+    journal = epmap(options, foo5c, CartesianIndices((5,2)))
+
+    taskids = parse.(Int, get.(mytasks, "id", "0"))
+
+    @test journal["tasklist"] == CartesianIndices((5,2))
+    for i = 1:10
+        @test haskey(journal["tasks"][1]["trials"][1], "start")
+        @test haskey(journal["tasks"][1]["trials"][1], "stop")
+        @test journal["tasks"][1]["trials"][1]["status"] == "suceeded"
+        @test i ∈ taskids
+    end
+    @test alltasks ≈ [1:10;]
+
+    rmprocs(workers())
+end
+
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
