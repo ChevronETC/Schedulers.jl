@@ -37,30 +37,16 @@ function check_for_preempted(pid, epmap_preempted)
 end
 
 function journal_init(tsks, epmap_journal_init_callback; reduce)
-    local linear_tsks
-    try
-        linear_tsks = LinearIndices(tsks)
-    catch
-        linear_tsks = tsks
-    end
-
-    journal = reduce ? Dict{String,Any}("tasklist"=>tsks, "tasks"=>Dict(), "checkpoints"=>Dict(), "rmcheckpoints"=>Dict(), "pids"=>Dict()) : Dict{String,Any}("tasklist"=>tsks, "tasks"=>Dict())
+    journal = reduce ? Dict{String,Any}("tasks"=>Dict(), "checkpoints"=>Dict(), "rmcheckpoints"=>Dict(), "pids"=>Dict()) : Dict{String,Any}("tasks"=>Dict())
     journal["start"] = now_formatted()
-
     for tsk in tsks
-        local linear_tsk
-        if isa(tsk, CartesianIndex) && @isdefined(linear_tsks)
-            linear_tsk = linear_tsks[tsk]
-        else
-            linear_tsk = tsk
-        end
-        journal["tasks"][linear_tsk] = Dict("id"=>"$linear_tsk", "trials"=>Dict[])
+        journal["tasks"][tsk] = Dict("id"=>"$tsk", "trials"=>Dict[])
         if reduce
-            journal["checkpoints"][linear_tsk] = Dict("id"=>"$linear_tsk", "trials"=>Dict[])
-            journal["rmcheckpoints"][linear_tsk] = Dict("id"=>"$linear_tsk", "trials"=>Dict[])
+            journal["checkpoints"][tsk] = Dict("id"=>"$tsk", "trials"=>Dict[])
+            journal["rmcheckpoints"][tsk] = Dict("id"=>"$tsk", "trials"=>Dict[])
         end
     end
-    epmap_journal_init_callback(collect(linear_tsks))
+    epmap_journal_init_callback(tsks)
     journal
 end
 
@@ -80,15 +66,8 @@ function journal_write(journal, filename)
 end
 
 function journal_start!(journal, epmap_journal_task_callback=tsk->nothing; stage, tsk, pid, hostname)
-    local linear_tsk
-    try
-        linear_tsk = LinearIndices(journal["tasklist"])[tsk]
-    catch
-        linear_tsk = tsk
-    end
-
     if stage ∈ ("tasks", "checkpoints", "rmcheckpoints")
-        push!(journal[stage][linear_tsk]["trials"],
+        push!(journal[stage][tsk]["trials"],
             Dict(
                 "pid" => pid,
                 "hostname" => hostname,
@@ -111,29 +90,22 @@ function journal_start!(journal, epmap_journal_task_callback=tsk->nothing; stage
     end
 
     if stage == "reduced"
-        journal["tasks"][linear_tsk]["trials"][end]["reduced"] = false
-        journal["tasks"][linear_tsk]["trials"][end]["reducedat"] = ""
+        journal["tasks"][tsk]["trials"][end]["reduced"] = false
+        journal["tasks"][tsk]["trials"][end]["reducedat"] = ""
     end
 
     if stage ∈ ("tasks", "reduced")
-        epmap_journal_task_callback(journal["tasks"][linear_tsk])
+        epmap_journal_task_callback(journal["tasks"][tsk])
     end
 end
 
 function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage, tsk, pid, fault)
-    local linear_tsk
-    try
-        linear_tsk = LinearIndices(journal["tasklist"])[tsk]
-    catch
-        linear_tsk = tsk
-    end
-
     if stage ∈ ("tasks", "checkpoints", "rmcheckpoints")
-        journal[stage][linear_tsk]["trials"][end]["status"] = fault ? "failed" : "suceeded"
-        journal[stage][linear_tsk]["trials"][end]["stop"] = now_formatted()
+        journal[stage][tsk]["trials"][end]["status"] = fault ? "failed" : "suceeded"
+        journal[stage][tsk]["trials"][end]["stop"] = now_formatted()
     elseif stage == "reduced"
-        journal["tasks"][linear_tsk]["trials"][end]["reduced"] = true
-        journal["tasks"][linear_tsk]["trials"][end]["reducedat"] = now_formatted()
+        journal["tasks"][tsk]["trials"][end]["reduced"] = true
+        journal["tasks"][tsk]["trials"][end]["reducedat"] = now_formatted()
     elseif stage ∈ ("restart", "reduce")
         journal["pids"][pid][stage]["elapsed"] += time() - journal["pids"][pid]["tic"]
         if fault
@@ -142,7 +114,7 @@ function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage,
     end
 
     if stage ∈ ("tasks", "reduced")
-        epmap_journal_task_callback(journal["tasks"][linear_tsk])
+        epmap_journal_task_callback(journal["tasks"][tsk])
     end
 end
 
@@ -808,7 +780,6 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
     loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
-    journal
 end
 
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
@@ -859,7 +830,6 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 yield()
             catch e
                 @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
-                logerror(e, Logging.Warn)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
                 push!(eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
