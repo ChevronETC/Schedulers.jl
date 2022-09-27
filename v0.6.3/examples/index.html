@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Examples · Schedulers</title><link href="https://fonts.googleapis.com/css?family=Lato|Roboto+Mono" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.0/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.0/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.0/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.11.1/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL=".."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../assets/documenter.js"></script><script src="../siteinfo.js"></script><script src="../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-dark.css" data-theme-name="documenter-dark"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit">Schedulers</span></div><form class="docs-search" action="../search/"><input class="docs-search-query" id="documenter-search-query" name="q" type="text" placeholder="Search docs"/></form><ul class="docs-menu"><li><a class="tocitem" href="../">Schedulers.jl</a></li><li class="is-active"><a class="tocitem" href>Examples</a><ul class="internal"><li><a class="tocitem" href="#Parallel-map"><span>Parallel map</span></a></li><li><a class="tocitem" href="#Parallel-map-reduce"><span>Parallel map reduce</span></a></li><li><a class="tocitem" href="#Parallel-map-reduce-with-structured-data"><span>Parallel map reduce with structured data</span></a></li><li><a class="tocitem" href="#Parameterization"><span>Parameterization</span></a></li></ul></li><li><a class="tocitem" href="../reference/">Reference</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Examples</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Examples</a></li></ul></nav><div class="docs-right"><a class="docs-edit-link" href="https://github.com/ChevronETC/Schedulers.jl/blob/master/docs/src/examples.md" title="Edit on GitHub"><span class="docs-icon fab"></span><span class="docs-label is-hidden-touch">Edit on GitHub</span></a><a class="docs-settings-button fas fa-cog" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-sidebar-button fa fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a></div></header><article class="content" id="documenter-page"><h1 id="Examples"><a class="docs-heading-anchor" href="#Examples">Examples</a><a id="Examples-1"></a><a class="docs-heading-anchor-permalink" href="#Examples" title="Permalink"></a></h1><h2 id="Parallel-map"><a class="docs-heading-anchor" href="#Parallel-map">Parallel map</a><a id="Parallel-map-1"></a><a class="docs-heading-anchor-permalink" href="#Parallel-map" title="Permalink"></a></h2><pre><code class="language-julia">using Distributed
+
+addprocs(5)
+@everywhere using Distributed, Schedulers
+@everywhere function foo(tsk)
+    @info &quot;sleeping for task $tsk on worker $(myid()) for 60 seconds&quot;
+    sleep(60)
+end
+
+epmap(foo, 1:20)
+rmprocs(workers())</code></pre><h2 id="Parallel-map-reduce"><a class="docs-heading-anchor" href="#Parallel-map-reduce">Parallel map reduce</a><a id="Parallel-map-reduce-1"></a><a class="docs-heading-anchor-permalink" href="#Parallel-map-reduce" title="Permalink"></a></h2><p>The parallel map reduce method <code>epmapreduce!</code> creates memory on each worker process for storing a local reduction.  Upon exhaustion of the tasks, the local reductions are reduced into a final reduction.  The memory allocated for each worker is dictated by the first argument to <code>epmapreduce!</code> which is also the memory that holds the final reduced result.</p><pre><code class="language-julia">using Distributed
+
+addprocs(5)
+@everywhere using Distributed, Schedulers
+@everywhere function foo(y, tsk)
+    y .+= tsk
+    @info &quot;sleeping for task $tsk on worker $(myid()) for 60 seconds&quot;
+    sleep(60)
+end
+x = epmapreduce!(zeros(Float64,5), foo, 1:10) # x=[10,10,10,10,10]</code></pre><p>Note that <code>y</code> contains a partial reduction for the tasks assigned to its Julia process.</p><h2 id="Parallel-map-reduce-with-structured-data"><a class="docs-heading-anchor" href="#Parallel-map-reduce-with-structured-data">Parallel map reduce with structured data</a><a id="Parallel-map-reduce-with-structured-data-1"></a><a class="docs-heading-anchor-permalink" href="#Parallel-map-reduce-with-structured-data" title="Permalink"></a></h2><p>By default the reduction assumes that the object being reduced is a Julia array. However, this can be customized to use an arbitrary object by specifying the <code>epmap_zeros</code> and <code>epmap_reducer!</code> key-work arguments.</p><pre><code class="language-julia">using Distributed
+
+addprocs(5)
+@everywhere using Distributed, Schedulers
+@everywhere function foo(y, tsk)
+    a = y.a
+    b = y.b
+    a .+= tsk
+    b .+= 2*tsk
+    nothing
+end
+
+@everywhere my_zeros() = (a=zeros(Float64,5), b=zeros(Float64,5))
+@everywhere function my_reducer!(x,y)
+    x.a .+= y.a
+    x.b .+= y.b
+    nothing
+end
+x = epmapreduce!(my_zeros(), foo, 1:10;
+    epmap_zeros = my_zeros,
+    epmap_reducer! = my_reducer!)</code></pre><h2 id="Parameterization"><a class="docs-heading-anchor" href="#Parameterization">Parameterization</a><a id="Parameterization-1"></a><a class="docs-heading-anchor-permalink" href="#Parameterization" title="Permalink"></a></h2><p>Both <code>epmap</code> and <code>epmapreduce!</code> can be controled by a parameter-set defined in <code>options::SchedulerOptions</code>, and that can be passed as the first argument to <code>epmap</code> or <code>epmapreduce</code>.  The parameters that can be set are described in the <code>epmap</code> and <code>epmapreduce!</code> documentation.</p><h3 id="Parallel-map-with-elasticity"><a class="docs-heading-anchor" href="#Parallel-map-with-elasticity">Parallel map with elasticity</a><a id="Parallel-map-with-elasticity-1"></a><a class="docs-heading-anchor-permalink" href="#Parallel-map-with-elasticity" title="Permalink"></a></h3><p>As an example of parameterizing <code>epmap</code>, we consider allow the compute cluster to grow and shrink during the map.  <code>options::SchedulerOptions</code> include <code>options.minworkers</code> and <code>options.maxworkers</code> to control elasticity.</p><pre><code class="language-julia">using Distributed
+
+addprocs(10)
+@everywhere using Distributed, Schedulers
+@everywhere function foo(tsk)
+    @info &quot;sleeping for task $tsk on worker $(myid()) for 60 seconds&quot;
+    sleep(60)
+end
+
+epmap(SchedulerOptions(;minworkers=5, maxworkers=15), foo, 1:20)
+rmprocs(workers())</code></pre><p>In addition <code>options.quantum</code> and <code>options.addprocs</code> can be used to control how workers are added.  <code>Distributed.rmprocs</code> is used to shrink the number of workers.  Further, note that the <code>epmap_nworkers</code> method allows you to specify a method that returns the current number of allocated workers.  This is useful for cloud computing where there is latency associated with provisioning.  See for example the <code>nworkers_provisioned</code> method in <a href="https://github.com/ChevronETC/AzManagers.jl">AzManagers.jl</a>.  As an example of elasticity, the number of workers will shrink when the number of remaining tasks is less than the number of Julia workers, or when a worker is deemed not usable due to fault handling. Note that as epmap elastically adds workers, methods  and packages that are defined in <code>Main</code> will automatically be loaded on the added workers.</p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../">« Schedulers.jl</a><a class="docs-footer-nextpage" href="../reference/">Reference »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> on <span class="colophon-date" title="Tuesday 27 September 2022 00:40">Tuesday 27 September 2022</span>. Using Julia version 1.8.1.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
