@@ -58,16 +58,15 @@ end
     x.b .+= y.b
     nothing
 end
-x = epmapreduce!(my_zeros(), foo, 1:10;
-    epmap_zeros = my_zeros,
-    epmap_reducer! = my_reducer!)
+options = SchedulerOptions(zeros = my_zeros, reducer! = my_reducer!)
+x = epmapreduce!(my_zeros(), options, foo, 1:10)
 ```
 
 ## Parameterization
-Both `epmap` and `epmapreduce!` can be controled by a parameter-set
+Both `epmap` and `epmapreduce!` can be controlled by a parameter-set
 defined in `options::SchedulerOptions`, and that can be passed as the
-first argument to `epmap` or `epmapreduce`.  The parameters that can be set
-are described in the `epmap` and `epmapreduce!` documentation.
+first argument to `epmap` or the second argument to `epmapreduce`.  The parameters
+that can be set are described in the `epmap` and `epmapreduce!` documentation.
 
 ### Parallel map with elasticity
 As an example of parameterizing `epmap`, we consider allow the compute cluster
