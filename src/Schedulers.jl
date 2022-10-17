@@ -387,7 +387,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             is_tasks_done_message_sent = true
         end
         
-        @debug "check for complete reduction when tasks are done ($is_tasks_done), and there are no more checkpoints: ($(length(eloop.reduce_checkpoints)) pending, $(length(eloop.checkpoints)) active)"
+        @debug "check for complete reduction when tasks are done ($is_tasks_done) and reduce is not active ($(!is_reduce_active)), and there are no more checkpoints: ($(length(eloop.reduce_checkpoints)) pending, $(length(eloop.checkpoints)) active, $(length(filter(v->v, collect(values(eloop.reduce_checkpoints_is_dirty))))) dirty)"
         if is_tasks_done && !is_reduce_active
             if isopen(eloop.pid_channel_reduce_add) && !is_reduce_done_message_sent
                 put!(eloop.pid_channel_reduce_add, -1)
@@ -1177,7 +1177,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             @debug "reduce, pid=$pid, at exit condition, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
             if length(epmap_eloop.reduce_checkpoints) < 2
                 @debug "reduce, popping pid=$pid from dirty list"
-                @debug "reduce, popping pid=$pid from dirty list"
                 pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                 @debug "reduce, putting $pid onto reduce remove channel"
                 put!(epmap_eloop.pid_channel_reduce_remove, (pid,false))
@@ -1196,6 +1195,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(epmap_eloop.reduce_machine_count) reduce workers)."
                 local checkpoint1
                 try
+                    @debug "reduce, popping first checkpoint, pid=$pid"
                     if epmap_eloop.is_reduce_triggered
                         checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
                         icheckpoint1 = findfirst(checkpoint->checkpoint == checkpoint1, epmap_eloop.reduce_checkpoints)
@@ -1203,6 +1203,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     else
                         checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints)
                     end
+                    @debug "reduce, popped first checkpoint, pid=$pid" checkpoint1
                 catch e
                     @warn "reduce, unable to pop checkpoint 1"
                     logerror(e, Logging.Warn)
@@ -1214,14 +1215,15 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
                 local checkpoint2
                 try
+                    @debug "reduce, popping second checkpoint, pid=$pid"
                     if epmap_eloop.is_reduce_triggered
                         checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
-                        @debug "reduce, popped second checkpoint=$checkpoint2"
                         icheckpoint2 = findfirst(checkpoint->checkpoint == checkpoint2, epmap_eloop.reduce_checkpoints)
                         icheckpoint2 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint2)
                     else
                         checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints)
                     end
+                    @debug "reduce, popped second checkpoint, pid=$pid" checkpoint2
                 catch e
                     @warn "reduce, unable to pop checkpoint 2"
                     logerror(e, Logging.Warn)
@@ -1235,8 +1237,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
                 local checkpoint3
                 try
+                    @debug "reduce, make third checkpoint, pid=$pid"
                     checkpoint3 = next_checkpoint(options.id, options.scratch)
-                    @debug "reduce, got third checkpoint=$checkpoint3"
+                    @debug "reduce, made third checkpoint, pid=$pid" checkpoint3
                 catch e
                     @warn "reduce, unable to create checkpoint 3"
                     logerror(e, Logging.Warn)
@@ -1257,13 +1260,13 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             @debug "reduce, released lock on pid=$pid"
 
             try
-                @debug "reducing into checkpoint3=$checkpoint3"
+                @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 remotecall_wait(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
-                @debug "pushed reduced checkpoint3=$checkpoint3"
+                @debug "pushed reduced checkpoint3, pid=$pid" checkpoint3
             catch e
                 push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
@@ -1284,11 +1287,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             # remove checkpoint 1
             try
-                options.keepcheckpoints || @debug "removing checkpoint 1=$checkpoint1"
+                options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                options.keepcheckpoints || @debug "removed checkpoint 1=$checkpoint1"
+                options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
             catch e
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
@@ -1308,11 +1311,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             # remove checkpoint 2
             try
-                options.keepcheckpoints || @debug "removing checkpoint 2=$checkpoint2"
+                options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                options.keepcheckpoints || @debug "removed checkpoint 2=$checkpoint2"
+                options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
             catch e
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
