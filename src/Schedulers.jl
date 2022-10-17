@@ -972,10 +972,32 @@ function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwar
     nothing
 end
 
+struct RemoteTimeOutException <: Exception
+    timeout::Int
+end
+Base.showerror(io::IO, e::RemoteTimeOutException) = print(io, "no response in $(e.timeout) seconds.")
+
+timeout_for_checkpoint_delete() = parse(Int, get(ENV, "SCHEDULERS_TIMEOUT_DELETE", "30"))
+
+function remotecall_wait_with_timeout(f, pid, timeout, args...; kwargs...)
+    _f = remotecall(f, pid, args...; kwargs...)
+    tic = time()
+    while !isready(_f)
+        if time() - tic > timeout
+            break
+        end
+        sleep(1)
+    end
+    isready(_f) || throw(RemoteTimeOutException(timeout))
+    wait(_f)
+end
+
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
 
     checkpoint_orphans = Any[]
+
+    _timeout_for_checkpoint_delete = timeout_for_checkpoint_delete()
 
     # work loop
     @sync while true
@@ -1111,7 +1133,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, old_checkpoint)
+                    options.keepcheckpoints || remotecall_wait_with_timeout(options.rm_checkpoint, pid, _timeout_for_checkpoint_delete, old_checkpoint)
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -1148,6 +1170,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     orphans_remove = Set{String}()
 
     l = ReentrantLock()
+
+    _timeout_for_checkpoint_delete = timeout_for_checkpoint_delete()
 
     @sync while true
         @debug "reduce, interrupted=$(epmap_eloop.interrupted)"
@@ -1289,7 +1313,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint1)
+                options.keepcheckpoints || remotecall_wait_with_timeout(options.rm_checkpoint, pid, _timeout_for_checkpoint_delete, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
             catch e
@@ -1312,7 +1336,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint2)
+                options.keepcheckpoints || remotecall_wait_with_timeout(options.rm_checkpoint, pid, _timeout_for_checkpoint_delete, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
             catch e
