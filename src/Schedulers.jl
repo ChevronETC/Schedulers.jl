@@ -578,7 +578,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             logerror(e)
         end
 
-        @debug "checking for workers sent from the reduce"
+        @debug "checking for workers sent from the reduce, isopen=$(isopen(eloop.pid_channel_reduce_remove))"
         yield()
         try
             while isready(eloop.pid_channel_reduce_remove)
@@ -1320,12 +1320,16 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+                @debug "pushing orphaned checkpoints onto orphans_remote, pid=$pid" checkpoint1 checkpoint2
                 push!(orphans_remove, checkpoint1, checkpoint2)
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
+                    @debug "popping from reduce_checkpoints_is_dirty, pid=$pid"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                    @debug "putting ($pid,$(r.bad_pid)) onto pid_channel_reduce_remove"
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                    @debug "put ($pid,$(r.bad_pid)) onto pid_channel_reduce_remove"
                     break
                 end
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
@@ -1343,12 +1347,16 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+                @debug "pushing orphaned checkpoint onto orphans_remote, pid=$pid" checkpoint2
                 push!(orphans_remove, checkpoint2)
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
+                    @debug "popping from reduce_checkpoints_is_dirty, pid=$pid"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                    @debug "putting ($pid,$(r.bad_pid)) onto pid_channel_reduce_remove"
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                    @debug "put ($pid,$(r.bad_pid)) onto pid_channel_reduce_remove"
                     break
                 end
             end
