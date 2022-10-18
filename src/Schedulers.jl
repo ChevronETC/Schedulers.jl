@@ -1302,7 +1302,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 if r.do_break || r.do_interrupt
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
-                    epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                     break
                 end
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
@@ -1326,7 +1325,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 if r.do_break || r.do_interrupt
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
-                    epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                     break
                 end
             end
