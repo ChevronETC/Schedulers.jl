@@ -1145,7 +1145,7 @@ end
 
 function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) where {T}
     @debug "entered the reduce method"
-    orphans_remove = Set{String}()
+    orphans_remove = Set{Any}()
 
     l = ReentrantLock()
 
