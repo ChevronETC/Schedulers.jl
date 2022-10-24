@@ -755,7 +755,7 @@ and `pmap_kwargs` are as follows.
 
 ## epmap_kwargs
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
-* `maxerrors=Inf` the maximum number of errors before we give-up and exit
+* `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
@@ -769,7 +769,7 @@ and `pmap_kwargs` are as follows.
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
 
 ## Notes
-[1] The number of machines provisioined may be greater than the number of workers in the cluster since with
+[1] The number of machines provisioned may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
 [2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
