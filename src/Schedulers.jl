@@ -977,6 +977,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
     checkpoint_orphans = Any[]
 
+    _timeout_for_rm_checkpoint = timeout_for_rm_checkpoint()
+
     # work loop
     @sync while true
         @debug "map, iterrupted=$(epmap_eloop.interrupted)"
@@ -1111,7 +1113,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, old_checkpoint)
+                    options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, old_checkpoint, _timeout_for_rm_checkpoint)
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -1137,7 +1139,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
     empty!(epmap_eloop.checkpoints)
 
     @debug "map, emptied the checkpoints"
-    isempty(checkpoint_orphans) || options.rm_checkpoint.(checkpoint_orphans)
+    for checkpoint in checkpoint_orphans
+        rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, _timeout_for_rm_checkpoint)
+    end
     @debug "map, deleted the orphaned checkpoints"
 
     nothing
@@ -1148,6 +1152,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     orphans_remove = Set{Any}()
 
     l = ReentrantLock()
+
+    _timeout_for_rm_checkpoint = timeout_for_rm_checkpoint()
 
     @sync while true
         @debug "reduce, interrupted=$(epmap_eloop.interrupted)"
@@ -1289,7 +1295,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint1)
+                options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, checkpoint1, _timeout_for_rm_checkpoint)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
             catch e
@@ -1312,7 +1318,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint2)
+                options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, checkpoint2, _timeout_for_rm_checkpoint)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
             catch e
@@ -1353,14 +1359,16 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     @debug "deleting orphaned checkpoints"
     if !(options.keepcheckpoints)
         try
-            options.rm_checkpoint(epmap_eloop.reduce_checkpoints[1])
+            rm_checkpoint_with_timeout(options.rm_checkpoint, epmap_eloop.reduce_checkpoints[1], _timeout_for_rm_checkpoint)
         catch
             @warn "unable to remove final checkpoint $(epmap_eloop.reduce_checkpoints[1])"
         end
-        try
-            options.rm_checkpoint.(orphans_remove)
-        catch
-            @warn "unable to remove orphaned checkpoints: $(orphans_remove)"
+        for checkpoint in orphans_remove
+            try
+                rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, _timeout_for_rm_checkpoint)
+            catch
+                @warn "unable to remove orphan checkpoint: $checkpoint"
+            end
         end
     end
     @debug "reduce, finished final clean-up on master"
@@ -1390,6 +1398,32 @@ end
 
 default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
 restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
+
+struct RemoveCheckpointTimeoutException{T} <: Exception
+    id::Int
+    timeout::Int
+    checkpoint::T
+end
+
+timeout_for_rm_checkpoint() = parse(Int, get(ENV, "SCHEDULERS_TIMEOUT_RM_CHECKPOINT", "30"))
+
+function rm_checkpoint_with_timeout(f, checkpoint, timeout)
+    tsk = @async f(checkpoint)
+
+    tic = time()
+    while !(istaskdone(tsk))
+        if time() - tic > timeout
+            break;
+        end
+        sleep(1)
+    end
+    if !(istaskdone(tsk))
+        @async Base.throwto(tsk, InterruptException())
+        throw(RemoveCheckpointTimeoutException(myid(), timeout, checkpoint))
+    end
+    fetch(tsk)
+end
+
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
