@@ -1166,7 +1166,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         hostname = ""
         try
             hostname = remotecall_fetch(gethostname, pid)
-        catch
+        catch e
             @warn "unable to determine host name for pid=$pid"
             logerror(e, Logging.Warn)
             put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
