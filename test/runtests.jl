@@ -516,6 +516,31 @@ end
     rm(tmpdir; recursive=true)
 end
 
+@testset "pmapreduce, cluster with time-out exception during save checkpoint" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random, Serialization
+    function foo9e(x, tsk)
+        x .+= tsk
+        sleep(1)
+    end
+
+    function mycheckpoint(checkpoint, localresult, T, onlyonce)
+        r = rand()
+        R = 0.5
+        if r > R && myid() != 1 && onlyonce
+            onlyonce = false
+            sleep(99999)
+        end
+        serialize(checkpoint, fetch(localresult)::T)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, save_checkpoint=(checkpoint,localresult,T)->mycheckpoint(checkpoint,localresult,T,true))
+    x = epmapreduce!(zeros(Float32,10), options, foo9e, 1:10)
+    @test x ≈ sum([1:10;]) * ones(10)
+    rm(tmpdir; recursive=true)
+end
+
 @testset "pmapreduce, growing cluster test" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random, Test
