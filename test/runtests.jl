@@ -535,7 +535,7 @@ end
     end
 
     tmpdir = mktempdir(;cleanup=false)
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, save_checkpoint=(checkpoint,localresult,T)->mycheckpoint(checkpoint,localresult,T,true))
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, save_checkpoint=(checkpoint,localresult,T)->mycheckpoint(checkpoint,localresult,T,true), storage_max_latency=10, storage_min_throughput=200)
     x = epmapreduce!(zeros(Float32,10), options, foo9e, 1:10)
     @test x ≈ sum([1:10;]) * ones(10)
     rm(tmpdir; recursive=true)
