@@ -1104,7 +1104,12 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 epmap_eloop.errored = r.do_error
                 @debug "caught save checkpoint" r.do_break r.do_interrupt _next_checkpoint
                 # note that `options.rm_checkpoint` should check if the file exists before attempting removal
-                rm_checkpoint_with_timeout(options.rm_checkpoint, _next_checkpoint, options.storage_max_latency)
+                try
+                    rm_checkpoint_with_timeout(options.rm_checkpoint, _next_checkpoint, options.storage_max_latency)
+                catch e
+                    @warn "unable to delete $(_next_checkpoint), manual clean-up may be required"
+                    logerror(e, Logging.Warn)
+                end
                 if r.do_break || r.do_interrupt
                     @debug "epmap_eloop.checkpoints[$pid]", epmap_eloop.checkpoints[pid]
                     if epmap_eloop.checkpoints[pid] !== nothing
@@ -1155,7 +1160,12 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
     @debug "map, emptied the checkpoints"
     for checkpoint in checkpoint_orphans
-        rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, options.storage_max_latency)
+        try
+            rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, options.storage_max_latency)
+        catch e
+            @warn "unable to remove checkpoint: $checkpoint, manual clean-up may be required"
+            logerror(e, Logging.Warn)
+        end
     end
     @debug "map, deleted the orphaned checkpoints"
 
