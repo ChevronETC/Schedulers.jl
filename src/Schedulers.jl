@@ -477,7 +477,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         if is_more_tasks && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints_snapshot), 2) <= eloop.reduce_machine_count
                             @debug "putting pid=$new_pid onto map channel"
                             put!(eloop.pid_channel_map_add, new_pid)
-                        elseif is_more_checkpoints && !is_waiting_on_flush
+                        elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > eloop.reduce_machine_count
                             @debug "putting pid=$new_pid onto reduce channel"
                             put!(eloop.pid_channel_reduce_add, new_pid)
                             eloop.reduce_machine_count += 1
