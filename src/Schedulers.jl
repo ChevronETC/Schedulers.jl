@@ -1017,19 +1017,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             continue
         end
 
-        try
-            localresults[pid] = remotecall_wait(options.zeros, pid)
-        catch e
-            @warn "unable to initialize local reduction"
-            r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-            epmap_eloop.interrupted = r.do_interrupt
-            epmap_eloop.errored = r.do_error
-            haskey(localresults, pid) && deleteat!(localresults, pid)
-            if r.do_break || r.do_interrupt
-                put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
-            end
-            continue
-        end
+        # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
+        # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
+        localresults[pid] = remotecall(options.zeros, pid)
 
         epmap_eloop.checkpoints[pid] = nothing
 
