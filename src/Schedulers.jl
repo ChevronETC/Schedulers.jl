@@ -389,8 +389,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         
         @debug "check for complete reduction when tasks are done ($is_tasks_done) and reduce is not active ($(!is_reduce_active)), and there are no more checkpoints: ($(length(eloop.reduce_checkpoints)) pending, $(length(eloop.checkpoints)) active, $(length(filter(v->v, collect(values(eloop.reduce_checkpoints_is_dirty))))) dirty)"
         if is_tasks_done && !is_reduce_active
+            @debug "elastic loop, check for open reduce channel, and if the reduce done message is already sent, isopen(eloop.pid_channel_reduce_add)=$(isopen(eloop.pid_channel_reduce_add)), is_reduce_done_message_sent=$is_reduce_done_message_sent"
             if isopen(eloop.pid_channel_reduce_add) && !is_reduce_done_message_sent
+                @debug "elastic loop, putting -1 onto pid_channel_reduce_add, length(eloop.pid_channel_reduce_add.data)=$(length(eloop.pid_channel_reduce_add.data)))"
                 put!(eloop.pid_channel_reduce_add, -1)
+                @debug "elastic loop, done putting -1 onto pid_channel_reduce_add"
                 is_reduce_done_message_sent = true
 
                 @debug "recording reduced tasks"
