@@ -694,6 +694,7 @@ function SchedulerOptions(;
         scratch = ["/scratch"],
         id = randstring(6),
         save_checkpoint = default_save_checkpoint,
+        load_checkpoint = default_load_checkpoint,
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
@@ -720,6 +721,7 @@ function SchedulerOptions(;
         isa(scratch, AbstractArray) ? scratch : [scratch],
         id,
         save_checkpoint,
+        load_checkpoint,
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction,
@@ -749,6 +751,7 @@ function Base.copy(options::SchedulerOptions)
         copy(options.scratch),
         options.id,
         options.save_checkpoint,
+        options.load_checkpoint,
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction,
@@ -1284,7 +1287,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_wait(reduce_with_timeout, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T, options.storage_max_latency, options.storage_min_throughput)
+                remotecall_wait(reduce_with_timeout, pid, options.reducer!, options.save_checkpoint, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T, options.storage_max_latency, options.storage_min_throughput)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1410,7 +1413,7 @@ struct ReduceTimeoutException{T} <: Exception
     checkpoint::T
 end
 
-function reduce_with_timeout(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}, latency, throughput) where {T}
+function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpoint1, checkpoint2, checkpoint3, ::Type{T}, latency, throughput) where {T}
     @debug "reduce_with_timeout, start"
     tsk_filesize = @async filesize(checkpoint1)
 
@@ -1430,8 +1433,8 @@ function reduce_with_timeout(reducer!, checkpoint1, checkpoint2, checkpoint3, ::
         throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
     end
 
-    tsk_checkpoint1 = @async deserialize(checkpoint1)::T
-    tsk_checkpoint2 = @async deserialize(checkpoint2)::T
+    tsk_checkpoint1 = @async load_checkpoint(checkpoint1)::T
+    tsk_checkpoint2 = @async load_checkpoint(checkpoint2)::T
     
     n = fetch(tsk_filesize)::Int
     timeout = latency + 2 * n / throughput
@@ -1461,7 +1464,7 @@ function reduce_with_timeout(reducer!, checkpoint1, checkpoint2, checkpoint3, ::
 
     reducer!(c2, c1)
 
-    tsk_serialize = @async serialize(checkpoint3, c2)
+    tsk_serialize = @async save_checkpoint(checkpoint3, c2, T)
 
     timeout = latency + n / throughput
 
@@ -1509,6 +1512,7 @@ function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, lat
 end
 
 default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
+default_load_checkpoint(checkpoint, ::Type{T}) where {T} = (deserialize(checkpoint::T); nothing)
 restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
 
 struct RemoveCheckpointTimeoutException{T} <: Exception
