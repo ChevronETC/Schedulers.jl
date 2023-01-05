@@ -665,6 +665,7 @@ mutable struct SchedulerOptions{C}
     scratch::Vector{C}
     id::String
     save_checkpoint::Function
+    load_checkpoint::Function
     rm_checkpoint::Function
     reduce_trigger::Function
     save_partial_reduction::Function

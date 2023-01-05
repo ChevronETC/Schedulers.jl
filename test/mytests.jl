@@ -50,7 +50,13 @@ end
 function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
     MPI.Init()
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
-        deserialize(checkpoint::T); nothing)
+        loaded = deserialize(checkpoint::T)
+    else
+        loaded = nothing
+    end
+    MPI.Barrier(MPI.COMM_WORLD)
+    return loaded
+end
 
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     N = 20 
@@ -66,7 +72,9 @@ function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
                                 nworkers=nworkers_provisioned,
                                 minworkers=1,
                                 maxworkers=N,
-                                zeros=my_zeros)
+                                zeros=my_zeros,
+                                save_checkpoint=my_save_checkpoint,
+                                load_checkpoint=my_load_checkpoint)
     x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo8mpi, 1:N, a; b=b)
 
     rmprocs(workers())
