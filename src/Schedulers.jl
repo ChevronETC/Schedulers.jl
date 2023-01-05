@@ -1512,7 +1512,7 @@ function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, lat
 end
 
 default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
-default_load_checkpoint(checkpoint, ::Type{T}) where {T} = (deserialize(checkpoint::T); nothing)
+default_load_checkpoint(checkpoint, ::Type{T}) where {T} = deserialize(checkpoint::T)
 restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
 
 struct RemoveCheckpointTimeoutException{T} <: Exception
