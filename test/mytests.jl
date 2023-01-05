@@ -1,4 +1,4 @@
-using AzManagers, AzStorage, AzSessions, Distributed, Logging, Random, Schedulers, Test, MPI, MFWIs
+using AzManagers, AzStorage, AzSessions, Distributed, Logging, Random, Schedulers, Serialization, Test, MPI, MFWIs
 
 function safe_addprocs(n, prefix)
     try
@@ -40,20 +40,24 @@ end
 
 function my_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} 
     MPI.Init()
+    @show "Saving Checkpoint!"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
         serialize(checkpoint, fetch(localresult)::T)
     end
     MPI.Barrier(MPI.COMM_WORLD)
+    @show "Done Saving Checkpoint!"
     nothing
 end
 
 function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
     MPI.Init()
+    @show "Loading Checkpoint!"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
         loaded = deserialize(checkpoint::T)
     else
         loaded = nothing
     end
+    @show "Done Loading Checkpoint!"
     MPI.Barrier(MPI.COMM_WORLD)
     return loaded
 end
