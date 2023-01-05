@@ -43,6 +43,7 @@ function my_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T}
     @show "Saving Checkpoint!"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
         serialize(checkpoint, fetch(localresult)::T)
+        @show "Through Serialization"
     end
     MPI.Barrier(MPI.COMM_WORLD)
     @show "Done Saving Checkpoint!"
@@ -57,8 +58,9 @@ function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
     else
         loaded = nothing
     end
-    @show "Done Loading Checkpoint!"
+    @show "Through DeSerialization"
     MPI.Barrier(MPI.COMM_WORLD)
+    @show "Done Loading Checkpoint!"
     return loaded
 end
 
