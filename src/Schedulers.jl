@@ -821,7 +821,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         end
 
         @async while true
-            is_preempted = false #check_for_preempted(pid, options.preempted)
+            is_preempted = check_for_preempted(pid, options.preempted)
             if is_preempted || length(eloop.tsk_pool_done) == eloop.tsk_count || eloop.interrupted
                 @debug "putting $pid onto map_remove channel"
                 put!(eloop.pid_channel_map_remove, (pid,is_preempted))
@@ -1033,7 +1033,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
             @show "checking for preempted"
-            is_preempted = check_for_preempted(pid, options.preempted)
+            is_preempted = false #check_for_preempted(pid, options.preempted)
             @show "done checking for preempted"
             if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
                 @show "into break loop!"
