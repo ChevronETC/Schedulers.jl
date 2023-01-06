@@ -1434,8 +1434,8 @@ function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpo
         throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
     end
 
-    tsk_checkpoint1 = @async load_checkpoint(checkpoint1)::T
-    tsk_checkpoint2 = @async load_checkpoint(checkpoint2)::T
+    tsk_checkpoint1 = @async load_checkpoint(checkpoint1, T)::T
+    tsk_checkpoint2 = @async load_checkpoint(checkpoint2, T)::T
     
     n = fetch(tsk_filesize)::Int
     timeout = latency + 2 * n / throughput
