@@ -1027,13 +1027,15 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @show "into remotecall zeros"
         localresults[pid] = remotecall(options.zeros, pid)
         @show "out of remote call zeros"
+        localresults[pid] = remotecall(options.zeros, pid)
+        @show "out of second remote call zeros"
         epmap_eloop.checkpoints[pid] = nothing
         @show "checkpoints set to nothing"
         @async while true
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
             @show "checking for preempted"
-            is_preempted = false #check_for_preempted(pid, options.preempted)
+            is_preempted = check_for_preempted(pid, options.preempted)
             @show "done checking for preempted"
             if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
                 @show "into break loop!"
@@ -1064,10 +1066,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 @show "starting journal"
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                 @show "remotecall"
-                # remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
-                call = remotecall(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                # call = remotecall(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 @show "done with remotecall"
-                fetch(call)
+                # fetch(call)
                 @show "done waiting"
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @show "journal stop"
