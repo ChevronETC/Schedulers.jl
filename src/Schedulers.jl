@@ -1064,8 +1064,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 @show "starting journal"
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                 @show "remotecall"
-                remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                # remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                call = remotecall(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 @show "done with remotecall"
+                fetch(call)
+                @show "done waiting"
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @show "journal stop"
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
