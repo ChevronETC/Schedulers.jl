@@ -664,6 +664,7 @@ mutable struct SchedulerOptions{C}
     zeros::Function
     scratch::Vector{C}
     id::String
+    epmapreduce_fetch_apply::Function
     save_checkpoint::Function
     load_checkpoint::Function
     rm_checkpoint::Function
@@ -694,6 +695,7 @@ function SchedulerOptions(;
         zeros = ()->nothing,
         scratch = ["/scratch"],
         id = randstring(6),
+        epmapreduce_fetch_apply = default_epmapreduce_fetch_apply,
         save_checkpoint = default_save_checkpoint,
         load_checkpoint = default_load_checkpoint,
         rm_checkpoint = default_rm_checkpoint,
@@ -721,6 +723,7 @@ function SchedulerOptions(;
         zeros,
         isa(scratch, AbstractArray) ? scratch : [scratch],
         id,
+        epmapreduce_fetch_apply,
         save_checkpoint,
         load_checkpoint,
         rm_checkpoint,
@@ -988,12 +991,6 @@ end
 
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
-function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
-    localresult = fetch(_localresult)::T
-    f(localresult, itsk, args...; kwargs...)
-    nothing
-end
-
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
 
@@ -1027,7 +1024,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
         localresults[pid] = remotecall(options.zeros, pid)
-
+        
         epmap_eloop.checkpoints[pid] = nothing
 
         @async while true
@@ -1058,7 +1055,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1510,6 +1507,12 @@ function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, lat
         throw(SaveCheckpointTimeoutException(myid(), round(Int,timeout), checkpoint))
     end
     fetch(tsk)
+end
+
+function default_epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+    localresult = fetch(_localresult)::T
+    f(localresult, itsk, args...; kwargs...)
+    nothing
 end
 
 default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)

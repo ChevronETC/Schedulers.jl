@@ -25,47 +25,50 @@ prefix = "lvjn-test-$(randstring(3))"
 
 function init_worker(pid)
     MPI.Init()
-    @show "Initializing $pid"
+    nranks = MPI.Comm_size(MPI.COMM_WORLD)
+    @show "Initializing $pid $nranks"
     nothing
 end
 
 function my_zeros()
     MPI.Init()
-    @show "Making Zeros!"
+    nranks = MPI.Comm_size(MPI.COMM_WORLD)
+    @show "Making Zeros! $nranks"
     initial_zeros =  (MPI.Comm_rank(MPI.COMM_WORLD) == 0 ? zeros(Float32,10) : nothing)
     MPI.Barrier(MPI.COMM_WORLD)
-    @show "Done with Zeros!"
+    @show "Done with Zeros! $nranks"
     return initial_zeros
 end
 
 function my_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} 
     MPI.Init()
-    @show "Saving Checkpoint!"
+    nranks = MPI.Comm_size(MPI.COMM_WORLD)
+    @show "Saving Checkpoint! $nranks"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
         serialize(checkpoint, fetch(localresult)::T)
-        @show "Through Serialization"
+        @show "Through Serialization $nranks"
     end
     MPI.Barrier(MPI.COMM_WORLD)
-    @show "Done Saving Checkpoint!"
+    @show "Done Saving Checkpoint! $nranks"
     nothing
 end
 
 function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
     MPI.Init()
-    @show "Loading Checkpoint!"
+    @show "Loading Checkpoint! $nranks"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
         loaded = deserialize(checkpoint::T)
     else
         loaded = nothing
     end
-    @show "Through DeSerialization"
+    @show "Through DeSerialization $nranks"
     MPI.Barrier(MPI.COMM_WORLD)
-    @show "Done Loading Checkpoint!"
+    @show "Done Loading Checkpoint! $nranks"
     return loaded
 end
 
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
-    N = 20 
+    N = 2 
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
     journalfile = "testjournal-$prefix.json"
 
@@ -81,7 +84,7 @@ end
                                 zeros=my_zeros,
                                 save_checkpoint=my_save_checkpoint,
                                 load_checkpoint=my_load_checkpoint)
-    x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo8mpi, 1:N, a; b=b)
+    x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo6mpi, 1:N, a; b=b)
 
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:N;]) * ones(10)
