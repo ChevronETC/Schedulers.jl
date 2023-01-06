@@ -1024,23 +1024,15 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
-        @show "into remotecall zeros"
         localresults[pid] = remotecall(options.zeros, pid)
-        @show "into second remotecall zeros"
-        localresults[2*pid] = remotecall(options.zeros, pid)
-        @show "getting second zeros"
-        fetch(localresults[2*pid])
-        @show "out of remote call zeros"
+        
         epmap_eloop.checkpoints[pid] = nothing
-        @show "checkpoints set to nothing"
+
         @async while true
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-            @show "checking for preempted"
-            is_preempted = false #check_for_preempted(pid, options.preempted)
-            @show "done checking for preempted"
+            is_preempted = check_for_preempted(pid, options.preempted)
             if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
-                @show "into break loop!"
                 if epmap_eloop.checkpoints[pid] !== nothing
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                 end
@@ -1052,7 +1044,6 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
             local tsk
             try
-                @show "getting tsk"
                 tsk = popfirst!(epmap_eloop.tsk_pool_todo)
             catch
                 # just in case another task does popfirst! before us (unlikely)
@@ -1062,19 +1053,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
             # compute and reduce
             try
-                @show "into compute"
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
-                @show "starting journal"
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                @show "remotecall"
                 remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
-                # call = remotecall(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
-                @show "done with remotecall"
-                # fetch(call)
-                @show "done waiting"
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                @show "journal stop"
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
                 @warn "pid=$pid ($hostname), task loop, caught exception during f eval"

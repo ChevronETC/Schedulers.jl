@@ -34,7 +34,8 @@ function my_zeros()
     MPI.Init()
     nranks = MPI.Comm_size(MPI.COMM_WORLD)
     @show "Making Zeros! $nranks"
-    initial_zeros =  (MPI.Comm_rank(MPI.COMM_WORLD) == 0 ? zeros(Float32,10) : nothing)
+    # initial_zeros =  (MPI.Comm_rank(MPI.COMM_WORLD) == 0 ? zeros(Float32,10) : nothing)
+    initial_zeros = zeros(Float32,10)
     MPI.Barrier(MPI.COMM_WORLD)
     @show "Done with Zeros! $nranks"
     return initial_zeros
