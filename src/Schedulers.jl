@@ -754,6 +754,7 @@ function Base.copy(options::SchedulerOptions)
         options.zeros,
         copy(options.scratch),
         options.id,
+        options.epmapreduce_fetch_apply,
         options.save_checkpoint,
         options.load_checkpoint,
         options.rm_checkpoint,

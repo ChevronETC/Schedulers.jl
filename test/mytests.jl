@@ -67,6 +67,13 @@ function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
     return loaded
 end
 
+function my_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+    @show "into fetch apply"
+    localresult = fetch(_localresult)::T
+    f(localresult, itsk, args...; kwargs...)
+    nothing
+end
+
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     N = 2 
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
@@ -82,6 +89,7 @@ end
                                 minworkers=1,
                                 maxworkers=N,
                                 zeros=my_zeros,
+                                epmapreduce_fetch_apply=my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,
                                 load_checkpoint=my_load_checkpoint)
     x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo6mpi, 1:N, a; b=b)
