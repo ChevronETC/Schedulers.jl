@@ -1026,6 +1026,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
         @show "into remotecall zeros"
         localresults[pid] = remotecall(options.zeros, pid)
+        @show "into second remotecall zeros"
+        localresults[2*pid] = remotecall(options.zeros, pid)
+        @show "getting second zeros"
+        fetch(localresults[2*pid])
         @show "out of remote call zeros"
         epmap_eloop.checkpoints[pid] = nothing
         @show "checkpoints set to nothing"
