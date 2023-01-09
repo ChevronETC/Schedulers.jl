@@ -1029,16 +1029,20 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         epmap_eloop.checkpoints[pid] = nothing
 
         @async while true
+            @show " into async loop"
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
+            @show epmap_eloop.tsk_pool_todo
             is_preempted = check_for_preempted(pid, options.preempted)
             if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+                @show "into exit"
                 if epmap_eloop.checkpoints[pid] !== nothing
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                 end
                 pop!(localresults, pid)
                 pop!(epmap_eloop.checkpoints, pid)
                 put!(epmap_eloop.pid_channel_map_remove, (pid,is_preempted))
+                @show "hitting break"
                 break
             end
 
@@ -1160,6 +1164,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     break
                 end
             end
+            @show "at end of async loop"
+            nothing
         end
     end
     @debug "exited the map worker loop"
