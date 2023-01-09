@@ -1035,6 +1035,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @show epmap_eloop.tsk_pool_todo
             @show isempty(epmap_eloop.tsk_pool_todo)
             @show length(epmap_eloop.tsk_pool_todo)
+            @show epmap_eloop.interrupted
+            @show epmap_eloop.is_reduce_triggered
+            @show !epmap_eloop.checkpoints_are_flushed
+            @show (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
             # @show (is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed))
             is_preempted = check_for_preempted(pid, options.preempted)
             if (is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed))
