@@ -999,17 +999,19 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
     end
 
     epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
-
+    @show "making elastic loop"
     epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
-
+    @show "into tsk_map"
     tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
-
+    @show "into tsk_reduce"
     tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
-
+    @show "waiting for tsk_loop"
     @debug "waiting for tsk_loop"
     loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+    @show "fetching from tsk_reduce"
     @debug "fetching from tsk_reduce"
     result = fetch(tsk_reduce)
+    @show "done fetching from tsk_reduce"
     @debug "finished fetching from tsk_reduce"
 
     journal_final(epmap_journal)
@@ -1202,15 +1204,15 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     break
                 end
             end
-            @show "at end of async loop"
+            @show "at end of async loop $pid"
             nothing
         end
-        @show "out of async loop"
+        @show "out of async loop $pid"
     end
-    @show "out of work worker"
+    @show "out of map worker loop"
     @debug "exited the map worker loop"
     empty!(epmap_eloop.checkpoints)
-
+    @show "after empty command"
     @debug "map, emptied the checkpoints"
     for checkpoint in checkpoint_orphans
         try
@@ -1222,7 +1224,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         end
     end
     @debug "map, deleted the orphaned checkpoints"
-
+    @show "through epmap_reduce_map"
     nothing
 end
 
