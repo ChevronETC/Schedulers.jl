@@ -1243,6 +1243,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         @debug "reduce, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel when the reduction is done
 
+        @show "trying to get hostname from $pid"
         hostname = ""
         try
             hostname = remotecall_fetch(gethostname, pid)
