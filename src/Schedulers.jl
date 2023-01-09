@@ -41,6 +41,7 @@ function check_for_preempted(pid, epmap_preempted)
         tic = time()
         timeout = 5
         while !(istaskdone(tsk))
+            @show "waiting for preempted"
             if time() - tic > timeout
                 break
             end
@@ -49,7 +50,8 @@ function check_for_preempted(pid, epmap_preempted)
         if !(istaskdone(tsk))
             preempted = true
         else
-            preempted = fetch(tsk)
+            if fetch(tsk)
+            preempted = true
         end
         # if remotecall_fetch(epmap_preempted, pid)
         #     preempted = true
