@@ -994,7 +994,7 @@ epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(resu
 
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
-
+    @show "into map"
     checkpoint_orphans = Any[]
 
     # work loop
@@ -1050,13 +1050,16 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 yield()
                 continue
             end
-
+            @show "into compute"
             # compute and reduce
             try
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
+                @show "starting journal for $pid"
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
+                @show "remotecall on fetch apply for $pid"
                 remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                @show "done with remotecall on fetch apply for $pid"
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1077,15 +1080,18 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 end
                 continue # no need to checkpoint since the task failed and will be re-run
             end
-
+            @show "retrieving next checkpoint"
             # checkpoint
             _next_checkpoint = next_checkpoint(options.id, options.scratch)
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
+                @show "into save checkpoint for $pid"
                 remotecall_wait(save_checkpoint_with_timeout, pid, options.save_checkpoint, _next_checkpoint, localresults[pid], T, options.storage_max_latency, options.storage_min_throughput)
+                @show "done with save checkpoint for $pid"
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
+                @show "pushing task done"
                 push!(epmap_eloop.tsk_pool_done, tsk)
             catch e
                 @warn "pid=$pid ($hostname), checkpoint=$(epmap_eloop.checkpoints[pid]), task loop, caught exception during save_checkpoint"
@@ -1121,14 +1127,16 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 end
                 continue # there is no new checkpoint, and we need to keep the old checkpoint
             end
-
+            @show "into delete old checkpoint"
             # delete old checkpoint
             old_checkpoint,epmap_eloop.checkpoints[pid] = get(epmap_eloop.checkpoints, pid, nothing),_next_checkpoint
             try
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
+                    @show "into rm checkpoitn with timeout on $pid"
                     options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, old_checkpoint, options.storage_max_latency)
+                    @show "done with rm checkpoint with timeout on $pid"
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e

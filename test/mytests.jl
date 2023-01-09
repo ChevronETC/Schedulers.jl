@@ -68,6 +68,24 @@ function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
     return loaded
 end
 
+function my_reducer!(x,y)
+    MPI.Init()
+    @show "into reducer"
+    myrank = MPI.Comm_rank(MPI.COMM_WORLD)
+    local result
+    if myrank == 0
+        x = x .+ y
+        y = nothing
+    else
+        x = nothing
+        y = nothing
+    end
+    @show "into reducer barrier"
+    MPI.Barrier(MPI.COMM_WORLD)
+    @show "out of reducer barrier"
+    nothing
+end
+
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     N = 2 
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
@@ -83,6 +101,7 @@ end
                                 minworkers=1,
                                 maxworkers=N,
                                 zeros=my_zeros,
+                                reducer! = my_reducer!,
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,
                                 load_checkpoint=my_load_checkpoint
