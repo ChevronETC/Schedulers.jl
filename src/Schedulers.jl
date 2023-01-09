@@ -48,6 +48,7 @@ function check_for_preempted(pid, epmap_preempted)
             sleep(1)
         end
         if !(istaskdone(tsk))
+            @show "SOMETHING IS WRONG!!!!"
             preempted = false # this really should be "I dont know"
         else
             preempted = fetch(tsk)
