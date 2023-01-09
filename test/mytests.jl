@@ -117,7 +117,7 @@ end
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,
                                 load_checkpoint=my_load_checkpoint,
-                                rm_checkpoint=my_remove_checkpoint
+                                rm_checkpoint=my_rm_checkpoint
                                 )
     x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo6mpi, 1:N, a, b)
 

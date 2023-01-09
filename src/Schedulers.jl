@@ -1130,8 +1130,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @show "into delete old checkpoint"
             # delete old checkpoint
             old_checkpoint,epmap_eloop.checkpoints[pid] = get(epmap_eloop.checkpoints, pid, nothing),_next_checkpoint
+            @show "got old checkpoint"
             try
+                @show "into try"
                 if old_checkpoint !== nothing
+                    @show "old checkpoint is not nothing"
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
                     @show "into rm checkpoitn with timeout on $pid"
@@ -1139,6 +1142,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @show "done with rm checkpoint with timeout on $pid"
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
+                @show "out of delete old checkpoint"
             catch e
                 @warn "pid=$pid ($hostname), task loop, caught exception during remove checkpoint, there may be stray check-point files that will be deleted later"
                 push!(checkpoint_orphans, old_checkpoint)
