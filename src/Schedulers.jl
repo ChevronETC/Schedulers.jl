@@ -26,7 +26,7 @@ now_formatted() = Dates.format(now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z
 
 function check_for_preempted(pid, epmap_preempted)
     preempted = false
-    @show "into preemted check"
+    @show "into preemted check $pid"
     try
         if remotecall_fetch(epmap_preempted, pid)
             preempted = true
@@ -34,7 +34,7 @@ function check_for_preempted(pid, epmap_preempted)
     catch e
         @debug "unable to call preempted method"
     end
-    @show "done with preempted check"
+    @show "done with preempted check $pid"
     preempted
 end
 
