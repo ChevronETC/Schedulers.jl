@@ -37,7 +37,7 @@ function check_for_preempted(pid, epmap_preempted)
     preempted = false
     @show "into preemted check $pid"
     try
-        tsk = @async remotecall(epmap_preempted, pid)
+        tsk = @async remotecall_fetch(epmap_preempted, pid)
         tic = time()
         timeout = 5
         while !(istaskdone(tsk))
@@ -48,11 +48,9 @@ function check_for_preempted(pid, epmap_preempted)
             sleep(1)
         end
         if !(istaskdone(tsk))
-            preempted = true
+            preempted = false # this really should be "I dont know"
         else
-            if fetch(tsk)
-                preempted = true
-            end
+            preempted = fetch(tsk)
         end
         # if remotecall_fetch(epmap_preempted, pid)
         #     preempted = true
