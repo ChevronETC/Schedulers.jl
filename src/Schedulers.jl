@@ -1582,10 +1582,11 @@ function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, lat
         @show "trying to throw timeout exception"
         throw(SaveCheckpointTimeoutException(myid(), round(Int,timeout), checkpoint))
     end
-    @show "into fetch"
-    my_result = fetch(tsk)
-    @show "fetched checkpoint result"
-    my_result
+    nothing
+    # @show "into fetch"
+    # my_result = fetch(tsk)
+    # @show "fetched checkpoint result"
+    # my_result
 end
 
 function default_epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
@@ -1619,7 +1620,8 @@ function rm_checkpoint_with_timeout(f, checkpoint, timeout)
         @async Base.throwto(tsk, InterruptException())
         throw(RemoveCheckpointTimeoutException(myid(), timeout, checkpoint))
     end
-    fetch(tsk)
+    nothing
+    # fetch(tsk)
 end
 
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)

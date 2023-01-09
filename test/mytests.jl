@@ -120,7 +120,7 @@ end
                                 init = pid->init_worker(pid),
                                 nworkers=nworkers_provisioned,
                                 minworkers=1,
-                                maxworkers=N,
+                                maxworkers=1,
                                 zeros=my_zeros,
                                 # reducer! = my_reducer!,
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
