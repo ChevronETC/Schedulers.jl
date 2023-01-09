@@ -1535,6 +1535,7 @@ struct RemoveCheckpointTimeoutException{T} <: Exception
 end
 
 function rm_checkpoint_with_timeout(f, checkpoint, timeout)
+    @show "removing checkpoint"
     tsk = @async f(checkpoint)
 
     tic = time()

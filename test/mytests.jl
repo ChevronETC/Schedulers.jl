@@ -86,6 +86,18 @@ function my_reducer!(x,y)
     nothing
 end
 
+function my_rm_checkpoint(checkpoint)
+    MPI.Init()
+    @show "into RM checkpoint"
+    if MPI.Comm_rank(MPI.COMM_WORLD) == 0
+        isfile(checkpoint) && rm(checkpoint)
+    end
+    @show "into barrier on rm checkpoint"
+    MPI.Barrier(MPI.COMM_WORLD)
+    @show "past barrier on rm checkpoint"
+    nothing
+end
+
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     N = 2 
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
@@ -104,7 +116,8 @@ end
                                 reducer! = my_reducer!,
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,
-                                load_checkpoint=my_load_checkpoint
+                                load_checkpoint=my_load_checkpoint,
+                                rm_checkpoint=my_remove_checkpoint
                                 )
     x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo6mpi, 1:N, a, b)
 
