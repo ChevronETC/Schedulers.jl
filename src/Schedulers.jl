@@ -51,7 +51,8 @@ function check_for_preempted(pid, epmap_preempted)
             preempted = true
         else
             if fetch(tsk)
-            preempted = true
+                preempted = true
+            end
         end
         # if remotecall_fetch(epmap_preempted, pid)
         #     preempted = true
