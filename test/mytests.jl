@@ -128,7 +128,7 @@ end
                                 rm_checkpoint=my_rm_checkpoint,
                                 preempted=my_preempted
                                 )
-    x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo6mpi, 1:N, a, b)
+    x = epmapreduce!(zeros(Float32,10), options, MFWIs.foo9mpi, 1:N, a; b=b)
 
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:N;]) * ones(10)

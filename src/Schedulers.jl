@@ -24,13 +24,36 @@ end
 # see https://github.com/JuliaTime/TimeZones.jl/issues/374
 now_formatted() = Dates.format(now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 
+# tsk = @async f(checkpoint)
+# timeout = latency + length(fetch(localresult)::T) / throughput
+# tic = time()
+# while !(istaskdone(tsk))
+#     if time() - tic > timeout
+#         break;
+#     end
+#     sleep(1)
+
 function check_for_preempted(pid, epmap_preempted)
     preempted = false
     @show "into preemted check $pid"
     try
-        if remotecall_fetch(epmap_preempted, pid)
-            preempted = true
+        tsk = @async remotecall(epmap_preempted, pid)
+        tic = time()
+        timeout = 5
+        while !(istaskdone(tsk))
+            if time() - tic > timeout
+                break
+            end
+            sleep(1)
         end
+        if !(istaskdone(tsk))
+            preempted = true
+        else
+            preempted = fetch(tsk)
+        end
+        # if remotecall_fetch(epmap_preempted, pid)
+        #     preempted = true
+        # end
     catch e
         @debug "unable to call preempted method"
     end
@@ -1004,7 +1027,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @debug "map, iterrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
         pid = take!(epmap_eloop.pid_channel_map_add)
-
+        @show "got pid, it is $pid"
         @debug "map, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
         
