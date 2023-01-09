@@ -26,13 +26,15 @@ now_formatted() = Dates.format(now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z
 
 function check_for_preempted(pid, epmap_preempted)
     preempted = false
-    # try
-    #     if remotecall_fetch(epmap_preempted, pid)
-    #         preempted = true
-    #     end
-    # catch e
-    #     @debug "unable to call preempted method"
-    # end
+    @show "into preemted check"
+    try
+        if remotecall_fetch(epmap_preempted, pid)
+            preempted = true
+        end
+    catch e
+        @debug "unable to call preempted method"
+    end
+    @show "done with preempted check"
     preempted
 end
 
@@ -1177,13 +1179,16 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @show "at end of async loop"
             nothing
         end
+        @show "out of async loop"
     end
+    @show "out of work worker"
     @debug "exited the map worker loop"
     empty!(epmap_eloop.checkpoints)
 
     @debug "map, emptied the checkpoints"
     for checkpoint in checkpoint_orphans
         try
+            @show "emptying the checkpoints"
             rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, options.storage_max_latency)
         catch e
             @warn "unable to remove checkpoint: $checkpoint, manual clean-up may be required"
