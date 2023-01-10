@@ -1203,8 +1203,6 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     break
                 end
             end
-            is_preempted = check_for_preempted(pid, options.preempted)
-            # @show "ending is preempted $is_preempted"
             # @show "at end of async loop $pid"
             nothing
         end

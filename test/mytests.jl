@@ -108,7 +108,7 @@ function my_preempted()
 end
 
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
-    N = 2 
+    N = 10 
     # scratch = "/amlustre2/$(prefix)"
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
     journalfile = "testjournal-$prefix.json"
@@ -121,8 +121,8 @@ end
                                 init = pid->init_worker(pid),
                                 nworkers=nworkers_provisioned,
                                 minworkers=1,
-                                maxworkers=1,
-                                # zeros=my_zeros,
+                                maxworkers=2,
+                                zeros=my_zeros,
                                 # reducer! = my_reducer!,
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,
