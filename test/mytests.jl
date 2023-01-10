@@ -24,25 +24,25 @@ container_path = "lvjn/test"
 prefix = "lvjn-test-$(randstring(3))"
 
 function init_worker(pid)
-    MPI.Init()
+    MPI.Initialized() || MPI.Init()
     nranks = MPI.Comm_size(MPI.COMM_WORLD)
     @show "Initializing $pid $nranks"
     nothing
 end
 
 function my_zeros()
-    MPI.Init()
+    MPI.Initialized() || MPI.Init()
     nranks = MPI.Comm_size(MPI.COMM_WORLD)
     @show "Making Zeros! $nranks"
-    # initial_zeros =  (MPI.Comm_rank(MPI.COMM_WORLD) == 0 ? zeros(Float32,10) : nothing)
-    initial_zeros = zeros(Float32,10)
+    initial_zeros =  (MPI.Comm_rank(MPI.COMM_WORLD) == 0 ? zeros(Float32,10) : nothing)
+    # initial_zeros = zeros(Float32,10)
     MPI.Barrier(MPI.COMM_WORLD)
     @show "Done with Zeros! $nranks"
     return initial_zeros
 end
 
 function my_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} 
-    MPI.Init()
+    MPI.Initialized() || MPI.Init()
     nranks = MPI.Comm_size(MPI.COMM_WORLD)
     @show "Saving Checkpoint! $nranks"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
@@ -55,7 +55,7 @@ function my_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T}
 end
 
 function my_load_checkpoint(checkpoint, ::Type{T}) where {T}
-    MPI.Init()
+    MPI.Initialized() || MPI.Init()
     @show "Loading Checkpoint! $nranks"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0 
         loaded = deserialize(checkpoint::T)
@@ -88,7 +88,7 @@ end
 # end
 
 function my_rm_checkpoint(checkpoint)
-    MPI.Init()
+    MPI.Initialized() || MPI.Init()
     @show "into RM checkpoint"
     if MPI.Comm_rank(MPI.COMM_WORLD) == 0
         isfile(checkpoint) && rm(checkpoint)
@@ -100,7 +100,7 @@ function my_rm_checkpoint(checkpoint)
 end
 
 function my_preempted()
-    MPI.Init()
+    MPI.Initialized() || MPI.Init()
     @show "into my preempted"
     MPI.Barrier(MPI.COMM_WORLD)
     @show  "through preempted barrier"
@@ -109,6 +109,7 @@ end
 
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     N = 2 
+    # scratch = "/amlustre2/$(prefix)"
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
     journalfile = "testjournal-$prefix.json"
 
@@ -121,7 +122,7 @@ end
                                 nworkers=nworkers_provisioned,
                                 minworkers=1,
                                 maxworkers=1,
-                                zeros=my_zeros,
+                                # zeros=my_zeros,
                                 # reducer! = my_reducer!,
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,

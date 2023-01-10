@@ -1,6 +1,6 @@
 module Schedulers
 
-using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics
+using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics, Schedulers
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
@@ -1570,7 +1570,7 @@ end
 function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, latency, throughput) where {T}
     tsk = @async f(checkpoint, localresult, T)
 
-    timeout = latency + length(fetch(localresult)::T) / throughput
+    timeout = latency + 99999#length(fetch(localresult)::T) / throughput
     tic = time()
     while !(istaskdone(tsk))
         if time() - tic > timeout
