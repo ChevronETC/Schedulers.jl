@@ -1510,51 +1510,51 @@ function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpo
     tsk_checkpoint1 = @async load_checkpoint(checkpoint1, T)::T
     tsk_checkpoint2 = @async load_checkpoint(checkpoint2, T)::T
     
-    n = fetch(tsk_filesize)::Int
-    timeout = latency + 2 * n / throughput
+    # n = fetch(tsk_filesize)::Int
+    # timeout = latency + 2 * n / throughput
 
-    @debug "reduce_with_timeout, waiting at most $timeout seconds for reading checkpoints" checkpoint1 checkpoint2
-    tic = time()
-    while !(istaskdone(tsk_checkpoint1) && istaskdone(tsk_checkpoint2))
-        if time() - tic > timeout
-            break
-        end
-        sleep(1)
-    end
+    # @debug "reduce_with_timeout, waiting at most $timeout seconds for reading checkpoints" checkpoint1 checkpoint2
+    # tic = time()
+    # while !(istaskdone(tsk_checkpoint1) && istaskdone(tsk_checkpoint2))
+    #     if time() - tic > timeout
+    #         break
+    #     end
+    #     sleep(1)
+    # end
 
-    if !(istaskdone(tsk_checkpoint1))
-        @debug "reduce_with_timeout, timed-out while waiting for checkpoint read" checkpoint1
-        @async Base.throwto(tsk_checkpoint1, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
-    end
-    if !(istaskdone(tsk_checkpoint2))
-        @debug "reduce_with_timeout, timed-out while waiting for checkpoint read" checkpoint2
-        @async Base.throwto(tsk_checkpoint2, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint2))
-    end
+    # if !(istaskdone(tsk_checkpoint1))
+    #     @debug "reduce_with_timeout, timed-out while waiting for checkpoint read" checkpoint1
+    #     @async Base.throwto(tsk_checkpoint1, InterruptException())
+    #     throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
+    # end
+    # if !(istaskdone(tsk_checkpoint2))
+    #     @debug "reduce_with_timeout, timed-out while waiting for checkpoint read" checkpoint2
+    #     @async Base.throwto(tsk_checkpoint2, InterruptException())
+    #     throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint2))
+    # end
 
-    c1 = fetch(tsk_checkpoint1)::T
-    c2 = fetch(tsk_checkpoint2)::T
+    c1 = fetch(tsk_checkpoint1)#::T
+    c2 = fetch(tsk_checkpoint2)#::T
 
     reducer!(c2, c1)
 
     tsk_serialize = @async save_checkpoint(checkpoint3, c2, T)
 
-    timeout = latency + n / throughput
+    # timeout = latency + n / throughput
 
-    @debug "reduce_with_timeout, waiting at most $timeout seconds for writing checkpoint" checkpoint3
-    tic = time()
-    while !(istaskdone(tsk_serialize))
-        if time() - tic > timeout
-            break
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk_serialize))
-        @debug "reduce_with_timeout, timed-out while waiting for checkpoint write" checkpoint3
-        @async Base.throwto(tsk_serialize, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint3))
-    end
+    # @debug "reduce_with_timeout, waiting at most $timeout seconds for writing checkpoint" checkpoint3
+    # tic = time()
+    # while !(istaskdone(tsk_serialize))
+    #     if time() - tic > timeout
+    #         break
+    #     end
+    #     sleep(1)
+    # end
+    # if !(istaskdone(tsk_serialize))
+    #     @debug "reduce_with_timeout, timed-out while waiting for checkpoint write" checkpoint3
+    #     @async Base.throwto(tsk_serialize, InterruptException())
+    #     throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint3))
+    # end
     fetch(tsk_serialize)
     @debug "reduce_with_timeout, end"
 
@@ -1570,20 +1570,20 @@ end
 function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, latency, throughput) where {T}
     tsk = @async f(checkpoint, localresult, T)
 
-    timeout = latency + 99999#length(fetch(localresult)::T) / throughput
-    tic = time()
-    while !(istaskdone(tsk))
-        if time() - tic > timeout
-            break;
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk))
-        # @show "into interupt!"
-        @async Base.throwto(tsk, InterruptException())
-        # @show "trying to throw timeout exception"
-        throw(SaveCheckpointTimeoutException(myid(), round(Int,timeout), checkpoint))
-    end
+    # timeout = latency + 99999#length(fetch(localresult)::T) / throughput
+    # tic = time()
+    # while !(istaskdone(tsk))
+    #     if time() - tic > timeout
+    #         break;
+    #     end
+    #     sleep(1)
+    # end
+    # if !(istaskdone(tsk))
+    #     # @show "into interupt!"
+    #     @async Base.throwto(tsk, InterruptException())
+    #     # @show "trying to throw timeout exception"
+    #     throw(SaveCheckpointTimeoutException(myid(), round(Int,timeout), checkpoint))
+    # end
     nothing
     # # @show "into fetch"
     # my_result = fetch(tsk)
@@ -1611,17 +1611,17 @@ function rm_checkpoint_with_timeout(f, checkpoint, timeout)
     # @show "removing checkpoint"
     tsk = @async f(checkpoint)
 
-    tic = time()
-    while !(istaskdone(tsk))
-        if time() - tic > timeout
-            break;
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk))
-        @async Base.throwto(tsk, InterruptException())
-        throw(RemoveCheckpointTimeoutException(myid(), timeout, checkpoint))
-    end
+    # tic = time()
+    # while !(istaskdone(tsk))
+    #     if time() - tic > timeout
+    #         break;
+    #     end
+    #     sleep(1)
+    # end
+    # if !(istaskdone(tsk))
+    #     @async Base.throwto(tsk, InterruptException())
+    #     throw(RemoveCheckpointTimeoutException(myid(), timeout, checkpoint))
+    # end
     nothing
     # fetch(tsk)
 end
