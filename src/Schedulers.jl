@@ -1488,7 +1488,7 @@ end
 function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpoint1, checkpoint2, checkpoint3, ::Type{T}, latency, throughput) where {T}
     @debug "reduce_with_timeout, start"
     # tsk_filesize = @async filesize(checkpoint1)
-    
+    @show "starting reduce with timeout"
     # timeout = latency
 
     # @debug "reduce_with_timeout, waiting at most $timeout seconds for filesize" checkpoint1
@@ -1536,11 +1536,12 @@ function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpo
 
     c1 = load_checkpoint(checkpoint1, T)
     c2 = load_checkpoint(checkpoint2, T)
-
+    @show "loaded checkpoints"
     reducer!(c2, c1)
-
+    @show "ran reducer"
     # tsk_serialize = @async save_checkpoint(checkpoint3, c2, T)
     save_checkpoint(checkpoint3, c2, T)
+    @show "saved checkpoints"
     # timeout = latency + n / throughput
 
     # @debug "reduce_with_timeout, waiting at most $timeout seconds for writing checkpoint" checkpoint3
