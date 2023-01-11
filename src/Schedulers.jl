@@ -572,7 +572,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 yield()
                 wait(init_tasks[pid])
                 isbad && push!(bad_pids, pid)
-                @debug "map channel, $pid is initialied, removing from used_pids"
+                @debug "map channel, $pid is initialized, removing from used_pids"
                 pid ∈ eloop.used_pids && pop!(eloop.used_pids, pid)
                 @debug "map channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids)"
             end
