@@ -1487,26 +1487,26 @@ end
 
 function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpoint1, checkpoint2, checkpoint3, ::Type{T}, latency, throughput) where {T}
     @debug "reduce_with_timeout, start"
-    tsk_filesize = @async filesize(checkpoint1)
+    # tsk_filesize = @async filesize(checkpoint1)
+    
+    # timeout = latency
 
-    timeout = latency
+    # @debug "reduce_with_timeout, waiting at most $timeout seconds for filesize" checkpoint1
+    # tic = time()
+    # while !(istaskdone(tsk_filesize))
+    #     if time() - tic > timeout
+    #         break
+    #     end
+    #     sleep(1)
+    # end
+    # if !(istaskdone(tsk_filesize))
+    #     @debug "reduce_with_timeout, timed-out while waiting for filesize" checkpoint1
+    #     @async Base.throwto(tsk_filesize, InterruptException())
+    #     throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
+    # end
 
-    @debug "reduce_with_timeout, waiting at most $timeout seconds for filesize" checkpoint1
-    tic = time()
-    while !(istaskdone(tsk_filesize))
-        if time() - tic > timeout
-            break
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk_filesize))
-        @debug "reduce_with_timeout, timed-out while waiting for filesize" checkpoint1
-        @async Base.throwto(tsk_filesize, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
-    end
-
-    tsk_checkpoint1 = @async load_checkpoint(checkpoint1, T)::T
-    tsk_checkpoint2 = @async load_checkpoint(checkpoint2, T)::T
+    # tsk_checkpoint1 = @async load_checkpoint(checkpoint1, T)::T
+    # tsk_checkpoint2 = @async load_checkpoint(checkpoint2, T)::T
     
     # n = fetch(tsk_filesize)::Int
     # timeout = latency + 2 * n / throughput
@@ -1531,13 +1531,16 @@ function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpo
     #     throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint2))
     # end
 
-    c1 = fetch(tsk_checkpoint1)#::T
-    c2 = fetch(tsk_checkpoint2)#::T
+    # c1 = fetch(tsk_checkpoint1)::T
+    # c2 = fetch(tsk_checkpoint2)::T
+
+    c1 = load_checkpoint(checkpoint1, T)
+    c2 = load_checkpoint(checkpoint2, T)
 
     reducer!(c2, c1)
 
-    tsk_serialize = @async save_checkpoint(checkpoint3, c2, T)
-
+    # tsk_serialize = @async save_checkpoint(checkpoint3, c2, T)
+    save_checkpoint(checkpoint3, c2, T)
     # timeout = latency + n / throughput
 
     # @debug "reduce_with_timeout, waiting at most $timeout seconds for writing checkpoint" checkpoint3
@@ -1553,7 +1556,7 @@ function reduce_with_timeout(reducer!, save_checkpoint, load_checkpoint, checkpo
     #     @async Base.throwto(tsk_serialize, InterruptException())
     #     throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint3))
     # end
-    fetch(tsk_serialize)
+    # fetch(tsk_serialize)
     @debug "reduce_with_timeout, end"
 
     nothing
