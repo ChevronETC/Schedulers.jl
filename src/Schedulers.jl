@@ -436,7 +436,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         reduce_trigger(eloop, journal, journal_task_callback)
         @debug "trigger=$(eloop.is_reduce_triggered)"
 
-        for new_pid in new_pids
+        @sync for new_pid in new_pids
             push!(eloop.used_pids, new_pid)
             init_tasks[new_pid] = @async begin
                 try
