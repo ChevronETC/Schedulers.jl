@@ -125,8 +125,9 @@ function load_modules_on_new_workers(pid)
             if isa(Base.eval(Main, _name), Module) && _name ∉ (:Base, :Core, :InteractiveUtils, :VSCodeServer, :Main, :_vscodeserver)
                 remotecall_fetch(Base.eval, pid, Main, :(using $_name))
             end
-        catch
-            @debug "caught error in load_modules_on_new_workers"
+        catch e
+            @debug "caught error in load_modules_on_new_workers for module $_name"
+            logerror(e, Logging.Debug)
         end
     end
     nothing
@@ -135,19 +136,25 @@ end
 function load_functions_on_new_workers(pid)
     _names = names(Main; imported=true)
     for _name in _names
-        try
-            @sync if isa(Base.eval(Main, _name), Function)
-                @async remotecall_fetch(Base.eval, pid, Main, :(function $_name end))
+        if isa(Base.eval(Main, _name), Function) && _name ∉ (Symbol("@enter"), Symbol("@run"), :ans, :eval, :include, :vscodedisplay)
+            try
+                remotecall_fetch(Base.eval, pid, Main, :(function $_name end))
+            catch e
+                @debug "caught error in load_functions_on_new_workers (function) for pid '$pid' and function '$_name'"
+                logerror(e, Logging.Debug)
+                continue
             end
-            @sync for m in Base.eval(Main, :(methods($_name)))
-                @async remotecall_fetch(Base.eval, pid, Main, :($m))
-            end
-        catch
-            if _name ∉ (Symbol("@enter"), Symbol("@run"), :ans, :vscodedisplay)
-                @debug "caught error in load_functions_on_new_workers for function $_name"
+            for method in Base.eval(Main, :(methods($_name)))
+                try
+                    remotecall_fetch(Base.eval, pid, Main, :($method))
+                catch e
+                    @debug "caught error in load_functions_on_new_workers (methods) for pid '$pid', function '$_name', method '$method'"
+                    logerror(e, Logging.Debug)
+                end
             end
         end
     end
+    nothing
 end
 
 # for performance metrics, track when the pid is started
