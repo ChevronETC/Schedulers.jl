@@ -75,7 +75,7 @@ function my_reducer!(x, y)
     @show "into reducer"
     myrank = MPI.Comm_rank(MPI.COMM_WORLD)
     if myrank == 0
-        x = x .+ y
+        x .+= y
     end
     @show "into reducer barrier"
     MPI.Barrier(MPI.COMM_WORLD)
@@ -104,7 +104,7 @@ function my_preempted()
 end
 
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
-    N = 10 
+    N = 100 
     # scratch = "/amlustre2/$(prefix)"
     scratch = AzContainer("$(container_path)/$prefix/scratch"; storageaccount=storageaccount, session=session_storage)
     journalfile = "testjournal-$prefix.json"
@@ -117,9 +117,9 @@ end
                                 init = pid->init_worker(pid),
                                 nworkers=nworkers_provisioned,
                                 minworkers=1,
-                                maxworkers=2,
-                                # zeros=my_zeros,
-                                # reducer! = my_reducer!,
+                                maxworkers=div(N,3),
+                                zeros=my_zeros,
+                                reducer! = my_reducer!,
                                 epmapreduce_fetch_apply=MFWIs.my_fetch_apply,
                                 save_checkpoint=my_save_checkpoint,
                                 load_checkpoint=my_load_checkpoint,
