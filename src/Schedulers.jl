@@ -814,7 +814,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
 
         @async while true
             is_preempted = check_for_preempted(pid, options.preempted)
-            if is_preempted || length(eloop.tsk_pool_done) == eloop.tsk_count || eloop.interrupted
+            @debug "map task loop exit condition" pid is_preempted length(eloop.tsk_pool_todo) eloop.interrupted
+            if is_preempted || length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
                 @debug "putting $pid onto map_remove channel"
                 put!(eloop.pid_channel_map_remove, (pid,is_preempted))
                 break
