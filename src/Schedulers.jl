@@ -764,10 +764,9 @@ function Base.copy(options::SchedulerOptions)
 end
 
 """
-    epmap([options,] f, tasks, args...; kwargs...)
+    epmap([options,] f, tasks)
 
-where `f` is the map function, and `tasks` is an iterable collection of tasks.  The function `f`
-takes the positional arguments `args`, and the keyword arguments `kwargs`.  `epmap` is parameterized
+where `f` is the map function, and `tasks` is an iterable collection of tasks. `epmap` is parameterized
 using `options::SchedulerOptions` and can be built using `options=SchedulerOptions(;epmap_kwargs...)`
 and `pmap_kwargs` are as follows.
 
@@ -792,15 +791,15 @@ some cluster managers, there may be a delay between the provisioining of a machi
 Julia cluster.
 [2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
 """
-function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...)
+function epmap(options::SchedulerOptions, f::Function, tasks)
     eloop = ElasticLoop(Nothing, tasks, options; isreduce=false)
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
     
-    tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
+    tsk_map = @async epmap_map(options, f, tasks, eloop, journal)
     loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
 end
 
-function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
+function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal)
     # work loop
     @sync while true
         eloop.interrupted && break
@@ -842,7 +841,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(f, pid, tsk, args...; kwargs...)
+                remotecall_wait(f, pid, tsk)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -868,14 +867,13 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
     journal
 end
 
-epmap(f::Function, tasks, args...; kwargs...) = epmap(SchedulerOptions(), f, tasks, args..., kwargs...)
+epmap(f::Function, tasks) = epmap(SchedulerOptions(), f, tasks)
 
 """
-    epmapreduce!(result, [options], f, tasks, args...; kwargs...) -> result
+    epmapreduce!(result, [options], f, tasks) -> result
 
 where `f` is the map function, and `tasks` are an iterable set of tasks to map over.  The
-positional arguments `args` and the named arguments `kwargs` are passed to `f` which has
-the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is
+function `f` has the method signature: `f(localresult, task)`.  `localresult` is
 the assoicated partial reduction contribution to `result`.  `epmapreduce!` is parameterized
 by `options::SchedulerOptions` and can be built using `options=SchedulerOptions(;epmap_kwargs...)`
 and `epmap_kwargs` are as follows.
@@ -961,7 +959,7 @@ result = epmapreduce!(zeros(Float32,10), SchedulerOptions(;reduce_trigger=eloop-
 ```
 Note that the methods `complete_tasks`, `pending_tasks`, `reduced_tasks`, and `total_tasks` can be useful when designing the `reduce_trigger` method.
 """
-function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
+function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks) where {T}
     for scratch in options.scratch
         isdir(scratch) || mkpath(scratch)
     end
@@ -974,7 +972,7 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
 
     epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
 
-    tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
+    tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options)
 
     tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
@@ -992,13 +990,13 @@ end
 
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
-function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk) where {T}
     localresult = fetch(_localresult)::T
-    f(localresult, itsk, args...; kwargs...)
+    f(localresult, itsk)
     nothing
 end
 
-function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
+function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options) where {T}
     localresults = Dict{Int, Future}()
 
     checkpoint_orphans = Any[]
@@ -1062,7 +1060,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
