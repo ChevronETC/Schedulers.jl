@@ -134,23 +134,25 @@ function load_modules_on_new_workers(pid)
 end
 
 function load_functions_on_new_workers(pid)
-    _names = names(Main; imported=true)
+    ignore = (Symbol("@enter"), Symbol("@run"), :ans, :eval, :include, :vscodedisplay)
+    _names = filter(name->name ∉ ignore && isa(Base.eval(Main, name), Function), names(Main; imported=true))
+
     for _name in _names
-        if isa(Base.eval(Main, _name), Function) && _name ∉ (Symbol("@enter"), Symbol("@run"), :ans, :eval, :include, :vscodedisplay)
+        try
+            remotecall_fetch(Base.eval, pid, Main, :(function $_name end))
+        catch e
+            @debug "caught error in load_functions_on_new_workers (function) for pid '$pid' and function '$_name'"
+            logerror(e, Logging.Debug)
+        end
+    end
+
+    for _name in _names
+        for method in Base.eval(Main, :(methods($_name)))
             try
-                remotecall_fetch(Base.eval, pid, Main, :(function $_name end))
+                remotecall_fetch(Base.eval, pid, Main, :($method))
             catch e
-                @debug "caught error in load_functions_on_new_workers (function) for pid '$pid' and function '$_name'"
+                @debug "caught error in load_functions_on_new_workers (methods) for pid '$pid', function '$_name', method '$method'"
                 logerror(e, Logging.Debug)
-                continue
-            end
-            for method in Base.eval(Main, :(methods($_name)))
-                try
-                    remotecall_fetch(Base.eval, pid, Main, :($method))
-                catch e
-                    @debug "caught error in load_functions_on_new_workers (methods) for pid '$pid', function '$_name', method '$method'"
-                    logerror(e, Logging.Debug)
-                end
             end
         end
     end
