@@ -237,6 +237,32 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     eloop
 end
 
+struct HandshakeException{T} <: Exception
+    pid::Int
+    hostname::String
+    tsk::T
+    timeout::Int
+end
+Base.show(io::IO, e::HandshakeException{T}) where {T} = show(io, "Failed to complete handshake in $(e.timeout) seconds for process '$(e.pid)' ($(e.hostname)), task '$(e.tsk)'.")
+
+function handle_exception(e::HandshakeException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
+    @debug "inside handle_exception for handshake" pid
+    logerror(e, Logging.Warn)
+
+    fails[pid] += 1
+    nerrors = sum(values(fails))
+
+    @warn "process with id=$pid ($hostname) failed handshake, marking as bad for removal."
+    r = (bad_pid=true, do_break=true, do_interrupt=false, do_error=false)
+
+    if nerrors >= epmap_maxerrors
+        @error "too many total errors, $nerrors errors"
+        r = (bad_pid = true, do_break=true, do_interrupt=true, do_error=true)
+    end
+
+    r
+end
+
 function handle_exception(e, pid, hostname, fails, epmap_maxerrors, epmap_retries)
     logerror(e, Logging.Warn)
 
@@ -619,10 +645,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     while !istaskdone(tsk_addrmprocs)
         if time() - tic > 10
             @warn "delayed remove/add procs tasks took longer than 10 seconds, giving up..."
-            # try
-            #     Base.throwto(tsk_addrmprocs, ErrorException(""))
-            # catch
-            # end
+            @async Base.throwto(tsk_addrmprocs, InterruptException())
             break
         end
         sleep(1)
@@ -655,6 +678,7 @@ default_reducer!(x, y) = (x .+= y; nothing)
 mutable struct SchedulerOptions{C}
     retries::Int
     maxerrors::Int
+    handshake_timeout::Int
     minworkers::Function
     maxworkers::Function
     nworkers::Function
@@ -684,6 +708,7 @@ end
 function SchedulerOptions(;
         retries = 0,
         maxerrors = typemax(Int),
+        handshake_timeout = 60,
         minworkers = Distributed.nworkers,
         maxworkers = Distributed.nworkers,
         nworkers = ()->Distributed.nprocs()-1,
@@ -711,6 +736,7 @@ function SchedulerOptions(;
     SchedulerOptions(
         retries,
         maxerrors,
+        handshake_timeout,
         isa(minworkers, Function) ? minworkers : ()->minworkers,
         isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
         nworkers,
@@ -740,6 +766,7 @@ function Base.copy(options::SchedulerOptions)
     SchedulerOptions(
         options.retries,
         options.maxerrors,
+        options.handshake_timeout,
         options.minworkers,
         options.maxworkers,
         options.nworkers,
@@ -776,6 +803,7 @@ and `pmap_kwargs` are as follows.
 ## epmap_kwargs
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
+* `handshake_timeout=10` the maximum time to wait for the worker to notify us that it is executing its task
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
@@ -802,7 +830,31 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
 end
 
+function complete_handshake(channel, timeout, pid, hostname, tsk)
+    @debug "waiting for handshake, pid=$pid, tsk=$tsk"
+    tsk_take = @async take!(channel)
+    tic = time()
+    while true
+        istaskdone(tsk_take) && break
+        if time() - tic > timeout
+            @async Base.throwto(tsk_take, InterruptException())
+            @debug "throwing handshake exception" pid tsk (time()-tic) timeout
+            throw(HandshakeException(pid, hostname, tsk, timeout))
+            @debug "thrown handshake exception" pid tsk (time()-tic) timeout
+        end
+        sleep(1)
+    end
+    @debug "handshake received, pid=$pid, tsk=$tsk"
+end
+
+function call_function_with_handshake(f, channel, args...; kwargs...)
+    put!(channel, true)
+    f(args...; kwargs...)
+end
+
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
+    handshake_channels = Dict{Int, RemoteChannel}()
+
     # work loop
     @sync while true
         eloop.interrupted && break
@@ -820,6 +872,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             put!(eloop.pid_channel_map_remove, (pid,true))
             continue
         end
+
+        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
 
         @async while true
             is_preempted = check_for_preempted(pid, options.preempted)
@@ -844,7 +898,14 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(f, pid, tsk, args...; kwargs...)
+                _future = remotecall(call_function_with_handshake, pid, f, handshake_channels[pid], tsk, args...; kwargs...)
+
+                complete_handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
+
+                @debug "fetching task future, pid=$pid, tsk=$tsk"
+                wait(_future)
+                @debug "fetched task future, pid=$pid, tsk=$tsk"
+
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -855,6 +916,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 push!(eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
                 if r.do_break || r.do_interrupt
+                    pop!(handshake_channels, pid)
                     put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
                 end
                 eloop.interrupted = r.do_interrupt
@@ -887,6 +949,7 @@ and `epmap_kwargs` are as follows.
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
+* `handshake_timeout=60` the maximum time to wait in seconds for the worker to notify us that it is executing its task
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
@@ -994,7 +1057,8 @@ end
 
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
-function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+function epmapreduce_fetch_apply_with_handshake(channel, _localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+    put!(channel, true)
     localresult = fetch(_localresult)::T
     f(localresult, itsk, args...; kwargs...)
     nothing
@@ -1002,6 +1066,7 @@ end
 
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
+    handshake_channels = Dict{Int, RemoteChannel}()
 
     checkpoint_orphans = Any[]
 
@@ -1036,6 +1101,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         epmap_eloop.checkpoints[pid] = nothing
 
+        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+
         @async while true
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
@@ -1064,7 +1131,14 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                _future = remotecall(epmapreduce_fetch_apply_with_handshake, pid, handshake_channels[pid], localresults[pid], T, f, tsk, args...; kwargs...)
+
+                complete_handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
+
+                @debug "waiting for task future, pid=$pid, tsk=$tsk"
+                wait(_future)
+                @debug "waited for task future, pid=$pid, tsk=$tsk"
+
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1080,6 +1154,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     end
                     pop!(localresults, pid)
                     pop!(epmap_eloop.checkpoints, pid)
+                    pop!(handshake_channels, pid)
                     put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
                     break
                 end
