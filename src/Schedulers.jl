@@ -1,6 +1,6 @@
 module Schedulers
 
-using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics
+using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics, ThreadPools
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempted = ()->false
@@ -237,15 +237,15 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     eloop
 end
 
-struct HandshakeException{T} <: Exception
+struct HeartbeatException{T} <: Exception
     pid::Int
     hostname::String
     tsk::T
-    timeout::Int
+    interval::Int
 end
-Base.show(io, e::HandshakeException) = show(io, "Failed to complete handshake in $(e.timeout) seconds for process '$(e.pid)' ($(e.hostname)), taks '$(e.tsk)'.")
+Base.show(io, e::HeartbeatException) = show(io, "Failed to receive heartbeat in $(e.interval) seconds for process '$(e.pid)' ($(e.hostname)), task '$(e.tsk)'.")
 
-function handle_exception(e::HandshakeException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
+function handle_exception(e::HeartbeatException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
     logerror(e, Logging.Warn)
 
     fails[pid] += 1
@@ -843,41 +843,32 @@ function heartbeat_worker(heartbeat_channel, complete_channel)
     end
 end
 
-function heartbeat_master(_future, heartbeat_channel)
-    timeout = get(ENV, "SCHEDULERS_HEARTBEAT_TIMEOUT", 600)
-    interval = get(ENV, "SCHEDULERS_HEARTBEAT_INTERVAL", 60)
+function heartbeat_master(_future, heartbeat_channel, heartbeat_timeout, heartbeat_interval, pid, hostname, tsk)
+    tic = time()
     while true
+        if isready(heartbeat_channel)
+            take!(heartbeat_channel)
+        elseif time() - tic > heartbeat_timeout
+            throw(HeartbeatException(pid, hostname, tsk, heartbeat_interval))
+        else
+            tic = time()
+        end
         if isready(_future)
             break
         end
-        take!(heartbeat_channel)
         sleep(interval)
     end
 end
 
-function complete_handshake(channel, timeout, pid, hostname, tsk)
-    @debug "waiting for handshake, pid=$pid, tsk=$tsk"
-    tic = time()
-    while !isready(channel)
-        if time() - tic > timeout
-            throw(HandShakeException(pid, hostname, tsk, timeout))
-        end
-        sleep(1)
-    end
-    @debug "handshake received, pid=$pid, tsk=$tsk"
-
-    @debug "completing handshake, pid=$pid, tsk=$tsk"
-    take!(channel)
-    @debug "completed handshake, pid=$pid, tsk=$tsk"
-end
-
-function call_function_with_handshake(f, channel, args...; kwargs...)
-    put!(channel, true)
+function call_function_with_heartbeat(f, heartbeat_channel, heartbeat_interval, heartbeat_thread, args...; kwargs...)
+    complete_channel = Channel{Bool}(1)
+    @tspawnat heartbeat_thread heartbeat_worker(heartbeat_channel, complete_channel)
     f(args...; kwargs...)
+    put!(complete_channel, true)
 end
 
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
-    handshake_channels = Dict{Int, RemoteChannel}()
+    heartbeat_channels = Dict{Int, RemoteChannel}()
 
     # work loop
     @sync while true
@@ -897,7 +888,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             continue
         end
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        heartbeat_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
 
         @async while true
             is_preempted = check_for_preempted(pid, options.preempted)
@@ -922,13 +913,9 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                _future = remotecall(call_function_with_handshake, pid, f, handshake_channels[pid], tsk, args...; kwargs...)
+                _future = remotecall(call_function_with_heartbeat, pid, f, handshake_channels[pid], tsk, args...; kwargs...)
 
-                complete_handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
-
-                @debug "fetching task future, pid=$pid, tsk=$tsk"
-                wait(_future)
-                @debug "fetched task future, pid=$pid, tsk=$tsk"
+                heartbeat_master(_future, handshake_channels[pid])
 
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
