@@ -832,7 +832,7 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
 end
 
 function complete_handshake(channel, timeout, pid, hostname, tsk)
-    @debug "waiting for handshake" pid tsk
+    @debug "waiting for handshake, pid=$pid, tsk=$tsk"
     tic = time()
     while !isready(channel)
         if time() - tic > timeout
@@ -840,11 +840,11 @@ function complete_handshake(channel, timeout, pid, hostname, tsk)
         end
         sleep(1)
     end
-    @debug "handshake received" pid tsk
+    @debug "handshake received, pid=$pid, tsk=$tsk"
 
-    @debug "completing handshake" pid tsk
+    @debug "completing handshake, pid=$pid, tsk=$tsk"
     take!(channel)
-    @debug "completed handshake" pid tsk
+    @debug "completed handshake, pid=$pid, tsk=$tsk"
 end
 
 function call_function_with_handshake(f, channel, args...; kwargs...)
@@ -902,9 +902,9 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
 
                 complete_handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
 
-                @debug "fetching task future" pid tsk
-                fetch(_future)
-                @debug "fetched task future" pid tsk
+                @debug "fetching task future, pid=$pid, tsk=$tsk"
+                wait(_future)
+                @debug "fetched task future, pid=$pid, tsk=$tsk"
 
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
