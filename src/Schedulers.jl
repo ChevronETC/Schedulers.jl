@@ -831,6 +831,30 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
 end
 
+function heartbeat_worker(heartbeat_channel, complete_channel)
+    interval = get(ENV, "SCHEDULERS_HEARTBEAT_INTERVAL", 60)
+    while true
+        put!(heartbeat_channel, true)
+        if isready(complete_channel)
+            empty!(heartbeat_channel)
+            break
+        end
+        sleep(interval)
+    end
+end
+
+function heartbeat_master(_future, heartbeat_channel)
+    timeout = get(ENV, "SCHEDULERS_HEARTBEAT_TIMEOUT", 600)
+    interval = get(ENV, "SCHEDULERS_HEARTBEAT_INTERVAL", 60)
+    while true
+        if isready(_future)
+            break
+        end
+        take!(heartbeat_channel)
+        sleep(interval)
+    end
+end
+
 function complete_handshake(channel, timeout, pid, hostname, tsk)
     @debug "waiting for handshake, pid=$pid, tsk=$tsk"
     tic = time()
