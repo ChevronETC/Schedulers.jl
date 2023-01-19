@@ -1135,9 +1135,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 complete_handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
 
-                @debug "fetching task future" pid tsk
-                fetch(_future)
-                @debug "fetched"
+                @debug "waiting for task future, pid=$pid, tsk=$tsk"
+                wait(_future)
+                @debug "waited for task future, pid=$pid, tsk=$tsk"
 
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
