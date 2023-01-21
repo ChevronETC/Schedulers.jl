@@ -803,7 +803,7 @@ and `pmap_kwargs` are as follows.
 ## epmap_kwargs
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
-* `handshake_timeout=10` the maximum time to wait for the worker to notify us that it is executing its task
+* `handshake_timeout=60` the maximum time to wait for the worker to notify us that it is executing its task
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
