@@ -677,8 +677,6 @@ mutable struct SchedulerOptions{C}
     rm_checkpoint::Function
     reduce_trigger::Function
     save_partial_reduction::Function
-    storage_max_latency::Int
-    storage_min_throughput::Int
 end
 
 function SchedulerOptions(;
@@ -705,9 +703,7 @@ function SchedulerOptions(;
         save_checkpoint = default_save_checkpoint,
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
-        save_partial_reduction = checkpoint->nothing,
-        storage_max_latency = parse(Int, get(ENV, "SCHEDULERS_STORAGE_MAX_LATENCY", "$(typemax(Int))")),
-        storage_min_throughput = parse(Float64, get(ENV, "SCHEDULERS_STORAGE_MIN_THROUGHPUT", "0.000001")))
+        save_partial_reduction = checkpoint->nothing)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -731,9 +727,7 @@ function SchedulerOptions(;
         save_checkpoint,
         rm_checkpoint,
         reduce_trigger,
-        save_partial_reduction,
-        storage_max_latency,
-        round(Int,storage_min_throughput*1_000_000)) # convert from MB/s to bytes/s.
+        save_partial_reduction)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -760,9 +754,7 @@ function Base.copy(options::SchedulerOptions)
         options.save_checkpoint,
         options.rm_checkpoint,
         options.reduce_trigger,
-        options.save_partial_reduction,
-        options.storage_max_latency,
-        options.storage_min_throughput)
+        options.save_partial_reduction)
 end
 
 """
@@ -902,8 +894,6 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
-* `storage_max_latency=parse(Int, get(ENV, "SCHEDULERS_STORAGE_MAX_LATENCY", "1"))` maximum storage latency in seconds [4]
-* `storage_min_throughput=parse(Int, get(ENV, "SCHEDULERS_STORAGe_MIN_THROUGHPUT", "1"))` minimum storage throughput in MegaBytes per second [4]
 
 ## Notes
 [1] The number of machines provisioined may be greater than the number of workers in the cluster since with
@@ -912,11 +902,6 @@ Julia cluster.
 [2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
 [3] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
-[4] In some cases, storage can become non-responsive. This is, in particular, observed on Azure Blob Storage.  When this happens, we
-need to treat this as a fault.  The fault is triggered with some timeout that takes into consideration a maximum allowed storage
-latency and a minimum allowed storage through-put.  So the time out is, in general, computed as `latency + N / throughput`, and
-where N is the size of the data being written or read.  One can think of this as a work-a-round for bugs that appear else-where
-in the software stack.  Note that the default values are very conservative.
 
 # Examples
 ## Example 1
@@ -1091,7 +1076,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                remotecall_wait(save_checkpoint_with_timeout, pid, options.save_checkpoint, _next_checkpoint, localresults[pid], T, options.storage_max_latency, options.storage_min_throughput)
+                remotecall_wait(options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1108,7 +1093,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 @debug "caught save checkpoint" r.do_break r.do_interrupt _next_checkpoint
                 # note that `options.rm_checkpoint` should check if the file exists before attempting removal
                 try
-                    rm_checkpoint_with_timeout(options.rm_checkpoint, _next_checkpoint, options.storage_max_latency)
+                    options.rm_checkpoint(_next_checkpoint)
                 catch e
                     @warn "unable to delete $(_next_checkpoint), manual clean-up may be required"
                     logerror(e, Logging.Warn)
@@ -1136,7 +1121,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, old_checkpoint, options.storage_max_latency)
+                    options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -1164,7 +1149,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
     @debug "map, emptied the checkpoints"
     for checkpoint in checkpoint_orphans
         try
-            rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, options.storage_max_latency)
+            options.rm_checkpoint(checkpoint)
         catch e
             @warn "unable to remove checkpoint: $checkpoint, manual clean-up may be required"
             logerror(e, Logging.Warn)
@@ -1294,7 +1279,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_wait(reduce_with_timeout, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T, options.storage_max_latency, options.storage_min_throughput)
+                remotecall_wait(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1321,7 +1306,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, checkpoint1, options.storage_max_latency)
+                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
             catch e
@@ -1344,7 +1329,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(rm_checkpoint_with_timeout, pid, options.rm_checkpoint, checkpoint2, options.storage_max_latency)
+                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
             catch e
@@ -1385,13 +1370,13 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     @debug "deleting orphaned checkpoints"
     if !(options.keepcheckpoints)
         try
-            rm_checkpoint_with_timeout(options.rm_checkpoint, epmap_eloop.reduce_checkpoints[1], options.storage_max_latency)
+            options.rm_checkpoint(epmap_eloop.reduce_checkpoints[1])
         catch
             @warn "unable to remove final checkpoint $(epmap_eloop.reduce_checkpoints[1])"
         end
         for checkpoint in orphans_remove
             try
-                rm_checkpoint_with_timeout(options.rm_checkpoint, checkpoint, options.storage_max_latency)
+                options.rm_checkpoint(checkpoint)
             catch
                 @warn "unable to remove orphan checkpoint: $checkpoint"
             end
@@ -1414,136 +1399,20 @@ function next_checkpoint(id, scratch)
     joinpath(scratch[next_scratch_index(length(scratch))], string("checkpoint-", id, "-", next_checkpoint_id()))
 end
 
-struct ReduceTimeoutException{T} <: Exception
-    id::Int
-    timeout::Int
-    checkpoint::T
-end
-
-function reduce_with_timeout(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}, latency, throughput) where {T}
-    @debug "reduce_with_timeout, start"
-    tsk_filesize = @async filesize(checkpoint1)
-
-    timeout = latency
-
-    @debug "reduce_with_timeout, waiting at most $timeout seconds for filesize" checkpoint1
-    tic = time()
-    while !(istaskdone(tsk_filesize))
-        if time() - tic > timeout
-            break
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk_filesize))
-        @debug "reduce_with_timeout, timed-out while waiting for filesize" checkpoint1
-        @async Base.throwto(tsk_filesize, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
-    end
-
-    tsk_checkpoint1 = @async deserialize(checkpoint1)::T
-    tsk_checkpoint2 = @async deserialize(checkpoint2)::T
-    
-    n = fetch(tsk_filesize)::Int
-    timeout = latency + 2 * n / throughput
-
-    @debug "reduce_with_timeout, waiting at most $timeout seconds for reading checkpoints" checkpoint1 checkpoint2
-    tic = time()
-    while !(istaskdone(tsk_checkpoint1) && istaskdone(tsk_checkpoint2))
-        if time() - tic > timeout
-            break
-        end
-        sleep(1)
-    end
-
-    if !(istaskdone(tsk_checkpoint1))
-        @debug "reduce_with_timeout, timed-out while waiting for checkpoint read" checkpoint1
-        @async Base.throwto(tsk_checkpoint1, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint1))
-    end
-    if !(istaskdone(tsk_checkpoint2))
-        @debug "reduce_with_timeout, timed-out while waiting for checkpoint read" checkpoint2
-        @async Base.throwto(tsk_checkpoint2, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint2))
-    end
-
-    c1 = fetch(tsk_checkpoint1)::T
-    c2 = fetch(tsk_checkpoint2)::T
-
+function reduce(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
+    @debug "reduce, load checkpoint 1"
+    c1 = deserialize(checkpoint1)::T
+    @debug "reduce, load checkpoint 2"
+    c2 = deserialize(checkpoint2)::T
+    @debug "reduce, reducer"
     reducer!(c2, c1)
-
-    tsk_serialize = @async serialize(checkpoint3, c2)
-
-    timeout = latency + n / throughput
-
-    @debug "reduce_with_timeout, waiting at most $timeout seconds for writing checkpoint" checkpoint3
-    tic = time()
-    while !(istaskdone(tsk_serialize))
-        if time() - tic > timeout
-            break
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk_serialize))
-        @debug "reduce_with_timeout, timed-out while waiting for checkpoint write" checkpoint3
-        @async Base.throwto(tsk_serialize, InterruptException())
-        throw(ReduceTimeoutException(myid(), round(Int,timeout), checkpoint3))
-    end
-    fetch(tsk_serialize)
-    @debug "reduce_with_timeout, end"
-
+    @debug "reduce, serialize"
+    serialize(checkpoint3, c2)
+    @debug "reduce, done"
     nothing
 end
 
-struct SaveCheckpointTimeoutException{T} <: Exception
-    id::Int
-    timeout::Int
-    checkpoint::T
-end
-
-function save_checkpoint_with_timeout(f, checkpoint, localresult, ::Type{T}, latency, throughput) where {T}
-    tsk = @async f(checkpoint, localresult, T)
-
-    timeout = latency + length(fetch(localresult)::T) / throughput
-    tic = time()
-    while !(istaskdone(tsk))
-        if time() - tic > timeout
-            break;
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk))
-        @async Base.throwto(tsk, InterruptException())
-        throw(SaveCheckpointTimeoutException(myid(), round(Int,timeout), checkpoint))
-    end
-    fetch(tsk)
-end
-
 default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
-restart(reducer!, orphan, localresult, ::Type{T}) where {T} = (reducer!(fetch(localresult)::T, deserialize(orphan)::T); nothing)
-
-struct RemoveCheckpointTimeoutException{T} <: Exception
-    id::Int
-    timeout::Int
-    checkpoint::T
-end
-
-function rm_checkpoint_with_timeout(f, checkpoint, timeout)
-    tsk = @async f(checkpoint)
-
-    tic = time()
-    while !(istaskdone(tsk))
-        if time() - tic > timeout
-            break;
-        end
-        sleep(1)
-    end
-    if !(istaskdone(tsk))
-        @async Base.throwto(tsk, InterruptException())
-        throw(RemoveCheckpointTimeoutException(myid(), timeout, checkpoint))
-    end
-    fetch(tsk)
-end
-
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
