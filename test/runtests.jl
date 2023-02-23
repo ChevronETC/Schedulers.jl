@@ -320,7 +320,7 @@ end
         sleep(1)
         nothing
     end
-
+    
     @everywhere function test_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T}
         x = rand()
         if x > 0.8
@@ -328,12 +328,20 @@ end
         end
         Schedulers.default_save_checkpoint(checkpoint, localresult, T)
     end
+    
+    @everywhere function test_load_checkpoint(checkpoint, ::Type{T}) where {T}
+        x = rand()
+        if x > 0.8
+            error("bar,x=$x")
+        end
+        Schedulers.default_load_checkpoint(checkpoint, T)
+    end
 
     a,b = 2,3
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, save_checkpoint = test_save_checkpoint, retries=0)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, load_checkpoint=test_load_checkpoint, save_checkpoint = test_save_checkpoint, retries=0)
     x = epmapreduce!(zeros(Float32,10), options, foo7b, 1:100, a, b)
 
     rmprocs(workers())
