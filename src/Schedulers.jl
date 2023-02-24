@@ -673,7 +673,9 @@ mutable struct SchedulerOptions{C}
     zeros::Function
     scratch::Vector{C}
     id::String
+    epmapreduce_fetch_apply::Function
     save_checkpoint::Function
+    load_checkpoint::Function
     rm_checkpoint::Function
     reduce_trigger::Function
     save_partial_reduction::Function
@@ -700,7 +702,9 @@ function SchedulerOptions(;
         zeros = ()->nothing,
         scratch = ["/scratch"],
         id = randstring(6),
+        epmapreduce_fetch_apply = default_epmapreduce_fetch_apply,
         save_checkpoint = default_save_checkpoint,
+        load_checkpoint = default_load_checkpoint,
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing)
@@ -724,7 +728,9 @@ function SchedulerOptions(;
         zeros,
         isa(scratch, AbstractArray) ? scratch : [scratch],
         id,
+        epmapreduce_fetch_apply,
         save_checkpoint,
+        load_checkpoint,
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction)
@@ -751,7 +757,9 @@ function Base.copy(options::SchedulerOptions)
         options.zeros,
         copy(options.scratch),
         options.id,
+        options.epmapreduce_fetch_apply,
         options.save_checkpoint,
+        options.load_checkpoint,
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction)
@@ -979,12 +987,6 @@ end
 
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
-function epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
-    localresult = fetch(_localresult)::T
-    f(localresult, itsk, args...; kwargs...)
-    nothing
-end
-
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
 
@@ -1049,7 +1051,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1279,7 +1281,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_wait(reduce, pid, options.reducer!, checkpoint1, checkpoint2, checkpoint3, T)
+                remotecall_wait(reduce, pid, options.reducer!, options.save_checkpoint, options.load_checkpoint,  checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1399,20 +1401,28 @@ function next_checkpoint(id, scratch)
     joinpath(scratch[next_scratch_index(length(scratch))], string("checkpoint-", id, "-", next_checkpoint_id()))
 end
 
-function reduce(reducer!, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
+function reduce(reducer!, save_checkpoint, load_checkpoint, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
     @debug "reduce, load checkpoint 1"
-    c1 = deserialize(checkpoint1)::T
+    c1 = load_checkpoint(checkpoint1, T)
     @debug "reduce, load checkpoint 2"
-    c2 = deserialize(checkpoint2)::T
+    c2 = load_checkpoint(checkpoint2, T)
     @debug "reduce, reducer"
     reducer!(c2, c1)
     @debug "reduce, serialize"
-    serialize(checkpoint3, c2)
+    save_checkpoint(checkpoint3, c2, T)
     @debug "reduce, done"
     nothing
 end
 
+function default_epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
+    localresult = fetch(_localresult)::T
+    f(localresult, itsk, args...; kwargs...)
+    nothing
+end
+
 default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
+default_load_checkpoint(checkpoint, ::Type{T}) where {T} = deserialize(checkpoint)::T
+
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
