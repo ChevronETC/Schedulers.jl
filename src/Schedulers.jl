@@ -664,8 +664,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         for rm_pid in rm_pids
                             haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
                         end
-
-                        tsk_addrmprocs_tic = time()
                     end
                 end
             elseif δ > 0
@@ -678,6 +676,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     logerror(e, Logging.Error)
                 end
             end
+
+            tsk_addrmprocs_tic = time()
         elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout && istaskdone(tsk_addrmprocs_interrupt)
             @warn "addprocs/rmprocs taking longer than expected, cancelling."
             tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmmprocs, InterruptException())
