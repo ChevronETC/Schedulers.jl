@@ -153,6 +153,7 @@ function complete_handshake(handshake)
         end
         sleep(1)
     end
+    put!(handshake.channel, true)
     @debug "handshake received, pid=$(handshake.pid), tsk=$(handshake.tsk)"
 end
 
@@ -161,6 +162,7 @@ function call_handshake(channel, f, args...; kwargs...)
     @debug "sending handshake boolean, pid='$pid'"
     put!(channel, true)
     @debug "done sending handshake boolean, pid='$pid'"
+    take!(channel)
     f(args...; kwargs...)
 end
 
