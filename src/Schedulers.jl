@@ -624,12 +624,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         @debug "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, and $(length(eloop.used_pids)) busy procs inclusive of process 1)"
 
         if istaskdone(tsk_addrmprocs)
-            if δ < 0 || length(bad_pids) > 0
+            if δ < 0 #=|| length(bad_pids) > 0=#
                 rm_pids = Int[]
-                while !isempty(bad_pids)
-                    push!(rm_pids, pop!(bad_pids))
-                end
-                δ += length(rm_pids)
+                # while !isempty(bad_pids)
+                #     push!(rm_pids, pop!(bad_pids))
+                # end
+                # δ += length(rm_pids)
                 if istaskdone(tsk_addrmprocs)
                     tsk_addrmprocs = @async begin
                         if δ < 0
@@ -643,7 +643,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         try
                             rmprocs(rm_pids_known; waitfor=addrmprocs_timeout)
                         catch e
-                            @warn "unable to run rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
+                            @warn "unable to verify rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
                             logerror(e, Logging.Warn)
                         end
                         @debug "done calling rmprocs on known pids"
