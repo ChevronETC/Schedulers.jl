@@ -165,19 +165,42 @@ function call_handshake(channel, f, args...; kwargs...)
 end
 
 function remotecall_wait_handshake(handshake, f, pid, args...; kwargs...)
-    _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
-    complete_handshake(handshake)
-    @debug "waiting on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
-    wait(_future)
-    @debug "waited on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
+    for iretry = 1:10
+        try
+            _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
+            complete_handshake(handshake)
+            @debug "waiting on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
+            wait(_future)
+            @debug "waited on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
+            break
+        catch e
+            if isa(e, HandshakeException) && iretry != 10
+                @warn "caught handshake exception, iretry=$iretry" e
+            else
+                throw(e)
+            end
+        end
+    end
 end
 
 function remotecall_fetch_handshake(handshake, f, pid, args...; kwargs...)
-    _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
-    complete_handshake(handshake)
-    @debug "fetching task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
-    x = fetch(_future)
-    @debug "fetched task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
+    local x
+    for iretry = 1:10
+        try
+            _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
+            complete_handshake(handshake)
+            @debug "fetching task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
+            x = fetch(_future)
+            @debug "fetched task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
+            break
+        catch e
+            if isa(e, HandshakeException) && iretry != 10
+                @warn "caught handshake exception, iretry=$iretry" e
+            else
+                throw(e)
+            end
+        end
+    end
     x
 end
 
