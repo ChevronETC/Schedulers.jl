@@ -119,14 +119,15 @@ function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage,
 end
 
 struct Handshake{T}
-    channel::RemoteChannel{Channel{Bool}}
+    channel_main_to_worker::RemoteChannel{Channel{Bool}}
+    channel_worker_to_main::RemoteChannel{Channel{Bool}}
     timeout::Int
     pid::Int
     hostname::String
     tsk::T
 end
-Handshake(channel, timeout, pid) = Handshake(channel, round(Int, timeout), pid, "", "")
-Handshake(channel, timeout, pid, hostname, tsk) = Handshake(channel, round(Int, timeout), pid, hostname, tsk)
+Handshake(channel_main_to_worker, channel_worker_to_main, timeout, pid) = Handshake(channel_main_to_worker, channel_worker_to_main, round(Int, timeout), pid, "", "")
+Handshake(channel_main_to_worker, channel_worker_to_main, timeout, pid, hostname, tsk) = Handshake(channel_main_to_worker, channel_worker_to_main, round(Int, timeout), pid, hostname, tsk)
 Base.show(io::IO, handshake::Handshake{T}) where {T} = show(io, "wait for '$(handshake.timeout)' seconds and process '$(handshake.pid)' ($(handshake.hostname)), task '$(handshake.tsk)'.")
 
 struct HandshakeException{T} <: Exception
@@ -141,7 +142,7 @@ Base.show(io::IO, e::TimeoutException) = show(io, "Failed to execute remotecall 
 
 function complete_handshake(handshake)
     @debug "waiting for handshake, pid=$(handshake.pid), tsk=$(handshake.tsk)"
-    tsk_take = @async take!(handshake.channel)
+    tsk_take = @async take!(handshake.channel_worker_to_main)
     tic = time()
     while true
         istaskdone(tsk_take) && break
@@ -153,23 +154,23 @@ function complete_handshake(handshake)
         end
         sleep(1)
     end
-    put!(handshake.channel, true)
+    put!(handshake.channel_main_to_worker, true)
     @debug "handshake received, pid=$(handshake.pid), tsk=$(handshake.tsk)"
 end
 
-function call_handshake(channel, f, args...; kwargs...)
+function call_handshake(channel_worker_to_main, channel_main_to_worker, f, args...; kwargs...)
     pid = myid()
     @debug "sending handshake boolean, pid='$pid'"
-    put!(channel, true)
+    put!(channel_worker_to_main, true)
     @debug "done sending handshake boolean, pid='$pid'"
-    take!(channel)
+    take!(channel_main_to_worker)
     f(args...; kwargs...)
 end
 
 function remotecall_wait_handshake(handshake, f, pid, args...; kwargs...)
     for iretry = 1:10
         try
-            _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
+            _future = remotecall(call_handshake, pid, handshake.channel_worker_to_main, handshake.channel_main_to_worker, f, args...; kwargs...)
             complete_handshake(handshake)
             @debug "waiting on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
             wait(_future)
@@ -189,7 +190,7 @@ function remotecall_fetch_handshake(handshake, f, pid, args...; kwargs...)
     local x
     for iretry = 1:10
         try
-            _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
+            _future = remotecall(call_handshake, pid, handshake.channel_worker_to_main, handshake.channel_main_to_worker, f, args...; kwargs...)
             complete_handshake(handshake)
             @debug "fetching task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
             x = fetch(_future)
@@ -933,7 +934,8 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
 end
 
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
-    handshake_channels = Dict{Int, RemoteChannel}()
+    handshake_channels_main_to_worker = Dict{Int, RemoteChannel}()
+    handshake_channels_worker_to_main = Dict{Int, RemoteChannel}()
 
     # work loop
     @sync while true
@@ -943,14 +945,15 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels_main_to_worker[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels_worker_to_main[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
 
         hostname = ""
 
         @async while true
             if hostname == ""
                 try
-                    handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid)
+                    handshake = Handshake(handshake_channels_main_to_worker[pid], handshake_channels_worker_to_main[pid], options.handshake_timeout, pid)
                     hostname = remotecall_fetch_handshake(handshake, gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid"
@@ -983,7 +986,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
+                handshake = Handshake(handshake_channels_main_to_worker[pid], handshake_channels_worker_to_main[pid], options.handshake_timeout, pid, hostname, tsk)
                 remotecall_wait_handshake(handshake, f, pid, tsk, args...; kwargs...)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
@@ -1131,7 +1134,8 @@ epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(resu
 
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
-    handshake_channels = Dict{Int, RemoteChannel}()
+    handshake_channels_main_to_worker = Dict{Int, RemoteChannel}()
+    handshake_channels_worker_to_main = Dict{Int, RemoteChannel}()
 
     checkpoint_orphans = Any[]
 
@@ -1149,7 +1153,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             continue
         end
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels_main_to_worker[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels_worker_to_main[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
 
         hostname = ""
 
@@ -1162,7 +1167,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @async while true
             if hostname == ""
                 try
-                    handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid)
+                    handshake = Handshake(handshake_channels_main_to_worker[pid], handshake_channels_worker_to_main[pid], options.handshake_timeout, pid)
                     hostname = remotecall_fetch_handshake(handshake, gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid"
@@ -1201,7 +1206,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 continue
             end
 
-            handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
+            handshake = Handshake(handshake_channels_main_to_worker[pid], handshake_channels_worker_to_main[pid], options.handshake_timeout, pid, hostname, tsk)
 
             # compute and reduce
             try
@@ -1326,7 +1331,8 @@ end
 function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) where {T}
     @debug "entered the reduce method"
     orphans_remove = Set{Any}()
-    handshake_channels = Dict{Int, RemoteChannel}()
+    handshake_channels_main_to_worker = Dict{Int, RemoteChannel}()
+    handshake_channels_worker_to_main = Dict{Int, RemoteChannel}()
 
     l = ReentrantLock()
 
@@ -1342,12 +1348,12 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
         handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
 
-        handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, "")
+        handshake = Handshake(handshake_channels_main_to_worker[pid], handshake_channels_worker_to_main[pid], options.handshake_timeout, pid, hostname, "")
 
         @async while true
             if hostname == ""
                 try
-                    hostname_handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid)
+                    hostname_handshake = Handshake(handshake_channels_main_to_worker[pid], handshake_channels_worker_to_main[pid], options.handshake_timeout, pid)
                     hostname = remotecall_fetch_handshake(hostname_handshake, gethostname, pid)
                 catch e
                     @warn "unable to determine host name for pid=$pid"
