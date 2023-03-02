@@ -918,7 +918,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(0), pid)
 
         hostname = ""
 
@@ -1124,7 +1124,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             continue
         end
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(0), pid)
 
         hostname = ""
 
@@ -1315,7 +1315,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
         hostname = ""
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(0), pid)
 
         handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, "")
 
