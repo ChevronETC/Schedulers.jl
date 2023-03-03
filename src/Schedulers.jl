@@ -925,8 +925,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         @async while true
             if hostname == ""
                 try
-                    handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid)
-                    hostname = remotecall_fetch_handshake(handshake, gethostname, pid)
+                    hostname = remotecall_fetch_handshake(Handshake(handshake_channels[pid], options.handshake_timeout, pid), gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid"
                     logerror(e, Logging.Warn)
@@ -962,8 +961,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk)
-                remotecall_wait_handshake(handshake, f, pid, tsk, args...; kwargs...)
+                remotecall_wait_handshake(Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk), f, pid, tsk, args...; kwargs...)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -1145,8 +1143,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @async while true
             if hostname == ""
                 try
-                    handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid)
-                    hostname = remotecall_fetch_handshake(handshake, gethostname, pid)
+                    hostname = remotecall_fetch_handshake(Handshake(handshake_channels[pid], options.handshake_timeout, pid), gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid"
                     logerror(e, Logging.Warn)
@@ -1341,8 +1338,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
         handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(0), pid)
 
-        handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, "")
-
         @async while true
             if hostname == ""
                 try
@@ -1361,6 +1356,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     break
                 end
             end
+
+            handshake = Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, "")
  
             @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
             epmap_eloop.interrupted && break
@@ -1470,11 +1467,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
-                    pop!(handshake_channels, pid)
                     try
                         close(handshake_channels[pid])
                     catch
                     end
+                    pop!(handshake_channels, pid)
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
