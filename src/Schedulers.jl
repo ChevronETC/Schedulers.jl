@@ -165,27 +165,27 @@ function call_handshake(channel, f, args...; kwargs...)
 end
 
 function remotecall_wait_handshake(handshake, f, pid, args...; kwargs...)
-    _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
+    _tsk = @async remotecall_wait(call_handshake, pid, handshake.channel, f, args...; kwargs...)
     complete_handshake(handshake)
     @debug "waiting on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
-    wait(_future)
+    wait(_tsk)
     @debug "waited on task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
 end
 
 function remotecall_fetch_handshake(handshake, f, pid, args...; kwargs...)
-    _future = remotecall(call_handshake, pid, handshake.channel, f, args...; kwargs...)
+    _tsk = @async remotecall_fetch(call_handshake, pid, handshake.channel, f, args...; kwargs...)
     complete_handshake(handshake)
     @debug "fetching task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
-    x = fetch(_future)
+    x = fetch(_tsk)
     @debug "fetched task future, pid=$(handshake.pid), tsk=$(handshake.tsk)"
     x
 end
 
 function remotecall_wait_timeout(timeout, f, pid, args...; kwargs...)
-    _future = remotecall(f, pid, args...; kwargs...)
+    _tsk = @async remotecall_wait(f, pid, args...; kwargs...)
     tic = time()
     while true
-        isready(_future) && break
+        istaskdone(_tsk) && break
         if time() - tic > timeout
             throw(TimeoutException(pid))
         end
