@@ -134,7 +134,7 @@ struct HandshakeException{T} <: Exception
 end
 Base.show(io::IO, e::HandshakeException{T}) where {T} = show(io, "Failed to complete handshake: $(e.handshake)")
 
-struct TimeoutException{T}
+struct TimeoutException
     pid::Int
 end
 Base.show(io::IO, e::TimeoutException) = show(io, "Failed to execute remotecall in $timeout seconds.")
