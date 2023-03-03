@@ -918,7 +918,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
-        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(1), pid)
+        handshake_channels[pid] = RemoteChannel(()->Channel{Bool}(0), pid)
 
         hostname = ""
 
