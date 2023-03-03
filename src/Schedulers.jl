@@ -930,6 +930,10 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 catch e
                     @warn "unable to determine hostname for pid=$pid"
                     logerror(e, Logging.Warn)
+                    try
+                        close(handle_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     put!(eloop.pid_channel_map_remove, (pid,true))
                     break
@@ -970,6 +974,10 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 push!(eloop.tsk_pool_todo, tsk)
                 r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
                 if r.do_break || r.do_interrupt
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
                 end
@@ -1147,6 +1155,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     end
                     haskey(localresults, pid) && deleteat!(localresults, pid)
                     pop!(epmap_eloop.checkpoints, pid)
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
                     break
@@ -1161,6 +1173,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                 end
                 pop!(localresults, pid)
+                try
+                    close(handshake_channels[pid])
+                catch
+                end
                 pop!(handshake_channels, pid)
                 pop!(epmap_eloop.checkpoints, pid)
                 put!(epmap_eloop.pid_channel_map_remove, (pid,is_preempted))
@@ -1243,6 +1259,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @debug "popping checkpoints"
                     pop!(epmap_eloop.checkpoints, pid)
                     @debug "poppping handshake channels"
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     @debug "returning pid to elastic loop"
                     put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
@@ -1273,6 +1293,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                         push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                     end
                     pop!(localresults, pid)
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     pop!(epmap_eloop.checkpoints, pid)
                     put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
@@ -1327,6 +1351,10 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 catch e
                     @warn "unable to determine host name for pid=$pid"
                     logerror(e, Logging.Warn)
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     haskey(epmap_eloop.reduce_checkpoints_is_dirty, pid) && pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
@@ -1443,6 +1471,10 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
                     pop!(handshake_channels, pid)
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
@@ -1467,6 +1499,10 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
@@ -1491,6 +1527,10 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
                 if r.do_break || r.do_interrupt
+                    try
+                        close(handshake_channels[pid])
+                    catch
+                    end
                     pop!(handshake_channels, pid)
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
