@@ -958,7 +958,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             end
 
             try
-                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left; $(length(eloop.tsk_pool_done)) tasks done."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                 remotecall_wait_handshake(Handshake(handshake_channels[pid], options.handshake_timeout, pid, hostname, tsk), f, pid, tsk, args...; kwargs...)
@@ -1193,7 +1193,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
             # compute and reduce
             try
-                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left; $(length(epmap_eloop.tsk_pool_done)) tasks done."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                 remotecall_wait_handshake(handshake, options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
@@ -1383,7 +1383,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             # reduce two checkpoints into a third checkpoint
             if n_checkpoints > 1
-                @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(epmap_eloop.reduce_machine_count) reduce workers)."
+                @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(epmap_eloop.reduce_machine_count) reduce workers, $(length(epmap_eloop.tsk_pool_done)) tasks done)."
                 local checkpoint1
                 try
                     @debug "reduce, popping first checkpoint, pid=$pid"
