@@ -31,9 +31,11 @@ addprocs(5)
     @info "sleeping for task $tsk on worker $(myid()) for 60 seconds"
     sleep(60)
 end
-x = epmapreduce!(zeros(Float64,5), foo, 1:10) # x=[10,10,10,10,10]
+x,tsks = epmapreduce!(zeros(Float64,5), foo, 1:10) # x=[10,10,10,10,10]
 ```
 Note that `y` contains a partial reduction for the tasks assigned to its Julia process.
+`x` is the result, and `tsks` is a list of any tasks that were aborted.  In general, we
+should expect this to be an empty list.
 
 ## Parallel map reduce with structured data
 By default the reduction assumes that the object being reduced is a Julia array.
@@ -59,7 +61,7 @@ end
     nothing
 end
 options = SchedulerOptions(zeros = my_zeros, reducer! = my_reducer!)
-x = epmapreduce!(my_zeros(), options, foo, 1:10)
+x,tsks = epmapreduce!(my_zeros(), options, foo, 1:10)
 ```
 
 ## Parameterization

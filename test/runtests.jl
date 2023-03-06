@@ -237,6 +237,60 @@ end
     end
 end
 
+@testset "pmap with timeout" begin
+    using Distributed, Schedulers
+
+    s = randstring('a':'z', 4)
+
+    function foo5c(tsk, s)
+        if tsk == 20 && !isfile(joinpath(tempdir(), "touch.txt"))
+            write(joinpath(tempdir(), "touch.txt"), "touch")
+            sleep(600)
+        else
+            sleep(1)
+        end
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk, $(myid())")
+    end
+
+    options = SchedulerOptions(;maxworkers=5)
+    journal,tsks = epmap(options, foo5c, 1:20, s)
+    @test isempty(tsks)
+    rm(joinpath(tempdir(), "touch.txt"))
+
+    for tsk = 1:20
+        @test isfile(joinpath(tempdir(), "task-$s-$tsk.txt"))
+        rm(joinpath(tempdir(), "task-$s-$tsk.txt"))
+    end
+end
+
+@testset "pmap with timeout and skip_tasks_that_timeout=true" begin
+    using Distributed, Schedulers
+
+    s = randstring('a':'z', 4)
+
+    function foo5c(tsk, s)
+        if tsk == 20
+            sleep(600)
+        else
+            sleep(1)
+        end
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk, $(myid())")
+    end
+
+    options = SchedulerOptions(;maxworkers=5, skip_tasks_that_timeout=true)
+    journal,tsks = epmap(options, foo5c, 1:20, s)
+    @test tsks == [20]
+
+    for tsk = 1:20
+        if tsk == 20
+            @test isfile(joinpath(tempdir(), "task-$s-$tsk.txt")) == false
+        else
+            @test isfile(joinpath(tempdir(), "task-$s-$tsk.txt"))
+            rm(joinpath(tempdir(), "task-$s-$tsk.txt"))
+        end
+    end
+end
+
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
@@ -249,7 +303,7 @@ end
 
     a,b = 2,3
     options = SchedulerOptions(;scratch=tmpdir)
-    x = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
 
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
@@ -269,7 +323,7 @@ end
 
     a,b = 2,3
     options = SchedulerOptions(;scratch=tmpdir)
-    x = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
@@ -297,7 +351,7 @@ end
     sleep(10)
     rmprocs(workers()[randperm(nworkers())[1]])
 
-    x = fetch(tsk)
+    x,tsks = fetch(tsk)
     @test nworkers() == 5
     _wrkrs = workers()
     @test wrkrs != _wrkrs
@@ -342,7 +396,7 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, load_checkpoint=test_load_checkpoint, save_checkpoint = test_save_checkpoint, retries=0)
-    x = epmapreduce!(zeros(Float32,10), options, foo7b, 1:100, a, b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo7b, 1:100, a, b)
 
     rmprocs(workers())
 
@@ -371,8 +425,8 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, retries=0)
-    x = epmapreduce!(zeros(Float32,10), options, foo7c, 1:100, a, b)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, retries=0, timeout_multiplier=70)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo7c, 1:100, a, b)
 
     rmprocs(workers())
 
@@ -401,7 +455,7 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     options = SchedulerOptions(;minworkers=5, maxworkers=5, scratch=tmpdir, retries=0, maxerrors=typemax(Int))
-    x = epmapreduce!(zeros(Float32,10), options, foo8, 1:10, a, b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo8, 1:10, a, b)
 
     rmprocs(workers())
 
@@ -463,7 +517,7 @@ end
     a,b = 2,3
     tmpdir = mktempdir(;cleanup=false)
     options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, reducer! = myreducer!)
-    x = epmapreduce!(zeros(Float32,10), options, foo9b, 1:10, a, b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo9b, 1:10, a, b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:10;]) * ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -490,7 +544,7 @@ end
     a,b = 2,3
     tmpdir = mktempdir(;cleanup=false)
     options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, reducer! = myreducer!)
-    x = epmapreduce!(zeros(Float32,10), options, foo9c, 1:10, a, b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo9c, 1:10, a, b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:10;]) * ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -517,7 +571,7 @@ end
     a,b = 2,3
     tmpdir = mktempdir(;cleanup=false)
     options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, rm_checkpoint = myrm)
-    x = epmapreduce!(zeros(Float32,10), options, foo9d, 1:10, a, b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo9d, 1:10, a, b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:10;]) * ones(10)
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
@@ -539,7 +593,7 @@ end
     tmpdir = mktempdir(;cleanup=false)
 
     options = SchedulerOptions(; minworkers=5, maxworkers=11, scratch=tmpdir, addprocs=safe_addprocs)
-    x = epmapreduce!(zeros(Float32,10), options, foo12, 1:100, a, b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo12, 1:100, a, b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
@@ -573,7 +627,7 @@ end
     sleep(20)
     @test nworkers() > 5
 
-    x = fetch(tsk)
+    x,tsks = fetch(tsk)
 
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
@@ -621,7 +675,7 @@ end
 
     a,b = 2,3
     options = SchedulerOptions(;scratch=tmpdirs, keepcheckpoints=true)
-    x = epmapreduce!(zeros(Float32,10), options, foo15, 1:100, a; b=b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo15, 1:100, a; b=b)
 
     ncheckpoints = [length(readdir(tmpdir)) for tmpdir in tmpdirs]
     ncheckpoints_average = sum(ncheckpoints) / 3
@@ -656,7 +710,7 @@ end
 
     ntasks = Ref(0)
     options = SchedulerOptions(;maxworkers=10, scratch=tmpdir, reduce_trigger=eloop->my_reduce_trigger(eloop, ntasks), save_partial_reduction=input->write(tmpfile, input))
-    r = epmapreduce!(zeros(10), options, foo16, 1:100)
+    r,tsks = epmapreduce!(zeros(10), options, foo16, 1:100)
 
     @test r ≈ sum([1:100;]) * ones(10)
 
@@ -668,6 +722,72 @@ end
 
     rm(tmpfile)
     rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "epmapreduce, timeout during f eval" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere function foo17(x, tsk, a; b)
+        if tsk == 20 && !isfile(joinpath(tempdir(), "touch.txt"))
+            write(joinpath(tempdir(), "touch.txt"), "touch")
+            sleep(600)
+        else
+            sleep(0.1)
+        end
+        x .+= a*b*tsk
+        nothing
+    end
+
+    tmpdirs = [mktempdir(;cleanup=false) for i=1:3]
+
+    a,b = 2,3
+    options = SchedulerOptions(;scratch=tmpdirs, keepcheckpoints=true)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo17, 1:100, a; b=b)
+    rm(joinpath(tempdir(), "touch.txt"))
+    @test isempty(tsks)
+
+    ncheckpoints = [length(readdir(tmpdir)) for tmpdir in tmpdirs]
+    ncheckpoints_average = sum(ncheckpoints) / 3
+    for i = 1:3
+        @test ncheckpoints[i] > 0
+        @test (ncheckpoints[i] - ncheckpoints_average) < .1*ncheckpoints_average
+    end
+
+    rmprocs(workers())
+    @test x ≈ (sum(a*b*[1:100;])) * ones(10)
+    rm.(tmpdirs; recursive=true, force=true)
+end
+
+@testset "epmapreduce, timeout during f eval, and skip_tasks_that_timeout=true" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere function foo17(x, tsk, a; b)
+        if tsk == 20
+            sleep(600)
+        else
+            sleep(0.1)
+        end
+        x .+= a*b*tsk
+        nothing
+    end
+
+    tmpdirs = [mktempdir(;cleanup=false) for i=1:3]
+
+    a,b = 2,3
+    options = SchedulerOptions(;scratch=tmpdirs, keepcheckpoints=true, skip_tasks_that_timeout=true)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo17, 1:100, a; b=b)
+    @test tsks == [20]
+
+    ncheckpoints = [length(readdir(tmpdir)) for tmpdir in tmpdirs]
+    ncheckpoints_average = sum(ncheckpoints) / 3
+    for i = 1:3
+        @test ncheckpoints[i] > 0
+        @test (ncheckpoints[i] - ncheckpoints_average) < .1*ncheckpoints_average
+    end
+
+    rmprocs(workers())
+    @test x ≈ (sum(a*b*[1:100;]) - a*b*20) * ones(10)
+    rm.(tmpdirs; recursive=true, force=true)
 end
 
 @testset "copy SchedulerOptions" begin
