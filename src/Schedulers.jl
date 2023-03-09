@@ -182,6 +182,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     epmap_nworkers::FNWorkers
     tsk_pool_todo::Vector{T}
     tsk_pool_done::Vector{T}
+    tsk_pool_timed_out::Vector{T}
     tsk_pool_reduced::Vector{T}
     tsk_count::Int
     reduce_machine_count::Int
@@ -218,6 +219,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         _tsk_pool_todo,
         empty(_tsk_pool_todo),
         empty(_tsk_pool_todo),
+        empty(_tsk_pool_todo),
         length(_tsk_pool_todo),
         0,
         C[],
@@ -235,6 +237,58 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     end
 
     eloop
+end
+
+struct TimeoutException <: Exception
+    pid::Int
+    elapsed::Float64
+end
+
+maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
+
+function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
+    tsk = @async remotecall_wait(f, pid, args...; kwargs...)
+    tic = time()
+    while !istaskdone(tsk)
+        if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
+            throw(TimeoutException(pid, time() - tic))
+        end
+        sleep(1)
+    end
+    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    if istaskfailed(tsk)
+        fetch(tsk)
+    end
+    nothing
+end
+
+function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
+    tsk = @async remotecall_fetch(f, pid, args...; kwargs...)
+    tic = time()
+    while !istaskdone(tsk)
+        if tic - time() > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
+            throw(TimeoutException(pid, tic - time()))
+        end
+        sleep(1)
+    end
+    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    fetch(tsk)
+end
+
+function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
+    logerror(e, Logging.Warn)
+
+    fails[pid] += 1
+    nerrors = sum(values(fails))
+
+    r = (bad_pid = true, do_break=true, do_interrupt=false, do_error=false)
+
+    if nerrors >= epmap_maxerrors
+        @error "too many total errors, $nerrors errors"
+        r = (bad_pid = true, do_break=true, do_interrupt=true, do_error=true)
+    end
+
+    r
 end
 
 function handle_exception(e, pid, hostname, fails, epmap_maxerrors, epmap_retries)
@@ -358,12 +412,15 @@ end
 
 function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
-    init_tasks = Dict{Int,Task}()
-
-    bad_pids = Set{Int}()
-    wrkrs = Dict{Int, Union{Distributed.LocalProcess, Distributed.Worker}}()
+    addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
 
     tsk_addrmprocs = @async nothing
+    tsk_addrmprocs_interrupt = @async nothing
+    tsk_addrmprocs_tic = time()
+
+    initializing_pids = Set{Int}()
+    bad_pids = Set{Int}()
+    wrkrs = Dict{Int, Union{Distributed.LocalProcess, Distributed.Worker}}()
 
     is_tasks_done_message_sent = false
     is_reduce_done_message_sent = false
@@ -422,8 +479,14 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             close(eloop.pid_channel_map_remove)
             isopen(eloop.pid_channel_reduce_add) && close(eloop.pid_channel_reduce_add)
             isopen(eloop.pid_channel_reduce_remove) && close(eloop.pid_channel_reduce_remove)
-            istaskfailed(tsk_map) && @error "map task failed"
-            istaskfailed(tsk_reduce) && @error "reduce task failed"
+            if istaskfailed(tsk_map)
+                @error "map task failed"
+                fetch(tsk_map)
+            end
+            if istaskfailed(tsk_reduce)
+                @error "reduce task failed"
+                fetch(tsk_reduce)
+            end
             break
         end
 
@@ -436,70 +499,72 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             continue
         end
 
-        new_pids = filter(pid->(pid ∉ eloop.used_pids && pid ∉ bad_pids), workers())
+        uninitialized_pids = filter(pid->(pid ∉ initializing_pids && pid ∉ eloop.initialized_pids), workers())
 
-        @debug "workers()=$(workers()), new_pids=$new_pids, used_pids=$(eloop.used_pids), bad_pids=$bad_pids"
+        for uninitialized_pid in uninitialized_pids
+            if !haskey(Distributed.map_pid_wrkr, uninitialized_pid)
+                @warn "worker with pid=$uninitialized_pid is not registered"
+            else
+                wrkrs[uninitialized_pid] = Distributed.map_pid_wrkr[uninitialized_pid]
+                push!(initializing_pids, uninitialized_pid)
+                @async try
+                    @debug "initializing failure count on $uninitialized_pid"
+                    yield()
+                    eloop.pid_failures[uninitialized_pid] = 0
+                    @debug "loading modules on $uninitialized_pid"
+                    yield()
+                    load_modules_on_new_workers(uninitialized_pid)
+                    @debug "loading functions on $uninitialized_pid"
+                    yield()
+                    load_functions_on_new_workers(uninitialized_pid)
+                    @debug "calling init on new $uninitialized_pid"
+                    yield()
+                    eloop.epmap_init(uninitialized_pid)
+                    @debug "done loading functions modules, and calling init on $uninitialized_pid"
+                    yield()
+                    _pid_up_timestamp[uninitialized_pid] = time()
+                    push!(eloop.initialized_pids, uninitialized_pid)
+                    pop!(initializing_pids, uninitialized_pid)
+                catch e
+                    @warn "problem initializing $uninitialized_pid, removing $uninitialized_pid from cluster."
+                    logerror(e, Logging.Warn)
+                    uninitialized_pid ∈ eloop.initialized_pids && pop!(eloop.initialized_pids, uninitialized_pid)
+                    uninitialized_pid ∈ initializing_pids && pop!(initializing_pids, uninitialized_pid)
+                    haskey(eloop.pid_failures, uninitialized_pid) && pop!(eloop.pid_failures, uninitialized_pid)
+                    push!(bad_pids, uninitialized_pid)
+                end
+            end
+        end
+
+        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids && pid ∉ bad_pids), workers())
+
+        @debug "workers()=$(workers()), free_pids=$free_pids, used_pids=$(eloop.used_pids), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
         yield()
 
         @debug "checking for reduction trigger"
         reduce_trigger(eloop, journal, journal_task_callback)
         @debug "trigger=$(eloop.is_reduce_triggered)"
 
-        for new_pid in new_pids
-            push!(eloop.used_pids, new_pid)
-            init_tasks[new_pid] = @async begin
-                try
-                    if new_pid ∉ eloop.initialized_pids
-                        @debug "initializing failure count on $new_pid"
-                        yield()
-                        eloop.pid_failures[new_pid] = 0
-                        @debug "loading modules on $new_pid"
-                        yield()
-                        load_modules_on_new_workers(new_pid)
-                        @debug "loading functions on $new_pid"
-                        yield()
-                        load_functions_on_new_workers(new_pid)
-                        @debug "calling init on new $new_pid"
-                        yield()
-                        eloop.epmap_init(new_pid)
-                        @debug "done loading functions modules, and calling init on $new_pid"
-                        yield()
-                        _pid_up_timestamp[new_pid] = time()
-                        push!(eloop.initialized_pids, new_pid)
-                    end
+        for free_pid in free_pids
+            push!(eloop.used_pids, free_pid)
 
-                    if !haskey(Distributed.map_pid_wrkr, new_pid)
-                        @warn "worker with pid=$new_pid is not registered"
-                        new_pid ∈ keys(wrkrs) && pop!(wrkrs, new_pid)
-                        new_pid ∈ eloop.used_pids && pop!(eloop.used_pids, new_pid)
-                    else
-                        wrkrs[new_pid] = Distributed.map_pid_wrkr[new_pid]
+            if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed) && length(eloop.checkpoints) == 0
+                eloop.reduce_checkpoints_snapshot = copy(eloop.reduce_checkpoints)
+                eloop.checkpoints_are_flushed = true
+            end
 
-                        if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed) && length(eloop.checkpoints) == 0
-                            eloop.reduce_checkpoints_snapshot = copy(eloop.reduce_checkpoints)
-                            eloop.checkpoints_are_flushed = true
-                        end
+            is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
+            @debug "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(eloop.reduce_machine_count)"
 
-                        is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
-                        @debug "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(eloop.reduce_machine_count)"
-
-                        if is_more_tasks && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints_snapshot), 2) <= eloop.reduce_machine_count
-                            @debug "putting pid=$new_pid onto map channel"
-                            put!(eloop.pid_channel_map_add, new_pid)
-                        elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > eloop.reduce_machine_count
-                            @debug "putting pid=$new_pid onto reduce channel"
-                            put!(eloop.pid_channel_reduce_add, new_pid)
-                            eloop.reduce_machine_count += 1
-                        else
-                            new_pid ∈ eloop.used_pids && pop!(eloop.used_pids, new_pid)
-                        end
-                    end
-                catch e
-                    @warn "problem initializing $new_pid, removing $new_pid from cluster."
-                    logerror(e, Logging.Warn)
-                    push!(bad_pids, new_pid)
-                    new_pid ∈ eloop.used_pids && pop!(eloop.used_pids, new_pid)
-                end
+            if is_more_tasks && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints_snapshot), 2) <= eloop.reduce_machine_count
+                @debug "putting pid=$free_pid onto map channel"
+                put!(eloop.pid_channel_map_add, free_pid)
+            elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > eloop.reduce_machine_count
+                @debug "putting pid=$free_pid onto reduce channel"
+                put!(eloop.pid_channel_reduce_add, free_pid)
+                eloop.reduce_machine_count += 1
+            else
+                free_pid ∈ eloop.used_pids && pop!(eloop.used_pids, free_pid)
             end
         end
 
@@ -520,56 +585,65 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
         @debug "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)"
         @debug "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, and $(length(eloop.used_pids)) busy procs inclusive of process 1)"
+
         if istaskdone(tsk_addrmprocs)
-            tsk_addrmprocs = @async begin
-                if !isempty(bad_pids)
-                    @debug "removing bad pids: $bad_pids"
-                    while !isempty(bad_pids)
-                        bad_pid = pop!(bad_pids)
-                        if haskey(Distributed.map_pid_wrkr, bad_pid)
-                            @debug "bad pid=$bad_pid is known to Distributed, calling rmprocs"
-                            rmprocs(bad_pid)
-                        else
-                            @debug "bad pid=$bad_pid is not known to Distributed, calling kill"
+            if δ < 0 || length(bad_pids) > 0
+                rm_pids = Int[]
+                while !isempty(bad_pids)
+                    push!(rm_pids, pop!(bad_pids))
+                end
+                δ += length(rm_pids)
+                if istaskdone(tsk_addrmprocs)
+                    tsk_addrmprocs = @async begin
+                        if δ < 0
+                            free_pids = filter(pid->pid ∉ eloop.used_pids, workers())
+                            push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
+                        end
+                        rm_pids_known = filter(rm_pid->haskey(Distributed.map_pid_wrkr, rm_pid), rm_pids)
+                        rm_pids_unknown = filter(rm_pid->rm_pid ∉ rm_pids_known, rm_pids)
+
+                        @debug "calling rmprocs on $rm_pids_known"
+                        try
+                            rmprocs(rm_pids_known; waitfor=addrmprocs_timeout)
+                        catch e
+                            @warn "unable to run rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
+                            logerror(e, Logging.Warn)
+                        end
+                        @debug "done calling rmprocs on known pids"
+
+                        for rm_pid in rm_pids_unknown
+                            @debug "pid=$rm_pid is not known to Distributed, calling kill"
                             try
                                 # required for cluster managers that require clean-up when the julia process on a worker dies:
-                                Distributed.kill(wrkrs[bad_pid].manager, bad_pid, wrkrs[bad_pid].config)
+                                @debug "calling kill with pid=$rm_pid"
+                                Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
+                                @debug "done calling kill with pid=$rm_pid"
                             catch e
-                                @warn "unable to kill bad worker with pid=$bad_pid"
+                                @warn "unable to kill bad worker with pid=$rm_pid"
                                 logerror(e, Logging.Warn)
                             end
                         end
-                        bad_pid ∈ wrkrs && delete!(wrkrs, bad_pid)
-                    end
-                elseif δ > 0
-                    try
-                        @debug "adding $δ procs"
-                        eloop.epmap_addprocs(δ)
-                    catch e
-                        @error "problem adding new processes"
-                        logerror(e, Logging.Error)
-                    end
-                elseif δ < 0
-                    @debug "determining free pids"
-                    freepids = filter(pid->pid ∉ eloop.used_pids, workers())
-                    @debug "done determining free pids"
 
-                    @debug "push onto rmpids"
-                    rmpids = freepids[1:min(-δ, length(freepids))]
-                    @debug "done push onto rmpids"
-
-                    try
-                        @debug "removing $rmpids from $freepids"
-                        rmprocs(rmpids)
-                    catch e
-                        @error "problem removing old processes"
-                        logerror(e, Logging.Error)
+                        for rm_pid in rm_pids
+                            haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
+                        end
                     end
                 end
-                @debug "done making new async add/rmprocs"
+            elseif δ > 0
+                try
+                    @debug "adding $δ procs"
+                    tsk_addrmprocs_tic = time()
+                    tsk_addrmprocs = @async eloop.epmap_addprocs(δ)
+                catch e
+                    @error "problem adding new processes"
+                    logerror(e, Logging.Error)
+                end
             end
-        else
-            @debug "previous addprocs/rmprocs is not complete, expect delays."
+
+            tsk_addrmprocs_tic = time()
+        elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout && istaskdone(tsk_addrmprocs_interrupt)
+            @warn "addprocs/rmprocs taking longer than expected, cancelling."
+            tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmmprocs, InterruptException())
         end
 
         @debug "checking for workers sent from the map"
@@ -579,7 +653,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 pid,isbad = take!(eloop.pid_channel_map_remove)
                 @debug "map channel, received pid=$pid, making sure that it is initialized"
                 yield()
-                wait(init_tasks[pid])
                 isbad && push!(bad_pids, pid)
                 @debug "map channel, $pid is initialized, removing from used_pids"
                 pid ∈ eloop.used_pids && pop!(eloop.used_pids, pid)
@@ -587,7 +660,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when removing workers from map"
-            logerror(e)
+            logerror(e, Logging.Warn)
         end
 
         @debug "checking for workers sent from the reduce"
@@ -598,7 +671,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 eloop.reduce_machine_count -= 1
                 @debug "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized"
                 yield()
-                wait(init_tasks[pid])
                 isbad && push!(bad_pids, pid)
                 @debug "reduce_channel, $pid is initialied, removing from used_pids"
                 pid ∈ eloop.used_pids && pop!(eloop.used_pids, pid)
@@ -614,18 +686,9 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     end
     @debug "exited the elastic loop"
 
-    @debug "ensure that tsk_addrmprocs is done."
-    tic = time()
-    while !istaskdone(tsk_addrmprocs)
-        if time() - tic > 10
-            @warn "delayed remove/add procs tasks took longer than 10 seconds, giving up..."
-            # try
-            #     Base.throwto(tsk_addrmprocs, ErrorException(""))
-            # catch
-            # end
-            break
-        end
-        sleep(1)
+    @debug "cancel any pending add/rm procs tasks"
+    if !istaskdone(tsk_addrmprocs)
+        @async Base.throwto(_tsk, InterruptException())
     end
 
     # ensure we are left with epmap_minworkers
@@ -655,6 +718,8 @@ default_reducer!(x, y) = (x .+= y; nothing)
 mutable struct SchedulerOptions{C}
     retries::Int
     maxerrors::Int
+    timeout_multiplier::Float64
+    skip_tasks_that_timeout::Bool
     minworkers::Function
     maxworkers::Function
     nworkers::Function
@@ -684,6 +749,8 @@ end
 function SchedulerOptions(;
         retries = 0,
         maxerrors = typemax(Int),
+        timeout_multiplier = 5,
+        skip_tasks_that_timeout = false,
         minworkers = Distributed.nworkers,
         maxworkers = Distributed.nworkers,
         nworkers = ()->Distributed.nprocs()-1,
@@ -711,6 +778,8 @@ function SchedulerOptions(;
     SchedulerOptions(
         retries,
         maxerrors,
+        Float64(timeout_multiplier),
+        skip_tasks_that_timeout,
         isa(minworkers, Function) ? minworkers : ()->minworkers,
         isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
         nworkers,
@@ -740,6 +809,8 @@ function Base.copy(options::SchedulerOptions)
     SchedulerOptions(
         options.retries,
         options.maxerrors,
+        options.timeout_multiplier,
+        options.skip_tasks_that_timeout,
         options.minworkers,
         options.maxworkers,
         options.nworkers,
@@ -776,6 +847,8 @@ and `pmap_kwargs` are as follows.
 ## epmap_kwargs
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
+* `timeout_multiplier=5` if any task takes `timeout_multiplier` longer than the mean task time, then abort that task
+* `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
@@ -800,9 +873,12 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
     loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    fetch(tsk_map)
 end
 
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
+    tsk_times = Float64[]
+
     # work loop
     @sync while true
         eloop.interrupted && break
@@ -811,17 +887,20 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         @debug "pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
-        local hostname
-        try
-            hostname = remotecall_fetch(gethostname, pid)
-        catch e
-            @warn "unable to determine hostname for pid=$pid"
-            logerror(e, Logging.Warn)
-            put!(eloop.pid_channel_map_remove, (pid,true))
-            continue
-        end
+        hostname = ""
 
         @async while true
+            if hostname == ""
+                try
+                    hostname = remotecall_fetch_timeout(60, 1, 1, gethostname, pid)
+                catch e
+                    @warn "unable to determine hostname for pid=$pid within 60 seconds"
+                    logerror(e, Logging.Warn)
+                    put!(eloop.pid_channel_map_remove, (pid, true))
+                    break
+                end
+            end
+
             is_preempted = check_for_preempted(pid, options.preempted)
             @debug "map task loop exit condition" pid is_preempted length(eloop.tsk_pool_todo) eloop.interrupted
             if is_preempted || length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
@@ -844,7 +923,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(f, pid, tsk, args...; kwargs...)
+                remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, f, pid, tsk, args...; kwargs...)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -852,7 +931,13 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             catch e
                 @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
-                push!(eloop.tsk_pool_todo, tsk)
+                if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                    @warn "skipping task '$tsk' that timed out"
+                    push!(eloop.tsk_pool_done, tsk)
+                    push!(eloop.tsk_pool_timed_out, tsk)
+                else
+                    push!(eloop.tsk_pool_todo, tsk)
+                end
                 r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
                 if r.do_break || r.do_interrupt
                     put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
@@ -867,7 +952,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
 
     journal_final(journal)
 
-    journal
+    journal, eloop.tsk_pool_timed_out
 end
 
 epmap(f::Function, tasks, args...; kwargs...) = epmap(SchedulerOptions(), f, tasks, args..., kwargs...)
@@ -887,6 +972,8 @@ and `epmap_kwargs` are as follows.
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
+* `timeout_multiplier=5` if any task takes `timeout_multiplier` longer than the mean task time, then abort that task
+* `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
@@ -919,7 +1006,7 @@ using Distributed
 addprocs(2)
 @everywhere using Distributed, Schedulers
 @everywhere f(x, tsk) = x .+= tsk; nothing)
-result = epmapreduce!(zeros(Float32,10), f, 1:100)
+result,tsks = epmapreduce!(zeros(Float32,10), f, 1:100)
 rmprocs(workers())
 ```
 
@@ -932,7 +1019,7 @@ mkpath(container)
 addprocs(2)
 @everywhere using Distributed, Schedulers
 @everywhere f(x, tsk) = (x .+= tsk; nothing)
-result = epmapreduce!(zeros(Float32,10), SchedulerOptions(;scratch=container), f, 1:100)
+result,tsks = epmapreduce!(zeros(Float32,10), SchedulerOptions(;scratch=container), f, 1:100)
 rmprocs(workers())
 ```
 
@@ -952,7 +1039,7 @@ tic = Ref(time())
 addprocs(2)
 @everywhere f(x, tsk) = (x .+= tsk; nothing)
 @everywhere using Distributed, Schedulers
-result = epmapreduce!(zeros(Float32,10), SchedulerOptions(;reduce_trigger=eloop->my_reduce_trigger(eloop, tic), save_partial_reduction=r->my_save(r, "partial.bin"), f, 1:100)
+result,tsks = epmapreduce!(zeros(Float32,10), SchedulerOptions(;reduce_trigger=eloop->my_reduce_trigger(eloop, tic), save_partial_reduction=r->my_save(r, "partial.bin"), f, 1:100)
 ```
 Note that the methods `complete_tasks`, `pending_tasks`, `reduced_tasks`, and `total_tasks` can be useful when designing the `reduce_trigger` method.
 """
@@ -982,7 +1069,7 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
     journal_final(epmap_journal)
     journal_write(epmap_journal, options.journalfile)
 
-    result
+    result, epmap_eloop.tsk_pool_timed_out
 end
 
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
@@ -991,6 +1078,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
     localresults = Dict{Int, Future}()
 
     checkpoint_orphans = Any[]
+
+    tsk_times = Float64[]
+    checkpoint_times = Float64[]
+    rm_times = Float64[]
 
     # work loop
     @sync while true
@@ -1006,16 +1097,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             continue
         end
 
-        local hostname
-        try
-            hostname = remotecall_fetch(gethostname, pid)
-        catch e
-            @warn "unable to determine hostname for pid=$pid"
-            logerror(e, Logging.Warn)
-            haskey(localresults, pid) && deleteat!(localresults, pid)
-            put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
-            continue
-        end
+        hostname = ""
 
         # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
@@ -1024,6 +1106,22 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         epmap_eloop.checkpoints[pid] = nothing
 
         @async while true
+            if hostname == ""
+                try
+                    hostname = remotecall_fetch_timeout(60, 1, 1, gethostname, pid)
+                catch e
+                    @warn "unable to determine hostname for pid=$pid within 60 seconds."
+                    logerror(e, Logging.Warn)
+                    if epmap_eloop.checkpoints[pid] !== nothing
+                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                    end
+                    haskey(localresults, pid) && deleteat!(localresults, pid)
+                    pop!(epmap_eloop.checkpoints, pid)
+                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+                    break
+                end
+            end
+
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
             is_preempted = check_for_preempted(pid, options.preempted)
@@ -1051,13 +1149,19 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait(options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
                 @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                push!(epmap_eloop.tsk_pool_todo, tsk)
+                if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                    @warn "skipping task '$tsk' that timed out, compute/reduce step"
+                    push!(epmap_eloop.tsk_pool_done, tsk)
+                    push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                else
+                    push!(epmap_eloop.tsk_pool_todo, tsk)
+                end
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 epmap_eloop.interrupted = r.do_interrupt
                 epmap_eloop.errored = r.do_error
@@ -1070,7 +1174,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
                     break
                 end
-                continue # no need to checkpoint since the task failed and will be re-run
+                continue # no need to checkpoint since the task failed and will be re-run (TODO: or abandoned)
             end
 
             # checkpoint
@@ -1078,7 +1182,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                remotecall_wait(options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1086,7 +1190,13 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 @warn "pid=$pid ($hostname), checkpoint=$(epmap_eloop.checkpoints[pid]), task loop, caught exception during save_checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
                 @debug "pushing task onto tsk_pool_todo list"
-                push!(epmap_eloop.tsk_pool_todo, tsk)
+                if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                    @warn "skipping task '$tsk' that timed out, checkpoint step"
+                    push!(epmap_eloop.tsk_pool_done, tsk)
+                    push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                else
+                    push!(epmap_eloop.tsk_pool_todo, tsk)
+                end
                 @debug "handling exception"
                 r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                 @debug "done handling exception"
@@ -1123,7 +1233,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, old_checkpoint)
+                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -1167,6 +1277,10 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     orphans_remove = Set{Any}()
 
     l = ReentrantLock()
+
+    # Seeding with a large value to account for potential throttling of various cloud storage services
+    reduce_times = Float64[300.0]
+    rm_times = Float64[300.0]
 
     @sync while true
         @debug "reduce, interrupted=$(epmap_eloop.interrupted)"
@@ -1281,7 +1395,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                remotecall_wait(reduce, pid, options.reducer!, options.save_checkpoint, options.load_checkpoint,  checkpoint1, checkpoint2, checkpoint3, T)
+                # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, reduce, pid, options.reducer!, options.save_checkpoint, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1308,7 +1423,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint1)
+                # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
             catch e
@@ -1331,7 +1447,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             try
                 options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                options.keepcheckpoints || remotecall_wait(options.rm_checkpoint, pid, checkpoint2)
+                # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
             catch e
