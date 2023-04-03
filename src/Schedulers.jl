@@ -229,7 +229,8 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         Dict{Int,Union{Nothing,C}}(),
         false,
         false,
-        Dict{Int,Int}())
+        Dict{Int,Int}()
+    )
 
     if !isreduce
         close(eloop.pid_channel_reduce_add)
@@ -593,40 +594,39 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     push!(rm_pids, pop!(bad_pids))
                 end
                 δ += length(rm_pids)
-                if istaskdone(tsk_addrmprocs)
-                    tsk_addrmprocs = @async begin
-                        if δ < 0
-                            free_pids = filter(pid->pid ∉ eloop.used_pids, workers())
-                            push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
-                        end
-                        rm_pids_known = filter(rm_pid->haskey(Distributed.map_pid_wrkr, rm_pid), rm_pids)
-                        rm_pids_unknown = filter(rm_pid->rm_pid ∉ rm_pids_known, rm_pids)
+                tsk_addrmprocs_tic = time()
+                tsk_addrmprocs = @async begin
+                    if δ < 0
+                        free_pids = filter(pid->pid ∉ eloop.used_pids, workers())
+                        push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
+                    end
+                    rm_pids_known = filter(rm_pid->haskey(Distributed.map_pid_wrkr, rm_pid), rm_pids)
+                    rm_pids_unknown = filter(rm_pid->rm_pid ∉ rm_pids_known, rm_pids)
 
-                        @debug "calling rmprocs on $rm_pids_known"
+                    @debug "calling rmprocs on $rm_pids_known"
+                    try
+                        rmprocs(rm_pids_known; waitfor=addrmprocs_timeout)
+                    catch e
+                        @warn "unable to run rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
+                        logerror(e, Logging.Warn)
+                    end
+                    @debug "done calling rmprocs on known pids"
+
+                    for rm_pid in rm_pids_unknown
+                        @debug "pid=$rm_pid is not known to Distributed, calling kill"
                         try
-                            rmprocs(rm_pids_known; waitfor=addrmprocs_timeout)
+                            # required for cluster managers that require clean-up when the julia process on a worker dies:
+                            @debug "calling kill with pid=$rm_pid"
+                            Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
+                            @debug "done calling kill with pid=$rm_pid"
                         catch e
-                            @warn "unable to run rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
+                            @warn "unable to kill bad worker with pid=$rm_pid"
                             logerror(e, Logging.Warn)
                         end
-                        @debug "done calling rmprocs on known pids"
+                    end
 
-                        for rm_pid in rm_pids_unknown
-                            @debug "pid=$rm_pid is not known to Distributed, calling kill"
-                            try
-                                # required for cluster managers that require clean-up when the julia process on a worker dies:
-                                @debug "calling kill with pid=$rm_pid"
-                                Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
-                                @debug "done calling kill with pid=$rm_pid"
-                            catch e
-                                @warn "unable to kill bad worker with pid=$rm_pid"
-                                logerror(e, Logging.Warn)
-                            end
-                        end
-
-                        for rm_pid in rm_pids
-                            haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
-                        end
+                    for rm_pid in rm_pids
+                        haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
                     end
                 end
             elseif δ > 0
@@ -634,14 +634,13 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     @debug "adding $δ procs"
                     tsk_addrmprocs_tic = time()
                     tsk_addrmprocs = @async eloop.epmap_addprocs(δ)
+                    sleep(1) # TODO: this seems needed for running with Distributed.SSHManager on a local cluster
                 catch e
                     @error "problem adding new processes"
                     logerror(e, Logging.Error)
                 end
             end
-
-            tsk_addrmprocs_tic = time()
-        elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout && istaskdone(tsk_addrmprocs_interrupt)
+        elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout+10 && istaskdone(tsk_addrmprocs_interrupt)
             @warn "addprocs/rmprocs taking longer than expected, cancelling."
             tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmmprocs, InterruptException())
         end
@@ -686,9 +685,15 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     end
     @debug "exited the elastic loop"
 
-    @debug "cancel any pending add/rm procs tasks"
-    if !istaskdone(tsk_addrmprocs)
-        @async Base.throwto(_tsk, InterruptException())
+    @debug "cancel any pending add/rm procs task"
+    while true
+        istaskdone(tsk_addrmprocs) && break
+        if time() - tsk_addrmprocs_tic > addrmprocs_timeout+10
+            @warn "addprocs/rmprocs taking longer than expected, cancelling."
+            @async Base.throwto(tsk_addrmprocs, InterruptException())
+            break
+        end
+        sleep(polling_interval)
     end
 
     # ensure we are left with epmap_minworkers
@@ -701,7 +706,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         n = length(_workers) - eloop.epmap_minworkers()
         if n > 0
             @debug "trimming $n workers"
-            rmprocs(workers()[1:n])
+            tsk_addrmprocs_tic = time()
+            tsk_addrmprocs = @async rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
             @debug "done trimming $n workers"
         end
     catch e
