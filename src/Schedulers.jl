@@ -634,6 +634,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     @debug "adding $δ procs"
                     tsk_addrmprocs_tic = time()
                     tsk_addrmprocs = @async eloop.epmap_addprocs(δ)
+                    sleep(1) # TODO: this seems needed for running with Distributed.SSHManager on a local cluster
                 catch e
                     @error "problem adding new processes"
                     logerror(e, Logging.Error)
