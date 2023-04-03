@@ -707,7 +707,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         if n > 0
             @debug "trimming $n workers"
             tsk_addrmprocs_tic = time()
-            tsk_addrmprocs = @async rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
+            tsk_addrmprocs = rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
             @debug "done trimming $n workers"
         end
     catch e
