@@ -744,7 +744,7 @@ mutable struct SchedulerOptions{C}
     zeros::Function
     scratch::Vector{C}
     id::String
-    epmapreduce_fetch_apply::Function
+    epmapreduce_fetch::Function
     save_checkpoint::Function
     load_checkpoint::Function
     rm_checkpoint::Function
@@ -775,7 +775,7 @@ function SchedulerOptions(;
         zeros = ()->nothing,
         scratch = ["/scratch"],
         id = randstring(6),
-        epmapreduce_fetch_apply = default_epmapreduce_fetch_apply,
+        epmapreduce_fetch = fetch,
         save_checkpoint = default_save_checkpoint,
         load_checkpoint = default_load_checkpoint,
         rm_checkpoint = default_rm_checkpoint,
@@ -803,7 +803,7 @@ function SchedulerOptions(;
         zeros,
         isa(scratch, AbstractArray) ? scratch : [scratch],
         id,
-        epmapreduce_fetch_apply,
+        epmapreduce_fetch,
         save_checkpoint,
         load_checkpoint,
         rm_checkpoint,
@@ -834,7 +834,7 @@ function Base.copy(options::SchedulerOptions)
         options.zeros,
         copy(options.scratch),
         options.id,
-        options.epmapreduce_fetch_apply,
+        options.epmapreduce_fetch,
         options.save_checkpoint,
         options.load_checkpoint,
         options.rm_checkpoint,
@@ -975,6 +975,8 @@ and `epmap_kwargs` are as follows.
 
 ## epmap_kwargs
 * `reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
+* `save_checkpoint = default_save_checkpoint` the method used to save checkpoints[1]
+* `load_checkpoint = default_load_checkpoint` the method used to load a checkpoint[2]
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
@@ -983,11 +985,11 @@ and `epmap_kwargs` are as follows.
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
-* `nworkers=nworkers` the number of machines currently provisioned for work[1]
+* `nworkers=nworkers` the number of machines currently provisioned for work[3]
 * `quantum=()->32` the maximum number of workers to elastically add at a time
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
-* `scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[3]
+* `scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
 * `reporttasks=true` log task assignment
 * `journalfile=""` write a journal showing what was computed where to a json file
 * `journal_init_callback=tsks->nothing` additional method when intializing the journal
@@ -997,11 +999,14 @@ and `epmap_kwargs` are as follows.
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
 
 ## Notes
-[1] The number of machines provisioined may be greater than the number of workers in the cluster since with
+[1] The signiture is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
+written to, and `x` is the data that will be written.
+[2] The signiture is `my_load_checkpoint(checkpoint_file)` where `checkpoint_file` is the file that
+data will be loaded from.
+[3] The number of machines provisioined may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
-[2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
-[3] If more than one scratch location is selected, then check-point files will be distributed across those locations.
+[4] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
 
 # Examples
@@ -1080,6 +1085,12 @@ end
 
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
+function epmapreduce_fetch_apply(_localresult, ::Type{T}, epmapreduce_fetch, f, itsk, args...; kwargs...) where {T}
+    localresult = epmapreduce_fetch(_localresult)::T
+    f(localresult, itsk, args...; kwargs...)
+    nothing
+end
+
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
 
@@ -1155,7 +1166,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.epmapreduce_fetch_apply, pid, localresults[pid], T, f, tsk, args...; kwargs...)
+                remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1188,7 +1199,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.save_checkpoint, pid, _next_checkpoint, localresults[pid], T)
+                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1402,7 +1413,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, reduce, pid, options.reducer!, options.save_checkpoint, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
+                remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1478,7 +1489,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     for i in 1:10
         try
-            options.reducer!(result, options.load_checkpoint(epmap_eloop.reduce_checkpoints[1], T))
+            options.reducer!(result, load_checkpoint(options.load_checkpoint, epmap_eloop.reduce_checkpoints[1], T))
             break
         catch e
             s = min(2.0^(i-1), 60.0) + rand()
@@ -1524,27 +1535,24 @@ function next_checkpoint(id, scratch)
     joinpath(scratch[next_scratch_index(length(scratch))], string("checkpoint-", id, "-", next_checkpoint_id()))
 end
 
-function reduce(reducer!, save_checkpoint, load_checkpoint, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
+function reduce(reducer!, save_checkpoint_method, fetch_method, load_checkpoint_method, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
     @debug "reduce, load checkpoint 1"
-    c1 = load_checkpoint(checkpoint1, T)
+    c1 = load_checkpoint(load_checkpoint_method, checkpoint1, T)
     @debug "reduce, load checkpoint 2"
-    c2 = load_checkpoint(checkpoint2, T)
+    c2 = load_checkpoint(load_checkpoint_method, checkpoint2, T)
     @debug "reduce, reducer"
     reducer!(c2, c1)
     @debug "reduce, serialize"
-    save_checkpoint(checkpoint3, c2, T)
+    save_checkpoint(save_checkpoint_method, fetch_method, checkpoint3, c2, T)
     @debug "reduce, done"
     nothing
 end
 
-function default_epmapreduce_fetch_apply(_localresult, ::Type{T}, f, itsk, args...; kwargs...) where {T}
-    localresult = fetch(_localresult)::T
-    f(localresult, itsk, args...; kwargs...)
-    nothing
-end
+save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T} = (save_checkpoint_method(checkpoint, fetch_method(_localresult)::T); nothing)
+load_checkpoint(load_checkpoint_method, checkpoint, ::Type{T}) where {T} = load_checkpoint_method(checkpoint)::T
 
-default_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T} = (serialize(checkpoint, fetch(localresult)::T); nothing)
-default_load_checkpoint(checkpoint, ::Type{T}) where {T} = deserialize(checkpoint)::T
+default_save_checkpoint(checkpoint, localresult) = serialize(checkpoint, localresult)
+default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
