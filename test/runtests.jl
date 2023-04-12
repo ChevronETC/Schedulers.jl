@@ -375,20 +375,20 @@ end
         nothing
     end
     
-    @everywhere function test_save_checkpoint(checkpoint, localresult, ::Type{T}) where {T}
+    @everywhere function test_save_checkpoint(checkpoint, localresult)
         x = rand()
         if x > 0.8
             error("foo,x=$x")
         end
-        Schedulers.default_save_checkpoint(checkpoint, localresult, T)
+        Schedulers.default_save_checkpoint(checkpoint, localresult)
     end
     
-    @everywhere function test_load_checkpoint(checkpoint, ::Type{T}) where {T}
+    @everywhere function test_load_checkpoint(checkpoint)
         x = rand()
         if x > 0.8
             error("bar,x=$x")
         end
-        Schedulers.default_load_checkpoint(checkpoint, T)
+        Schedulers.default_load_checkpoint(checkpoint)
     end
 
     a,b = 2,3
