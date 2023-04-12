@@ -1478,7 +1478,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     for i in 1:10
         try
-            options.reducer!(result, deserialize(epmap_eloop.reduce_checkpoints[1]))
+            options.reducer!(result, options.load_checkpoint(epmap_eloop.reduce_checkpoints[1], T))
             break
         catch e
             s = min(2.0^(i-1), 60.0) + rand()
