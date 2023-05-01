@@ -588,6 +588,13 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         @debug "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, and $(length(eloop.used_pids)) busy procs inclusive of process 1)"
 
         if istaskdone(tsk_addrmprocs)
+            try
+                fetch(tsk_addrmprocs)
+            catch e
+                @warn "problem adding or removing processes"
+                logerror(e, Logging.Warn)
+            end
+
             if δ < 0 || length(bad_pids) > 0
                 rm_pids = Int[]
                 while !isempty(bad_pids)
@@ -643,6 +650,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout+10 && istaskdone(tsk_addrmprocs_interrupt)
             @warn "addprocs/rmprocs taking longer than expected, cancelling."
             tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmmprocs, InterruptException())
+            tsk_addrmprocs = @async nothing
         end
 
         @debug "checking for workers sent from the map"
