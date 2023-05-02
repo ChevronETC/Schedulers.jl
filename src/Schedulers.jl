@@ -572,8 +572,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         # check to see if we need to add or remove machines
         δ,n_remaining_tasks = 0,0
         try
-            n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
-            δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
+            n_remaining_tasks = length(eloop.tsk_pool_todo) + max(length(eloop.reduce_checkpoints) - 1, 0)
+            δ = n_remaining_tasks < _epmap_nworkers ? min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers) : min(_epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
             # note that 1. we will only remove a machine if it is not in the 'eloop.used_pids' vector.
             # and 2. we will only remove machines if we are left with at least epmap_minworkers.
             if _epmap_nworkers + δ < _epmap_minworkers
