@@ -600,7 +600,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 while !isempty(bad_pids)
                     push!(rm_pids, pop!(bad_pids))
                 end
-                δ += length(rm_pids)
+                δ += length(unique!(rm_pids))
                 tsk_addrmprocs_tic = time()
                 tsk_addrmprocs = @async begin
                     if δ < 0
