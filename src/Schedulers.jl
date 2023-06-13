@@ -1062,8 +1062,8 @@ result,tsks = epmapreduce!(zeros(Float32,10), SchedulerOptions(;reduce_trigger=e
 ```
 Note that the methods `complete_tasks`, `pending_tasks`, `reduced_tasks`, and `total_tasks` can be useful when designing the `reduce_trigger` method.
 """
-function epmapreduce!(result::T, _options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
-    options = deepcopy(_options)
+function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
+    options_init = copy(options)
 
     for scratch in options.scratch
         isdir(scratch) || mkpath(scratch)
@@ -1090,6 +1090,9 @@ function epmapreduce!(result::T, _options::SchedulerOptions, f::Function, tasks,
     journal_final(epmap_journal)
     journal_write(epmap_journal, options.journalfile)
 
+    for fieldname in fieldnames(SchedulerOptions)
+        setfield!(options, fieldname, getfield(options_init, fieldname))
+    end
     result, epmap_eloop.tsk_pool_timed_out
 end
 
