@@ -1065,33 +1065,36 @@ Note that the methods `complete_tasks`, `pending_tasks`, `reduced_tasks`, and `t
 function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
     options_init = copy(options)
 
-    for scratch in options.scratch
-        isdir(scratch) || mkpath(scratch)
-    end
+    local epmap_eloop
+    try
+        for scratch in options.scratch
+            isdir(scratch) || mkpath(scratch)
+        end
 
-    if options.zeros() === nothing
-        options.zeros = ()->zeros(eltype(result), size(result))::T
-    end
+        if options.zeros() === nothing
+            options.zeros = ()->zeros(eltype(result), size(result))::T
+        end
 
-    epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
+        epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
 
-    epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
+        epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
 
-    tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
+        tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
 
-    tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
+        tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
-    @debug "waiting for tsk_loop"
-    loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
-    @debug "fetching from tsk_reduce"
-    result = fetch(tsk_reduce)
-    @debug "finished fetching from tsk_reduce"
+        @debug "waiting for tsk_loop"
+        loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        @debug "fetching from tsk_reduce"
+        result = fetch(tsk_reduce)
+        @debug "finished fetching from tsk_reduce"
 
-    journal_final(epmap_journal)
-    journal_write(epmap_journal, options.journalfile)
-
-    for fieldname in fieldnames(SchedulerOptions)
-        setfield!(options, fieldname, getfield(options_init, fieldname))
+        journal_final(epmap_journal)
+        journal_write(epmap_journal, options.journalfile)
+    finally
+        for fieldname in fieldnames(SchedulerOptions)
+            setfield!(options, fieldname, getfield(options_init, fieldname))
+        end
     end
     result, epmap_eloop.tsk_pool_timed_out
 end
