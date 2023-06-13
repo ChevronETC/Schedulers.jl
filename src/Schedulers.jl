@@ -1062,7 +1062,9 @@ result,tsks = epmapreduce!(zeros(Float32,10), SchedulerOptions(;reduce_trigger=e
 ```
 Note that the methods `complete_tasks`, `pending_tasks`, `reduced_tasks`, and `total_tasks` can be useful when designing the `reduce_trigger` method.
 """
-function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
+function epmapreduce!(result::T, _options::SchedulerOptions, f::Function, tasks, args...; kwargs...) where {T}
+    options = deepcopy(_options)
+
     for scratch in options.scratch
         isdir(scratch) || mkpath(scratch)
     end

@@ -303,9 +303,13 @@ end
 
     a,b = 2,3
     options = SchedulerOptions(;scratch=tmpdir)
+    options_init = deepcopy(options)
     x,tsks = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
 
     rmprocs(workers())
+    for field ∈ fieldnames(SchedulerOptions)
+        @test getfield(options_init, field) == getfield(options, field)
+    end
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
