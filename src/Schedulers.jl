@@ -1257,6 +1257,16 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @debug "done returning pid to elastic loop"
                     break
                 end
+
+                # populate local reduction with the previous checkpoint since we will re-run the task.
+                if epmap_eloop.checkpoints[pid] === nothing
+                    @debug "re-zeroing local result (no existing checkpoints)"
+                    localresults[pid] = remotecall(options.zeros, pid)
+                else
+                    @debug "re-setting localresult to the previously saved checkpoint"
+                    localresults[pid] = remotecall(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
+                end
+
                 continue # there is no new checkpoint, and we need to keep the old checkpoint
             end
 
