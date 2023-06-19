@@ -409,6 +409,49 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "pmapreduce, cluster with ErrorException during checkpoint and retries=1" begin
+    # important to test with retries=1 since we need to ensure that we don't reduce things twice
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere wrkrs = workers()
+
+    s = randstring(6)
+    @everywhere function foo7b(x, tsk, a, b)
+        fetch(x)::Vector{Float32} .+= a*b*tsk
+        sleep(1)
+        nothing
+    end
+
+    @everywhere function test_save_checkpoint(checkpoint, localresult)
+        x = rand()
+        if x > 0.8
+            error("foo,x=$x")
+        end
+        Schedulers.default_save_checkpoint(checkpoint, localresult)
+    end
+
+    @everywhere function test_load_checkpoint(checkpoint)
+        x = rand()
+        if x > 0.8
+            error("bar,x=$x")
+        end
+        Schedulers.default_load_checkpoint(checkpoint)
+    end
+
+    a,b = 2,3
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, load_checkpoint=test_load_checkpoint, save_checkpoint = test_save_checkpoint, retries=1)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo7b, 1:100, a, b)
+
+    rmprocs(workers())
+
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "pmapreduce, force overlap of map and reduce" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
