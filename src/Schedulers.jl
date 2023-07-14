@@ -610,31 +610,40 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     rm_pids_known = filter(rm_pid->haskey(Distributed.map_pid_wrkr, rm_pid), rm_pids)
                     rm_pids_unknown = filter(rm_pid->rm_pid ∉ rm_pids_known, rm_pids)
 
+                    @info "Schedulers.loop -- rm_pids_known=$(rm_pids_known) rm_pids_unknown=$(rm_pids_unknown)"
+
                     @debug "calling rmprocs on $rm_pids_known"
                     try
+                        @info "Schedulers.loop -- removing rm_pids_known=$(rm_pids_known)"
+
                         rmprocs(rm_pids_known; waitfor=addrmprocs_timeout)
+
+                        for rm_pid in rm_pids_known
+                            haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
+                        end
+    
                     catch e
                         @warn "unable to run rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
                         logerror(e, Logging.Warn)
                     end
                     @debug "done calling rmprocs on known pids"
 
-                    for rm_pid in rm_pids_unknown
-                        @debug "pid=$rm_pid is not known to Distributed, calling kill"
-                        try
-                            # required for cluster managers that require clean-up when the julia process on a worker dies:
-                            @debug "calling kill with pid=$rm_pid"
-                            Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
-                            @debug "done calling kill with pid=$rm_pid"
-                        catch e
-                            @warn "unable to kill bad worker with pid=$rm_pid"
-                            logerror(e, Logging.Warn)
-                        end
-                    end
+                    # for rm_pid in rm_pids_unknown
+                    #     @debug "pid=$rm_pid is not known to Distributed, calling kill"
+                    #     try
+                    #         # required for cluster managers that require clean-up when the julia process on a worker dies:
+                    #         @debug "calling kill with pid=$rm_pid"
+                    #         Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
+                    #         @debug "done calling kill with pid=$rm_pid"
+                    #     catch e
+                    #         @warn "unable to kill bad worker with pid=$rm_pid"
+                    #         logerror(e, Logging.Warn)
+                    #     end
+                    # end
 
-                    for rm_pid in rm_pids
-                        haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
-                    end
+                    # for rm_pid in rm_pids
+                    #     haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
+                    # end
                 end
             elseif δ > 0
                 try
