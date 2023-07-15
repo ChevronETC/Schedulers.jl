@@ -601,8 +601,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     push!(rm_pids, pop!(bad_pids))
                 end
                 δ += length(rm_pids)
-                tsk_addrmprocs_tic = time()
-                tsk_addrmprocs = @async begin
+                
+                # What if this was not async?
+                # tsk_addrmprocs_tic = time()
+                # tsk_addrmprocs = @async begin
+
+                begin
                     if δ < 0
                         free_pids = filter(pid->pid ∉ eloop.used_pids, workers())
                         push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
@@ -628,22 +632,22 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     end
                     @debug "done calling rmprocs on known pids"
 
-                    # for rm_pid in rm_pids_unknown
-                    #     @debug "pid=$rm_pid is not known to Distributed, calling kill"
-                    #     try
-                    #         # required for cluster managers that require clean-up when the julia process on a worker dies:
-                    #         @debug "calling kill with pid=$rm_pid"
-                    #         Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
-                    #         @debug "done calling kill with pid=$rm_pid"
-                    #     catch e
-                    #         @warn "unable to kill bad worker with pid=$rm_pid"
-                    #         logerror(e, Logging.Warn)
-                    #     end
-                    # end
+                    for rm_pid in rm_pids_unknown
+                        @debug "pid=$rm_pid is not known to Distributed, calling kill"
+                        try
+                            # required for cluster managers that require clean-up when the julia process on a worker dies:
+                            @debug "calling kill with pid=$rm_pid"
+                            Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
+                            @debug "done calling kill with pid=$rm_pid"
+                        catch e
+                            @warn "unable to kill bad worker with pid=$rm_pid"
+                            logerror(e, Logging.Warn)
+                        end
+                    end
 
-                    # for rm_pid in rm_pids
-                    #     haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
-                    # end
+                    for rm_pid in rm_pids
+                        haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
+                    end
                 end
             elseif δ > 0
                 try
