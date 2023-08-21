@@ -607,29 +607,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         free_pids = filter(pid->pid ∉ eloop.used_pids, workers())
                         push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
                     end
-                    rm_pids_known = filter(rm_pid->haskey(Distributed.map_pid_wrkr, rm_pid), rm_pids)
-                    rm_pids_unknown = filter(rm_pid->rm_pid ∉ rm_pids_known, rm_pids)
-
-                    @debug "calling rmprocs on $rm_pids_known"
+                    @debug "calling rmprocs on $rm_pids"
                     try
-                        rmprocs(rm_pids_known; waitfor=addrmprocs_timeout)
-                    catch e
-                        @warn "unable to run rmprocs on $rm_pids_known in $addrmprocs_timeout seconds."
-                        logerror(e, Logging.Warn)
-                    end
-                    @debug "done calling rmprocs on known pids"
-
-                    for rm_pid in rm_pids_unknown
-                        @debug "pid=$rm_pid is not known to Distributed, calling kill"
-                        try
-                            # required for cluster managers that require clean-up when the julia process on a worker dies:
-                            @debug "calling kill with pid=$rm_pid"
-                            Distributed.kill(wrkrs[rm_pid].manager, rm_pid, wrkrs[rm_pid].config)
-                            @debug "done calling kill with pid=$rm_pid"
-                        catch e
-                            @warn "unable to kill bad worker with pid=$rm_pid"
-                            logerror(e, Logging.Warn)
-                        end
+                        rmprocs(rm_pids; waitfor=addrmprocs_timeout)
+                    catch
+                        @warn "unable to run rmprocs on $rm_pids in $addrmprocs_timeout seconds."
                     end
 
                     for rm_pid in rm_pids
