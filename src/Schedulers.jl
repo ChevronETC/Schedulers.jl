@@ -247,8 +247,19 @@ end
 
 maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
 
+#=
+# see https://discourse.julialang.org/t/with-julia-1-9-should-the-main-task-block-interactive-tasks/92809/1
+# If something is running on pid within a thread (e.g. an interactive thread), then we need to explicitly
+# Threads.@spawn f, otherwise f blocks the interactive thread.  This seems like a bug in Julia, and we should
+# work to fully understand this behvior and perhaps have it changed/fixed in the Julia language.
+=#
+function __spawn(f, args...; kwargs...)
+    tsk = Threads.@spawn f(args...; kwargs...)
+    fetch(tsk)
+end
+
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    tsk = @async remotecall_wait(f, pid, args...; kwargs...)
+    tsk = @async remotecall_wait(__spawn, pid, f, args...; kwargs...)
     tic = time()
     while !istaskdone(tsk)
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
@@ -264,7 +275,7 @@ function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pi
 end
 
 function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    tsk = @async remotecall_fetch(f, pid, args...; kwargs...)
+    tsk = @async remotecall_fetch(__spawn, pid, f, args...; kwargs...)
     tic = time()
     while !istaskdone(tsk)
         if tic - time() > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
