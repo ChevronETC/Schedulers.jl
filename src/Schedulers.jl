@@ -254,6 +254,8 @@ Threads.@spawn f, otherwise f blocks the interactive thread.  This seems like a 
 work to fully understand this behvior and perhaps have it changed/fixed in the Julia language.
 =#
 function __spawn(f, args...; kwargs...)
+    @show Threads.nthreads()
+    @show Threads.nthreads(:interactive)
     tsk = Threads.@spawn f(args...; kwargs...)
     fetch(tsk)
 end
