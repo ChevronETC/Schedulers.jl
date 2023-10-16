@@ -473,24 +473,40 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
-        @debug "check for complete map and reduce tasks, map: $(istaskdone(tsk_map)), reduce: $(istaskdone(tsk_reduce))"
+        @debug "check for complete/failed tsk_map"
         yield()
-        if istaskdone(tsk_map) && istaskdone(tsk_reduce)
-            close(eloop.pid_channel_map_add)
-            close(eloop.pid_channel_map_remove)
-            isopen(eloop.pid_channel_reduce_add) && close(eloop.pid_channel_reduce_add)
-            isopen(eloop.pid_channel_reduce_remove) && close(eloop.pid_channel_reduce_remove)
+        if istaskdone(tsk_map)
+            @debug "map task done"
+            isopen(eloop.pid_channel_map_add) && close(eloop.pid_channel_map_add)
+            isopen(eloop.pid_channel_map_remove) && close(eloop.pid_channel_map_remove)
             if istaskfailed(tsk_map)
                 @error "map task failed"
+                if !istaskdone(tsk_reduce)
+                    @async Base.throwto(tsk_reduce, InterruptException())
+                end
                 fetch(tsk_map)
+                break
             end
-            if istaskfailed(tsk_reduce)
-                @error "reduce task failed"
-                fetch(tsk_reduce)
+        end
+
+        @debug "check for failed reduce_map"
+        if istaskfailed(tsk_reduce)
+            @error "reduce task failed"
+            if !istaskdone(tsk_map)
+                @async Base.throwto(tsk_map, InterruptException())
             end
+            fetch(tsk_reduce)
             break
         end
 
+        @debug "check for complete map and reduce tasks, map: $(istaskdone(tsk_map)), reduce: $(istaskdone(tsk_reduce))"
+        yield()
+        if istaskdone(tsk_map) && istaskdone(tsk_reduce)
+            isopen(eloop.pid_channel_reduce_add) && close(eloop.pid_channel_reduce_add)
+            isopen(eloop.pid_channel_reduce_remove) && close(eloop.pid_channel_reduce_remove)
+            break
+        end
+        
         local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum
         try
             _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_quantum()
