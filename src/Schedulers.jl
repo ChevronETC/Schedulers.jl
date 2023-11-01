@@ -258,10 +258,12 @@ function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pi
         end
         sleep(1)
     end
+    @info "!istaskdone loop for pid $pid on $(myid)"
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
     if istaskfailed(tsk)
         fetch(tsk)
     end
+    @info "out of remotecallwait timeout pid $pid on $(myid)"
     nothing
 end
 
