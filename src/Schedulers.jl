@@ -128,6 +128,7 @@ function load_modules_on_new_workers(pid)
         catch e
             @debug "caught error in load_modules_on_new_workers for module $_name"
             logerror(e, Logging.Debug)
+            throw(e)
         end
     end
     nothing
@@ -143,6 +144,7 @@ function load_functions_on_new_workers(pid)
         catch e
             @debug "caught error in load_functions_on_new_workers (function) for pid '$pid' and function '$_name'"
             logerror(e, Logging.Debug)
+            throw(e)
         end
     end
 
@@ -153,6 +155,7 @@ function load_functions_on_new_workers(pid)
             catch e
                 @debug "caught error in load_functions_on_new_workers (methods) for pid '$pid', function '$_name', method '$method'"
                 logerror(e, Logging.Debug)
+                throw(e)
             end
         end
     end
@@ -411,7 +414,7 @@ function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback)
     eloop.is_reduce_triggered
 end
 
-function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
+function loop(eloop::ElasticLoop, journal, journal_task_callback, maxerrors, retries, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
 
@@ -508,31 +511,46 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             else
                 wrkrs[uninitialized_pid] = Distributed.map_pid_wrkr[uninitialized_pid]
                 push!(initializing_pids, uninitialized_pid)
-                @async try
-                    @debug "initializing failure count on $uninitialized_pid"
-                    yield()
-                    eloop.pid_failures[uninitialized_pid] = 0
-                    @debug "loading modules on $uninitialized_pid"
-                    yield()
-                    load_modules_on_new_workers(uninitialized_pid)
-                    @debug "loading functions on $uninitialized_pid"
-                    yield()
-                    load_functions_on_new_workers(uninitialized_pid)
-                    @debug "calling init on new $uninitialized_pid"
-                    yield()
-                    eloop.epmap_init(uninitialized_pid)
-                    @debug "done loading functions modules, and calling init on $uninitialized_pid"
-                    yield()
-                    _pid_up_timestamp[uninitialized_pid] = time()
-                    push!(eloop.initialized_pids, uninitialized_pid)
-                    pop!(initializing_pids, uninitialized_pid)
-                catch e
-                    @warn "problem initializing $uninitialized_pid, removing $uninitialized_pid from cluster."
-                    logerror(e, Logging.Warn)
-                    uninitialized_pid ∈ eloop.initialized_pids && pop!(eloop.initialized_pids, uninitialized_pid)
-                    uninitialized_pid ∈ initializing_pids && pop!(initializing_pids, uninitialized_pid)
-                    haskey(eloop.pid_failures, uninitialized_pid) && pop!(eloop.pid_failures, uninitialized_pid)
-                    push!(bad_pids, uninitialized_pid)
+                @async begin
+                    while true
+                        hostname = ""
+                        try
+                            @debug "getting hostname on $uninitialized_pid"
+                            yield()
+                            hostname = remotecall_fetch_timeout(60, 1, 1, gethostname, uninitialized_pid)
+                            @debug "initializing failure count on $uninitialized_pid ($hostname)"
+                            yield()
+                            eloop.pid_failures[uninitialized_pid] = 0
+                            @debug "loading modules on $uninitialized_pid ($hostname)"
+                            yield()
+                            load_modules_on_new_workers(uninitialized_pid)
+                            @debug "loading functions on $uninitialized_pid ($hostname)"
+                            yield()
+                            load_functions_on_new_workers(uninitialized_pid)
+                            @debug "calling init on new $uninitialized_pid ($hostname)"
+                            yield()
+                            eloop.epmap_init(uninitialized_pid)
+                            @debug "done loading functions modules, and calling init on $uninitialized_pid ($hostname)"
+                            yield()
+                            _pid_up_timestamp[uninitialized_pid] = time()
+                            push!(eloop.initialized_pids, uninitialized_pid)
+                            pop!(initializing_pids, uninitialized_pid)
+                            break
+                        catch e
+                            @warn "problem initializing $uninitialized_pid ($hostname), removing $uninitialized_pid from cluster."
+                            logerror(e, Logging.Warn)
+                            r = handle_exception(e, pid, hostname, eloop.pid_failures, maxerrors, retries)
+                            eloop.interrupted = r.do_interrupt
+                            eloop.errored = r.do_error
+                            if r.do_break || r.do_interrupt
+                                uninitialized_pid ∈ eloop.initialized_pids && pop!(eloop.initialized_pids, uninitialized_pid)
+                                uninitialized_pid ∈ initializing_pids && pop!(initializing_pids, uninitialized_pid)
+                                haskey(eloop.pid_failures, uninitialized_pid) && pop!(eloop.pid_failures, uninitialized_pid)
+                                push!(bad_pids, uninitialized_pid)
+                                break
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -868,7 +886,7 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
     
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
-    loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    loop(eloop, journal, options.journal_task_callback, options.maxerrors, options.retries, tsk_map, @async nothing)
     fetch(tsk_map)
 end
 
@@ -1066,7 +1084,7 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
         tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
         @debug "waiting for tsk_loop"
-        loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        loop(epmap_eloop, epmap_journal, options.journal_task_callback, options.maxerrors, options.retries, tsk_map, tsk_reduce)
         @debug "fetching from tsk_reduce"
         result = fetch(tsk_reduce)
         @debug "finished fetching from tsk_reduce"
