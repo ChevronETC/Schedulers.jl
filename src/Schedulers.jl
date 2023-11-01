@@ -1089,7 +1089,7 @@ end
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
 function epmapreduce_fetch_apply(_localresult, ::Type{T}, epmapreduce_fetch, f, itsk, args...; kwargs...) where {T}
-    localresult = epmapreduce_fetch(_localresult)::T
+    localresult = epmapreduce_fetch(_localresult, T)
     f(localresult, itsk, args...; kwargs...)
     nothing
 end
