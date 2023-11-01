@@ -1556,7 +1556,11 @@ function reduce(reducer!, save_checkpoint_method, fetch_method, load_checkpoint_
     nothing
 end
 
-save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T} = (save_checkpoint_method(checkpoint, fetch_method(_localresult)::T); nothing)
+function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T}
+    @info "heading into save checkpoint method on $(myid())"
+    save_checkpoint_method(checkpoint, fetch_method(_localresult)::T)
+    nothing
+end
 load_checkpoint(load_checkpoint_method, checkpoint, ::Type{T}) where {T} = load_checkpoint_method(checkpoint)::T
 
 default_save_checkpoint(checkpoint, localresult) = serialize(checkpoint, localresult)
