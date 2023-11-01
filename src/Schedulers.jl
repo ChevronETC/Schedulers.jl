@@ -248,7 +248,9 @@ end
 maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
 
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
+    @info "running remotecall wait for pid $pid on $(myid)"
     tsk = @async remotecall_wait(f, pid, args...; kwargs...)
+    @info "past async remotecall_wait for pid $pid on $(myid)"
     tic = time()
     while !istaskdone(tsk)
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
