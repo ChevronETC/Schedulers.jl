@@ -253,6 +253,7 @@ function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pi
     @info "past async remotecall_wait for pid $pid on $(myid)"
     tic = time()
     while !istaskdone(tsk)
+        @info "task not yet done for pid $pid on $(myid)"
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
@@ -1565,7 +1566,7 @@ end
 
 function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T}
     @info "heading into save checkpoint method on $(myid())"
-    localresult = fetch_method(_localresult)::T
+    localresult = fetch_method(_localresult, T)
     @info "retrieved local result in save checkpoint method on $(myid()) "
     save_checkpoint_method(checkpoint, localresult)
     @info "past save checkpoint method on $(myid()) "
