@@ -248,23 +248,18 @@ end
 maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
 
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    @info "running remotecall wait for pid $pid on $(myid)"
     tsk = @async remotecall_wait(f, pid, args...; kwargs...)
-    @info "past async remotecall_wait for pid $pid on $(myid)"
     tic = time()
     while !istaskdone(tsk)
-        @info "task not yet done for pid $pid on $(myid)"
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
     end
-    @info "!istaskdone loop for pid $pid on $(myid)"
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
     if istaskfailed(tsk)
         fetch(tsk)
     end
-    @info "out of remotecallwait timeout pid $pid on $(myid)"
     nothing
 end
 
@@ -1089,7 +1084,7 @@ end
 epmapreduce!(result, f::Function, tasks, args...; kwargs...) = epmapreduce!(result, SchedulerOptions(), f, tasks, args...; kwargs...)
 
 function epmapreduce_fetch_apply(_localresult, ::Type{T}, epmapreduce_fetch, f, itsk, args...; kwargs...) where {T}
-    localresult = epmapreduce_fetch(_localresult, T)
+    localresult = epmapreduce_fetch(_localresult)::T
     f(localresult, itsk, args...; kwargs...)
     nothing
 end
@@ -1201,11 +1196,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             _next_checkpoint = next_checkpoint(options.id, options.scratch)
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
-                @info "Into checkpoint area"
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                @info "remotecall the checkpoint"
                 remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
-                @info "out of remote call the checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1564,14 +1556,7 @@ function reduce(reducer!, save_checkpoint_method, fetch_method, load_checkpoint_
     nothing
 end
 
-function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T}
-    @info "heading into save checkpoint method on $(myid())"
-    localresult = fetch_method(_localresult, T)
-    @info "retrieved local result in save checkpoint method on $(myid()) "
-    save_checkpoint_method(checkpoint, localresult)
-    @info "past save checkpoint method on $(myid()) "
-    nothing
-end
+save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T} = (save_checkpoint_method(checkpoint, fetch_method(_localresult)::T); nothing)
 load_checkpoint(load_checkpoint_method, checkpoint, ::Type{T}) where {T} = load_checkpoint_method(checkpoint)::T
 
 default_save_checkpoint(checkpoint, localresult) = serialize(checkpoint, localresult)
