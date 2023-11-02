@@ -1204,7 +1204,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 @info "Into checkpoint area"
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
                 @info "remotecall the checkpoint"
-                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                # remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
                 @info "out of remote call the checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
@@ -1564,7 +1564,7 @@ function reduce(reducer!, save_checkpoint_method, fetch_method, load_checkpoint_
     nothing
 end
 
-function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, T)
+function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T}
     @info "heading into save checkpoint method on $(myid())"
     localresult = fetch_method(_localresult)::T
     @info "retrieved local result in save checkpoint method on $(myid()) "
@@ -1572,7 +1572,7 @@ function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _loca
     @info "past save checkpoint method on $(myid()) "
     nothing
 end
-load_checkpoint(load_checkpoint_method, checkpoint, T) = load_checkpoint_method(checkpoint)::T
+load_checkpoint(load_checkpoint_method, checkpoint, ::Type{T}) where {T} = load_checkpoint_method(checkpoint)::T
 
 default_save_checkpoint(checkpoint, localresult) = serialize(checkpoint, localresult)
 default_load_checkpoint(checkpoint) = deserialize(checkpoint)
