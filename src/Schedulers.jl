@@ -1566,7 +1566,7 @@ end
 
 function save_checkpoint(save_checkpoint_method, fetch_method, checkpoint, _localresult, ::Type{T}) where {T}
     @info "heading into save checkpoint method on $(myid())"
-    localresult = fetch_method(_localresult, T)
+    localresult = fetch_method(_localresult)::T
     @info "retrieved local result in save checkpoint method on $(myid()) "
     save_checkpoint_method(checkpoint, localresult)
     @info "past save checkpoint method on $(myid()) "
