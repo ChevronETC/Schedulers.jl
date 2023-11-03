@@ -538,6 +538,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, maxerrors, ret
                             break
                         catch e
                             @warn "problem initializing $uninitialized_pid ($hostname), removing $uninitialized_pid from cluster."
+                            hostip = Distributed.map_pid_wrkr[uninitialized_pid].config.host
+                            run(`scp -i ~/.ssh/azmanagers_rsa cvx@$hostip:/var/log/cloud-init-output.log ./cloud-init-output-$uninitialized_pid.log`)
                             logerror(e, Logging.Warn)
                             r = handle_exception(e, pid, hostname, eloop.pid_failures, maxerrors, retries)
                             eloop.interrupted = r.do_interrupt
