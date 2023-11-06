@@ -249,8 +249,10 @@ maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) 
 
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
     @info "running remotecall wait for pid $pid on $(myid())"
-    tsk = @async remotecall_wait(f, pid, args...; kwargs...)
-    @info "past async remotecall_wait for pid $pid on $(myid())"
+    # tsk = @async remotecall_wait(f, pid, args...; kwargs...)
+    tsk = @async remotecall(f, pid, args...; kwargs...)
+    @info "past async remotecall for pid $pid on $(myid())"
+    wait(tsk)
     tic = time()
     while !istaskdone(tsk)
         @info "task not yet done for pid $pid on $(myid())"
@@ -1204,7 +1206,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 @info "Into checkpoint area"
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
                 @info "remotecall the checkpoint"
-                # remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
                 @info "out of remote call the checkpoint"
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
