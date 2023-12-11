@@ -1146,9 +1146,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     if epmap_eloop.checkpoints[pid] !== nothing
                         push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                     end
-                    haskey(localresults, pid) && deleteat!(localresults, pid)
+                    pop!(localresults, pid)
                     pop!(epmap_eloop.checkpoints, pid)
                     put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+                    @debug "...finished cleanup for hostname failure for pid=$pid."
                     break
                 end
             end
