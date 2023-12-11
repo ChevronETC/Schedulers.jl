@@ -858,3 +858,22 @@ end
         @test contains(s, "notafunction")
     end
 end
+
+@testset "epmapreduce! hostname lookup failure" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers, Random
+    @everywhere function foo6(x, tsk, a; b)
+        x .+= a*b*tsk
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    a,b = 2,3
+    options = SchedulerOptions(;scratch=tmpdir, gethostname=()->rand() > 0.8 ? error("error") : gethostname())
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
+    rmprocs(workers())
+    @test x ≈ sum(a*b*[1:100;]) * ones(10)
+    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    rm(tmpdir; recursive=true, force=true)
+end

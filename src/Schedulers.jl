@@ -756,6 +756,7 @@ mutable struct SchedulerOptions{C}
     rm_checkpoint::Function
     reduce_trigger::Function
     save_partial_reduction::Function
+    gethostname::Function
 end
 
 function SchedulerOptions(;
@@ -786,7 +787,8 @@ function SchedulerOptions(;
         load_checkpoint = default_load_checkpoint,
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
-        save_partial_reduction = checkpoint->nothing)
+        save_partial_reduction = checkpoint->nothing,
+        gethostname = gethostname)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -814,7 +816,8 @@ function SchedulerOptions(;
         load_checkpoint,
         rm_checkpoint,
         reduce_trigger,
-        save_partial_reduction)
+        save_partial_reduction,
+        gethostname)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -845,7 +848,8 @@ function Base.copy(options::SchedulerOptions)
         options.load_checkpoint,
         options.rm_checkpoint,
         options.reduce_trigger,
-        options.save_partial_reduction)
+        options.save_partial_reduction,
+        options.gethostname)
 end
 
 """
@@ -904,7 +908,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         @async while true
             if hostname == ""
                 try
-                    hostname = remotecall_fetch_timeout(60, 1, 1, gethostname, pid)
+                    hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid within 60 seconds"
                     logerror(e, Logging.Warn)
@@ -1139,7 +1143,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @async while true
             if hostname == ""
                 try
-                    hostname = remotecall_fetch_timeout(60, 1, 1, gethostname, pid)
+                    hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid within 60 seconds."
                     logerror(e, Logging.Warn)
@@ -1334,7 +1338,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
         hostname = ""
         try
-            hostname = remotecall_fetch(gethostname, pid)
+            hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
         catch e
             @warn "unable to determine host name for pid=$pid"
             logerror(e, Logging.Warn)
