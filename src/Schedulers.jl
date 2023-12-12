@@ -1128,7 +1128,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
         
         if pid ∈ keys(localresults) # task loop has already run for this pid
+            @debug "pid already in local results, sending to elastic loop, pid=$pid"
             put!(epmap_eloop.pid_channel_map_remove, (pid,false))
+            @debug "...pid already in local results, sending to elastic loop, pid=$pid"
             continue
         end
 
@@ -1136,7 +1138,12 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
-        localresults[pid] = remotecall(options.zeros, pid)
+        try
+            localresults[pid] = remotecall(options.zeros, pid)
+        catch e
+            @warn "remotecall zeros failed"
+            logerror(e)
+        end
 
         epmap_eloop.checkpoints[pid] = nothing
 
