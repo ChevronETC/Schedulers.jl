@@ -247,8 +247,14 @@ end
 
 maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
 
+# see: https://github.com/JuliaLang/julia/issues/53217
+# if we don't do this, then the work is sent to the interactive thread pool, and
+# we do not want to block an interactive thread.  For example, in AzManagers.jl
+# we use the interactive thread pool to poll for spot evictions.
+default_threadpool_call(f, args...; kwargs...) = fetch(Threads.@spawn f(args...; kwargs...))
+
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    tsk = @async remotecall_wait(f, pid, args...; kwargs...)
+    tsk = @async remotecall_wait(default_threadpool_call, pid, f, args...; kwargs...)
     tic = time()
     while !istaskdone(tsk)
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
@@ -264,7 +270,7 @@ function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pi
 end
 
 function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    tsk = @async remotecall_fetch(f, pid, args...; kwargs...)
+    tsk = @async remotecall_fetch(default_threadpool_call, pid, f, args...; kwargs...)
     tic = time()
     while !istaskdone(tsk)
         if tic - time() > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
@@ -275,6 +281,8 @@ function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, f, p
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
     fetch(tsk)
 end
+
+remotecall_default_threadpool(f, pid, args...; kwargs...) = remotecall(default_threadpool_call, pid, f, args...; kwargs...)
 
 function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
     logerror(e, Logging.Warn)
@@ -1136,7 +1144,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
-        localresults[pid] = remotecall(options.zeros, pid)
+        localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
 
         epmap_eloop.checkpoints[pid] = nothing
 
@@ -1264,10 +1272,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 # populate local reduction with the previous checkpoint since we will re-run the task.
                 if epmap_eloop.checkpoints[pid] === nothing
                     @debug "re-zeroing local result (no existing checkpoints)"
-                    localresults[pid] = remotecall(options.zeros, pid)
+                    localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
                 else
                     @debug "re-setting localresult to the previously saved checkpoint"
-                    localresults[pid] = remotecall(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
+                    localresults[pid] = remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
                 end
 
                 continue # there is no new checkpoint, and we need to keep the old checkpoint
