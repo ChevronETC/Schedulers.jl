@@ -268,7 +268,7 @@ function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, f, p
     tic = time()
     while !istaskdone(tsk)
         if tic - time() > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
-            throw(TimeoutException(pid, tic - time()))
+            throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
     end
