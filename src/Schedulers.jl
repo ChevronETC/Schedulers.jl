@@ -672,8 +672,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout+10 && istaskdone(tsk_addrmprocs_interrupt)
             @warn "addprocs/rmprocs taking longer than expected, cancelling."
-            tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmmprocs, InterruptException())
-            tsk_addrmprocs = @async nothing
+            tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmprocs, InterruptException())
         end
 
         @debug "checking for workers sent from the map"
