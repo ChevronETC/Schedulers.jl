@@ -1,6 +1,6 @@
 name = "Schedulers"
 uuid = "fcb5363a-df8d-57f1-a64b-7615e60d793b"
-version = "0.9.5"
+version = "0.10.0"
 
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
