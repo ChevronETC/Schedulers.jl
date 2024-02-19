@@ -419,6 +419,38 @@ function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback)
     eloop.is_reduce_triggered
 end
 
+function robust_rmprocs(pids; waitfor)
+    try
+        rmprocs(pids; waitfor)
+    catch e
+        @warn "unable to run rmprocs on $pids, using fall-back strategy"
+        logerror(e, Logging.Warn)
+        try
+            rmprocset = Union{Distributed.LocalProcess, Distributed.Worker}[]
+            for pid in pids
+                if pid != 1 && haskey(Distributed.map_pid_wrkr, pid)
+                    w = Distributed.map_pid_wrkr[pid]
+                    push!(rmprocset, w)
+                end
+            end
+            unremoved = [wrkr.id for wrkr in filter(w -> w.state !== Distributed.W_TERMINATED, rmprocset)]
+
+            for pid in unremoved
+                @debug "robust_rmprocs, setting worker state, and calling kill"
+                if haskey(Distributed.map_pid_wrkr, pid)
+                    w = Distributed.map_pid_wrkr[pid]
+                    Distributed.set_worker_state(w, Distributed.W_TERMINATED)
+                    Distributed.deregister_worker(pid)
+                    Distributed.kill(w.manager, pid, w.config)
+                end
+            end
+        catch e
+            @warn "rmprocs fall-back strategy failed."
+            logerror(e, Logging.Error)
+        end
+    end
+end
+
 function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
@@ -492,7 +524,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 if !istaskdone(tsk_reduce)
                     @async Base.throwto(tsk_reduce, InterruptException())
                 end
-                fetch(tsk_map)
+                try
+                    fetch(tsk_map)
+                catch e
+                    logerror(e, Logging.Error)
+                end
                 break
             end
         end
@@ -633,7 +669,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     end
                     @debug "calling rmprocs on $rm_pids"
                     try
-                        rmprocs(rm_pids; waitfor=addrmprocs_timeout)
+                        robust_rmprocs(rm_pids; waitfor=addrmprocs_timeout)
                     catch
                         @warn "unable to run rmprocs on $rm_pids in $addrmprocs_timeout seconds."
                     end
@@ -720,7 +756,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         if n > 0
             @debug "trimming $n workers"
             tsk_addrmprocs_tic = time()
-            tsk_addrmprocs = rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
+            tsk_addrmprocs = robust_rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
             @debug "done trimming $n workers"
         end
     catch e
