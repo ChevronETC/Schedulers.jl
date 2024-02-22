@@ -237,7 +237,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         Ref(Inf),
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
-        options.grace_period_ratio
+        options.grace_period_ratio,
     )
 
     if !isreduce
@@ -266,6 +266,45 @@ function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pi
     tic = time()
     while !istaskdone(tsk)
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
+            throw(TimeoutException(pid, time() - tic))
+        end
+        sleep(1)
+    end
+    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    if istaskfailed(tsk)
+        fetch(tsk)
+    end
+    nothing
+end
+
+function robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
+    # GXTODO: maximum time allowed?
+    tsk_times_robust = tsk_times[tsk_times .> null_tsk_runtime_threshold]
+    if length(tsk_times_robust) >= 0.3 * tsk_count     # Start statistics after 30% of the tasks are done
+        return sum(tsk_times_robust) / length(tsk_times_robust)
+    else
+        return Inf
+    end
+end
+
+function check_timeout_status(tic, tsk_times, tsk_count, timeout_multiplier, cutoff_time_value, null_tsk_runtime_threshold, grace_period_ratio)
+    toc = time()
+    average_task_time = robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
+    if toc - tic > average_task_time * timeout_multiplier
+        is_timeout = true
+    elseif toc - cutoff_time_value > grace_period_ratio * average_task_time
+        is_timeout = true
+    else
+        is_timeout = false
+    end
+    return is_timeout
+end
+
+function remotecall_new_wait_timeout(tsk_times, eloop, options, f, pid, args...; kwargs...)
+    tsk = @async remotecall_wait(default_threadpool_call, pid, f, args...; kwargs...)
+    tic = time()
+    while !istaskdone(tsk)
+        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_multiplier, eloop.cutoff_time[], options.null_tsk_runtime_threshold, options.grace_period_ratio)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
@@ -459,11 +498,10 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        if (length(eloop.tsk_pool_done) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio)) && (!is_grace_period)
+        if (length(eloop.tsk_pool_done) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio)) && !is_grace_period
             eloop.cutoff_time[] = time()
             is_grace_period = true
         end
-        @show "GXTEST", now(), eloop.cutoff_time[], eloop.skip_tsk_tol_ratio
         is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
         is_more_tasks = length(eloop.tsk_pool_todo) > 0
         is_reduce_active = reduce_checkpoints_is_dirty(eloop) || length(eloop.reduce_checkpoints) > 1 || length(eloop.checkpoints) > 0
@@ -473,8 +511,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         yield()
         if is_tasks_done && !is_tasks_done_message_sent
             put!(eloop.pid_channel_map_add, -1)
-            @show "GXTEST complete time..."
-            @show now()
             is_tasks_done_message_sent = true
         end
         
@@ -600,7 +636,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             if is_more_tasks && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints_snapshot), 2) <= eloop.reduce_machine_count
                 @debug "putting pid=$free_pid onto map channel"
                 put!(eloop.pid_channel_map_add, free_pid)
-                @show now(), "GXTEST putting $free_pid"
             elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > eloop.reduce_machine_count
                 @debug "putting pid=$free_pid onto reduce channel"
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -935,19 +970,13 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
     @sync while true
         eloop.interrupted && break
         pid = take!(eloop.pid_channel_map_add)
-        @show "GXTEST", pid
 
         @debug "pid=$pid"
-        if pid == -1
-            @show "GXTEST break"
-            break
-        end
-        # pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
+        pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
         hostname = ""
 
         @async while true
-            @show "GXTEST inner loop", pid, eloop.tsk_pool_todo
             if hostname == ""
                 try
                     hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
@@ -981,7 +1010,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, f, pid, tsk, args...; kwargs...)
+                # remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, f, pid, tsk, args...; kwargs...)
+                remotecall_new_wait_timeout(tsk_times, eloop, options, f, pid, tsk, args...; kwargs...)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
