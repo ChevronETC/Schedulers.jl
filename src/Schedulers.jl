@@ -337,7 +337,7 @@ function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxer
     fails[pid] += 1
     nerrors = sum(values(fails))
 
-    r = (bad_pid = true, do_break=true, do_interrupt=false, do_error=false)
+    r = (bad_pid = false, do_break=false, do_interrupt=false, do_error=false)
 
     if nerrors >= epmap_maxerrors
         @error "too many total errors, $nerrors errors"
