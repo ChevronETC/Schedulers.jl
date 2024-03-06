@@ -291,6 +291,69 @@ end
     end
 end
 
+@testset "pmap with task checkpoint and restart" begin
+    s = Dict{Int,Future}()
+    p = Dict{Int,Future}()
+
+    function init(pid, s)
+        s[pid] = remotecall(ones, pid, Int, 1)
+        p[pid] = remotecall(Channel{Bool}, pid, 1)
+    end
+
+    r = randstring('a':'z', 6)
+
+    function foo5d(tsk, s, r)
+        _s = fetch(s[myid()])::Vector{Int}
+        for i = _s[1]:10
+            _s .= i
+            touch("testfile-$r-$tsk-$i.txt")
+            @info "_s on pid=$(myid()) is $(_s[1])"
+            sleep(5)
+        end
+        _s .= 1
+    end
+
+    function checkpoint_task(tsk, s)
+        @info "checkpoint task..."
+        _s = fetch(s[myid()])::Vector{Int}
+        write("task_checkpoint_$tsk.bin", _s)
+        @info "...checkpoint task with state=$(_s[1])."
+    end
+
+    function restart_task!(tsk, s)
+        @info "restart task..."
+        _s = fetch(s[myid()])::Vector{Int}
+        if isfile("task_checkpoint_$tsk.bin")
+            read!("task_checkpoint_$tsk.bin", _s)
+            rm("task_checkpoint_$tsk.bin")
+        end
+        @info "...restart task, " _s
+    end
+
+    function signal_preempt(p)
+        put!(fetch(p[myid()]), true)
+    end
+
+    options = SchedulerOptions(;
+        minworkers = 0,
+        maxworkers = 2,
+        init = pid->init(pid, s),
+        checkpoint_task = tsk->checkpoint_task(tsk, s),
+        restart_task = tsk->restart_task!(tsk, s),
+        preempt_channel_future = pid->p[pid]
+    )
+
+    t = @async epmap(options, i->foo5d(i,s,r), 1:4)
+
+    sleep(25)
+    remotecall_wait(signal_preempt, workers()[1], p)
+
+    journal,tsks = fetch(t)
+    files = filter(f->startswith(f, "testfile-$r"), readdir())
+    @test length(files) == 40
+    rm.(files)
+end
+
 @testset "pmapreduce, stable cluster test, backwards compatability" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
@@ -318,7 +381,7 @@ end
 @testset "pmapreduce, stable cluster test" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
-    @everywhere function foo6(x, tsk, a; b)
+    @everywhere function foo6b(x, tsk, a; b)
         x .+= a*b*tsk
         nothing
     end
@@ -327,7 +390,7 @@ end
 
     a,b = 2,3
     options = SchedulerOptions(;scratch=tmpdir)
-    x,tsks = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo6b, 1:100, a; b=b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
@@ -835,6 +898,78 @@ end
     rmprocs(workers())
     @test x ≈ (sum(a*b*[1:100;]) - a*b*20) * ones(10)
     rm.(tmpdirs; recursive=true, force=true)
+end
+
+@testset "pmapreduce with task checkpoint and restart" begin
+    s = Dict{Int,Future}()
+    p = Dict{Int,Future}()
+
+    function init(pid, s)
+        s[pid] = remotecall(ones, pid, Int, 1)
+        p[pid] = remotecall(Channel{Bool}, pid, 1)
+    end
+
+    r = randstring('a':'z', 6)
+
+    function foo18(result, tsk, s, r)
+        _s = fetch(s[myid()])::Vector{Int}
+        for i = _s[1]:10
+            _s .= i
+            touch("testfile-$r-$tsk-$i.txt")
+            @info "_s on pid=$(myid()) is $(_s[1])"
+            sleep(5)
+        end
+        result .+= _s[1]
+        _s .= 1
+    end
+
+    function checkpoint_task(tsk, s)
+        @info "checkpoint task..."
+        _s = fetch(s[myid()])::Vector{Int}
+        write("task_checkpoint_$tsk.bin", _s)
+        @info "...checkpoint task with state=$(_s[1])."
+    end
+
+    function restart_task!(tsk, s)
+        @info "restart task..."
+        _s = fetch(s[myid()])::Vector{Int}
+        if isfile("task_checkpoint_$tsk.bin")
+            read!("task_checkpoint_$tsk.bin", _s)
+            rm("task_checkpoint_$tsk.bin")
+        end
+        @info "...restart task, " _s
+    end
+
+    function signal_preempt(p)
+        put!(fetch(p[myid()]), true)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    options = SchedulerOptions(;
+        minworkers = 0,
+        maxworkers = 2,
+        init = pid->init(pid, s),
+        checkpoint_task = tsk->checkpoint_task(tsk, s),
+        restart_task = tsk->restart_task!(tsk, s),
+        preempt_channel_future = pid->p[pid],
+        scratch = tmpdir
+    )
+
+    t = @async epmapreduce!(zeros(2), options, (result,i)->foo18(result,i,s,r), 1:4)
+
+    sleep(25)
+    while nprocs() == 1
+        sleep(25)
+    end
+    remotecall_wait(signal_preempt, workers()[1], p)
+
+    result,tsks = fetch(t)
+    @test result ≈ [40.0,40.0]
+    files = filter(f->startswith(f, "testfile-$r"), readdir())
+    @test length(files) == 40
+    rm.(files)
+    rm(tmpdir; recursive=true, force=true)
 end
 
 @testset "copy SchedulerOptions" begin

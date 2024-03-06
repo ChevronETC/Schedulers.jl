@@ -3,7 +3,9 @@ module Schedulers
 using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
-epmap_default_preempted = ()->false
+epmap_default_preempt_channel_future = pid->nothing
+epmap_default_checkpoint_task = pid->nothing
+epmap_default_restart_task = pid->nothing
 epmap_default_init = pid->nothing
 
 function logerror(e, loglevel=Logging.Debug)
@@ -23,18 +25,6 @@ end
 
 # see https://github.com/JuliaTime/TimeZones.jl/issues/374
 now_formatted() = Dates.format(now(Dates.UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z")
-
-function check_for_preempted(pid, epmap_preempted)
-    preempted = false
-    try
-        if remotecall_fetch(epmap_preempted, pid)
-            preempted = true
-        end
-    catch e
-        @debug "unable to call preempted method"
-    end
-    preempted
-end
 
 function journal_init(tsks, epmap_journal_init_callback; reduce)
     journal = reduce ? Dict{String,Any}("tasks"=>Dict(), "checkpoints"=>Dict(), "rmcheckpoints"=>Dict(), "pids"=>Dict()) : Dict{String,Any}("tasks"=>Dict())
@@ -247,42 +237,80 @@ end
 
 maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
 
-# see: https://github.com/JuliaLang/julia/issues/53217
-# if we don't do this, then the work is sent to the interactive thread pool, and
-# we do not want to block an interactive thread.  For example, in AzManagers.jl
-# we use the interactive thread pool to poll for spot evictions.
-default_threadpool_call(f, args...; kwargs...) = fetch(Threads.@spawn f(args...; kwargs...))
+struct PreemptException <: Exception end
 
-function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    tsk = @async remotecall_wait(default_threadpool_call, pid, f, args...; kwargs...)
+function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
+    # see: https://github.com/JuliaLang/julia/issues/53217
+    # We explicitly use a default thread here.  If we don't do this, then the work is sent to the
+    # interactive thread pool, and we do not want to block an interactive thread.  For example,
+    # in AzManagers.jl we use the interactive thread pool to poll for spot evictions.
+    t = Threads.@spawn begin
+        try
+            restart_task(tsk)
+        catch
+            @warn "error restarting task $tsk"
+            logerror(e, Logging.Warn)
+        end
+        f(args...; kwargs...)
+    end
+
+    if preempt_channel_future !== nothing
+        preempt_channel = fetch(preempt_channel_future)::Channel{Bool}
+        # this loop runs on the interactive thread
+        while !istaskdone(t)
+            if isready(preempt_channel)
+                take!(preempt_channel)
+                try
+                    checkpoint_task(tsk)
+                catch e
+                    @warn "error checkpointing task $tsk"
+                    logerror(e, Logging.Warn)
+                end
+                @async Base.throwto(t, InterruptException())
+                throw(PreemptException())
+            end
+            sleep(0.1)
+        end
+    end
+
+    fetch(t)
+end
+
+function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
+    t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
-    while !istaskdone(tsk)
+    while !istaskdone(t)
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
     end
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
-    if istaskfailed(tsk)
-        fetch(tsk)
+    if istaskfailed(t)
+        fetch(t)
     end
     nothing
 end
 
-function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, f, pid, args...; kwargs...)
-    tsk = @async remotecall_fetch(default_threadpool_call, pid, f, args...; kwargs...)
+function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
+    t = @async remotecall_fetch(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
-    while !istaskdone(tsk)
+    while !istaskdone(t)
         if tic - time() > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
     end
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
-    fetch(tsk)
+    fetch(t)
 end
 
-remotecall_default_threadpool(f, pid, args...; kwargs...) = remotecall(default_threadpool_call, pid, f, args...; kwargs...)
+remotecall_default_threadpool(f, pid, args...; kwargs...) = remotecall(default_threadpool_checkpoint_call, pid, nothing, tsk->nothing, tsk->nothing, 0, f, args...; kwargs...)
+
+function handle_exception(e::PreemptException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
+    @warn "preempt exception caught on process with id=$pid ($hostname)"
+    (bad_pid = true, do_break=true, do_interrupt=false, do_error=true)
+end
 
 function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
     logerror(e, Logging.Warn)
@@ -435,14 +463,20 @@ function robust_rmprocs(pids; waitfor)
             end
             unremoved = [wrkr.id for wrkr in filter(w -> w.state !== Distributed.W_TERMINATED, rmprocset)]
 
-            for pid in unremoved
-                @debug "robust_rmprocs, setting worker state, and calling kill"
-                if haskey(Distributed.map_pid_wrkr, pid)
-                    w = Distributed.map_pid_wrkr[pid]
-                    Distributed.set_worker_state(w, Distributed.W_TERMINATED)
-                    Distributed.deregister_worker(pid)
-                    Distributed.kill(w.manager, pid, w.config)
+            lock(Distributed.worker_lock)
+            try
+                for pid in unremoved
+                    @debug "robust_rmprocs, setting worker state, and calling kill"
+                    if haskey(Distributed.map_pid_wrkr, pid)
+                        w = Distributed.map_pid_wrkr[pid]
+                        Distributed.set_worker_state(w, Distributed.W_TERMINATED)
+                        Distributed.deregister_worker(pid)
+                        Distributed.kill(w.manager, pid, w.config)
+                    end
                 end
+            catch
+            finally
+                unlock(Distributed.worker_lock)
             end
         catch e
             @warn "rmprocs fall-back strategy failed."
@@ -782,7 +816,9 @@ mutable struct SchedulerOptions{C}
     quantum::Function
     addprocs::Function
     init::Function
-    preempted::Function
+    preempt_channel_future::Function
+    checkpoint_task::Function
+    restart_task::Function
     reporttasks::Bool
     keepcheckpoints::Bool
     journalfile::String
@@ -814,7 +850,9 @@ function SchedulerOptions(;
         quantum = ()->32,
         addprocs = Distributed.addprocs,
         init = epmap_default_init,
-        preempted = epmap_default_preempted,
+        preempt_channel_future = epmap_default_preempt_channel_future,
+        checkpoint_task = epmap_default_checkpoint_task,
+        restart_task = epmap_default_restart_task,
         reporttasks = true,
         keepcheckpoints = false,
         journalfile = "",
@@ -844,7 +882,9 @@ function SchedulerOptions(;
         isa(quantum, Function) ? quantum : ()->quantum,
         addprocs,
         init,
-        preempted,
+        preempt_channel_future,
+        checkpoint_task,
+        restart_task,
         reporttasks,
         keepcheckpoints,
         journalfile,
@@ -876,7 +916,9 @@ function Base.copy(options::SchedulerOptions)
         options.quantum,
         options.addprocs,
         options.init,
-        options.preempted,
+        options.preempt_channel_future,
+        options.checkpoint_task,
+        options.restart_task,
         options.reporttasks,
         options.keepcheckpoints,
         options.journalfile,
@@ -948,10 +990,18 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
 
         hostname = ""
 
+        local preempt_channel_future
+        try
+            preempt_channel_future = options.preempt_channel_future(pid)
+        catch
+            @warn "failed to retreive preempt_channel_future.  checkpoint/restart functionality disabled."
+            preempt_channel_future = nothing
+        end
+
         @async while true
             if hostname == ""
                 try
-                    hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
+                    hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid within 60 seconds"
                     logerror(e, Logging.Warn)
@@ -960,11 +1010,10 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 end
             end
 
-            is_preempted = check_for_preempted(pid, options.preempted)
-            @debug "map task loop exit condition" pid is_preempted length(eloop.tsk_pool_todo) eloop.interrupted
-            if is_preempted || length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+            @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
+            if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
                 @debug "putting $pid onto map_remove channel"
-                put!(eloop.pid_channel_map_remove, (pid,is_preempted))
+                put!(eloop.pid_channel_map_remove, (pid,false))
                 break
             end
             isempty(eloop.tsk_pool_todo) && (yield(); continue)
@@ -982,7 +1031,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, f, pid, tsk, args...; kwargs...)
+                remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
                 journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 push!(eloop.tsk_pool_done, tsk)
                 @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -1183,10 +1232,18 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         epmap_eloop.checkpoints[pid] = nothing
 
+        local preempt_channel_future
+        try
+            preempt_channel_future = options.preempt_channel_future(pid)
+        catch
+            @warn "failed to retreive preempt_channel_future.  checkpoint/restart functionality disabled."
+            preempt_channel_future = nothing
+        end
+
         @async while true
             if hostname == ""
                 try
-                    hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
+                    hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
                 catch e
                     @warn "unable to determine hostname for pid=$pid within 60 seconds."
                     logerror(e, Logging.Warn)
@@ -1203,14 +1260,13 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
             @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
             @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-            is_preempted = check_for_preempted(pid, options.preempted)
-            if is_preempted || isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+            if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
                 if epmap_eloop.checkpoints[pid] !== nothing
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                 end
                 pop!(localresults, pid)
                 pop!(epmap_eloop.checkpoints, pid)
-                put!(epmap_eloop.pid_channel_map_remove, (pid,is_preempted))
+                put!(epmap_eloop.pid_channel_map_remove, (pid,false))
                 break
             end
 
@@ -1228,7 +1284,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 yield()
                 journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
+                remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
                 journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                 @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
             catch e
@@ -1261,7 +1317,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             try
                 @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                 journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
                 journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                 @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                 push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1322,7 +1378,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
                     journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.rm_checkpoint, pid, old_checkpoint)
+                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
                     journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                 end
             catch e
@@ -1381,7 +1437,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
         hostname = ""
         try
-            hostname = remotecall_fetch_timeout(60, 1, 1, options.gethostname, pid)
+            hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
         catch e
             @warn "unable to determine host name for pid=$pid"
             logerror(e, Logging.Warn)
@@ -1392,7 +1448,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         @async while true
             @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
             epmap_eloop.interrupted && break
-            check_for_preempted(pid, options.preempted) && break
 
             epmap_eloop.reduce_checkpoints_is_dirty[pid] = true
 
@@ -1485,7 +1540,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
+                remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                 epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -1513,7 +1568,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, options.rm_checkpoint, pid, checkpoint1)
+                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
             catch e
@@ -1537,7 +1592,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, options.rm_checkpoint, pid, checkpoint2)
+                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
             catch e
