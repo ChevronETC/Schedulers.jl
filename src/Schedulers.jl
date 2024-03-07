@@ -987,8 +987,9 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         local preempt_channel_future
         try
             preempt_channel_future = options.preempt_channel_future(pid)
-        catch
+        catch e
             @warn "failed to retreive preempt_channel_future.  checkpoint/restart functionality disabled."
+            logerror(e, Logging.Warn)
             preempt_channel_future = nothing
         end
 
