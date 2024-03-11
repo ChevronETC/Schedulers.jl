@@ -259,6 +259,7 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
         # this loop runs on the interactive thread
         while !istaskdone(t)
             if isready(preempt_channel)
+                @async Base.throwto(t, InterruptException())
                 take!(preempt_channel)
                 try
                     checkpoint_task(tsk)
@@ -266,7 +267,6 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
                     @warn "error checkpointing task $tsk"
                     logerror(e, Logging.Warn)
                 end
-                @async Base.throwto(t, InterruptException())
                 throw(PreemptException())
             end
             sleep(0.1)
