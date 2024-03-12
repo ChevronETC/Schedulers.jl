@@ -463,14 +463,20 @@ function robust_rmprocs(pids; waitfor)
             end
             unremoved = [wrkr.id for wrkr in filter(w -> w.state !== Distributed.W_TERMINATED, rmprocset)]
 
-            for pid in unremoved
-                @debug "robust_rmprocs, setting worker state, and calling kill"
-                if haskey(Distributed.map_pid_wrkr, pid)
-                    w = Distributed.map_pid_wrkr[pid]
-                    Distributed.set_worker_state(w, Distributed.W_TERMINATED)
-                    Distributed.deregister_worker(pid)
-                    Distributed.kill(w.manager, pid, w.config)
+            lock(Distributed.worker_lock)
+            try
+                for pid in unremoved
+                    @debug "robust_rmprocs, setting worker state, and calling kill"
+                    if haskey(Distributed.map_pid_wrkr, pid)
+                        w = Distributed.map_pid_wrkr[pid]
+                        Distributed.set_worker_state(w, Distributed.W_TERMINATED)
+                        Distributed.deregister_worker(pid)
+                        Distributed.kill(w.manager, pid, w.config)
+                    end
                 end
+            catch
+            finally
+                unlock(Distributed.worker_lock)
             end
         catch e
             @warn "rmprocs fall-back strategy failed."
