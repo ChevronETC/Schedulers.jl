@@ -654,9 +654,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             if is_more_tasks && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints_snapshot), 2) <= eloop.reduce_machine_count
                 @debug "putting pid=$free_pid onto map channel"
                 put!(eloop.pid_channel_map_add, free_pid)
+                @debug "done putting pid=$free_pid onto map channel"
             elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > eloop.reduce_machine_count
                 @debug "putting pid=$free_pid onto reduce channel"
                 put!(eloop.pid_channel_reduce_add, free_pid)
+                @debug "done putting pid=$free_pid onto reduce channel"
                 eloop.reduce_machine_count += 1
             else
                 free_pid ∈ eloop.used_pids && pop!(eloop.used_pids, free_pid)
@@ -691,6 +693,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
             if δ < 0 || length(bad_pids) > 0
                 rm_pids = Int[]
+                filter!(bad_pid->bad_pid ∈ workers(), bad_pids)
                 while !isempty(bad_pids)
                     push!(rm_pids, pop!(bad_pids))
                 end
@@ -803,6 +806,22 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 end
 
 default_reducer!(x, y) = (x .+= y; nothing)
+
+function pid_tsk_monitor!(channel_remove, pid_tsks)
+    for (pid,pid_tsk) in pid_tsks
+        if istaskfailed(pid_tsk)
+            isopen(channel_remove) && put!(channel_remove, (pid,true))
+            try
+                wait(pid_tsk)
+            catch e
+                @warn "unhandled exception in work loop for pid=$pid"
+                logerror(e, Logging.Warn)
+            end
+        end
+    end
+    filter!(pid_tsk->!istaskdone(pid_tsk[2]), pid_tsks)
+    nothing
+end
 
 mutable struct SchedulerOptions{C}
     retries::Int
@@ -980,8 +999,9 @@ end
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
     tsk_times = Float64[]
 
+    pid_tsks = Dict{Int,Task}()
     # work loop
-    @sync while true
+    while true
         eloop.interrupted && break
         pid = take!(eloop.pid_channel_map_add)
 
@@ -998,7 +1018,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             preempt_channel_future = nothing
         end
 
-        @async while true
+        pid_tsks[pid] = @async while true
             if hostname == ""
                 try
                     hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
@@ -1055,8 +1075,21 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 r.do_break && break
             end
         end
+
+        pid_tsk_monitor!(eloop.pid_channel_map_remove, pid_tsks)
+
     end
-    @debug "exiting the map loop"
+
+    @debug "waiting for incomplete tasks after exiting the map worker loop"
+    while true
+        pid_tsk_monitor!(eloop.pid_channel_map_remove, pid_tsks)
+        isempty(pid_tsks) && break
+        for (pid,pid_tsk) in pid_tsks
+            wait(pid_tsk)
+        end
+        sleep(1)
+    end
+    @debug "done waiting for tasks to complete after exiting the map worker loop"
 
     journal_final(journal)
 
@@ -1210,9 +1243,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
     checkpoint_times = Float64[]
     rm_times = Float64[]
 
+    pid_tsks = Dict{Int,Task}()
     # work loop
-    @sync while true
-        @debug "map, iterrupted=$(epmap_eloop.interrupted)"
+    while true
+        @debug "map, interrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
         pid = take!(epmap_eloop.pid_channel_map_add)
 
@@ -1240,7 +1274,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             preempt_channel_future = nothing
         end
 
-        @async while true
+        pid_tsks[pid] = @async while true
             if hostname == ""
                 try
                     hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
@@ -1258,8 +1292,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 end
             end
 
-            @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
-            @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
+            @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo)), epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
             if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
                 if epmap_eloop.checkpoints[pid] !== nothing
                     push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
@@ -1399,8 +1432,21 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 end
             end
         end
+
+        pid_tsk_monitor!(epmap_eloop.pid_channel_map_remove, pid_tsks)
     end
-    @debug "exited the map worker loop"
+
+    @debug "map, waiting for incomplete tasks after exiting the map worker loop"
+    while true
+        pid_tsk_monitor!(epmap_eloop.pid_channel_map_remove, pid_tsks)
+        isempty(pid_tsks) && break
+        for (pid,pid_tsk) in pid_tsks
+            wait(pid_tsk)
+        end
+        sleep(1)
+    end
+    @debug "map, done waiting for incomplete tasks after exiting the map worker loop"
+
     empty!(epmap_eloop.checkpoints)
 
     @debug "map, emptied the checkpoints"
@@ -1427,7 +1473,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     reduce_times = Float64[300.0]
     rm_times = Float64[300.0]
 
-    @sync while true
+    pid_tsks = Dict{Int,Task}()
+
+    while true
         @debug "reduce, interrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
         pid = take!(epmap_eloop.pid_channel_reduce_add)
@@ -1445,7 +1493,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             continue
         end
 
-        @async while true
+        pid_tsks[pid] = @async while true
             @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
             epmap_eloop.interrupted && break
 
@@ -1611,8 +1659,21 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
             epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
         end
+
+        pid_tsk_monitor!(epmap_eloop.pid_channel_reduce_remove, pid_tsks)
+
     end
-    @debug "reduce, exited the reduce worker loop"
+
+    @debug "reduce, waiting for incomplete tasks after exiting the map worker loop"
+    while true
+        pid_tsk_monitor!(epmap_eloop.pid_channel_reduce_remove, pid_tsks)
+        isempty(pid_tsks) && break
+        for (pid,pid_tsk) in pid_tsks
+            wait(pid_tsk)
+        end
+        sleep(1)
+    end
+    @debug "reduce, done waiting for incomplete tasks after exiting the map worker loop"
 
     for i in 1:10
         try
