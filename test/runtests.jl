@@ -374,7 +374,7 @@ end
         @test getfield(options_init, field) == getfield(options, field)
     end
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
-    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
 
@@ -393,7 +393,7 @@ end
     x,tsks = epmapreduce!(zeros(Float32,10), options, foo6b, 1:100, a; b=b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
-    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
 
@@ -707,7 +707,7 @@ end
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
-    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
 
@@ -742,7 +742,7 @@ end
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
 
-    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
 
@@ -1009,6 +1009,6 @@ end
     x,tsks = epmapreduce!(zeros(Float32,10), options, foo6, 1:100, a; b=b)
     rmprocs(workers())
     @test x ≈ sum(a*b*[1:100;]) * ones(10)
-    @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
+    @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
