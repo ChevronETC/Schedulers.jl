@@ -998,62 +998,70 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             preempt_channel_future = nothing
         end
 
-        @async while true
-            if hostname == ""
-                try
-                    hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
-                catch e
-                    @warn "unable to determine hostname for pid=$pid within 60 seconds"
-                    logerror(e, Logging.Warn)
-                    put!(eloop.pid_channel_map_remove, (pid, true))
+        @async try
+            while true
+                if hostname == ""
+                    try
+                        hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                    catch e
+                        @warn "unable to determine hostname for pid=$pid within 60 seconds"
+                        logerror(e, Logging.Warn)
+                        put!(eloop.pid_channel_map_remove, (pid, true))
+                        break
+                    end
+                end
+
+                @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
+                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+                    @debug "putting $pid onto map_remove channel"
+                    put!(eloop.pid_channel_map_remove, (pid,false))
                     break
                 end
-            end
+                isempty(eloop.tsk_pool_todo) && (yield(); continue)
 
-            @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
-            if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
-                @debug "putting $pid onto map_remove channel"
-                put!(eloop.pid_channel_map_remove, (pid,false))
-                break
-            end
-            isempty(eloop.tsk_pool_todo) && (yield(); continue)
+                local tsk
+                try
+                    tsk = popfirst!(eloop.tsk_pool_todo)
+                catch
+                    # just in case another task does popfirst! before us (unlikely)
+                    yield()
+                    continue
+                end
 
-            local tsk
-            try
-                tsk = popfirst!(eloop.tsk_pool_todo)
-            catch
-                # just in case another task does popfirst! before us (unlikely)
-                yield()
-                continue
-            end
-
-            try
-                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
-                yield()
-                journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
-                journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                push!(eloop.tsk_pool_done, tsk)
-                @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
-                yield()
-            catch e
-                @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
-                journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
-                if isa(e, TimeoutException) && options.skip_tasks_that_timeout
-                    @warn "skipping task '$tsk' that timed out"
+                try
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                    yield()
+                    journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
+                    remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
+                    journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                     push!(eloop.tsk_pool_done, tsk)
-                    push!(eloop.tsk_pool_timed_out, tsk)
-                else
-                    push!(eloop.tsk_pool_todo, tsk)
+                    @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
+                    yield()
+                catch e
+                    @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
+                    journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
+                    if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                        @warn "skipping task '$tsk' that timed out"
+                        push!(eloop.tsk_pool_done, tsk)
+                        push!(eloop.tsk_pool_timed_out, tsk)
+                    else
+                        push!(eloop.tsk_pool_todo, tsk)
+                    end
+                    r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
+                    if r.do_break || r.do_interrupt
+                        put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                    end
+                    eloop.interrupted = r.do_interrupt
+                    eloop.errored = r.do_error
+                    r.do_break && break
                 end
-                r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
-                if r.do_break || r.do_interrupt
-                    put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
-                end
-                eloop.interrupted = r.do_interrupt
-                eloop.errored = r.do_error
-                r.do_break && break
             end
+        catch e
+            @warn "uncaught exception in worker loop for pid=$pid"
+            logerror(e, Logging.Warn)
+            @debug "putting $pid onto remove channel"
+            isopen(eloop.pid_channel_map_remove) && put!(eloop.pid_channel_map_remove, (pid,true))
+            @debug "done putting $pid onto remove channel"
         end
     end
     @debug "exiting the map loop"
@@ -1240,164 +1248,172 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             preempt_channel_future = nothing
         end
 
-        @async while true
-            if hostname == ""
+        @async try
+            while true
+                if hostname == ""
+                    try
+                        hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                    catch e
+                        @warn "unable to determine hostname for pid=$pid within 60 seconds."
+                        logerror(e, Logging.Warn)
+                        if epmap_eloop.checkpoints[pid] !== nothing
+                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                        end
+                        pop!(localresults, pid)
+                        pop!(epmap_eloop.checkpoints, pid)
+                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+                        @debug "...finished cleanup for hostname failure for pid=$pid."
+                        break
+                    end
+                end
+
+                @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
+                @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
+                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+                    if epmap_eloop.checkpoints[pid] !== nothing
+                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                    end
+                    pop!(localresults, pid)
+                    pop!(epmap_eloop.checkpoints, pid)
+                    put!(epmap_eloop.pid_channel_map_remove, (pid,false))
+                    break
+                end
+
+                local tsk
                 try
-                    hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
-                catch e
-                    @warn "unable to determine hostname for pid=$pid within 60 seconds."
-                    logerror(e, Logging.Warn)
-                    if epmap_eloop.checkpoints[pid] !== nothing
-                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                    end
-                    pop!(localresults, pid)
-                    pop!(epmap_eloop.checkpoints, pid)
-                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
-                    @debug "...finished cleanup for hostname failure for pid=$pid."
-                    break
+                    tsk = popfirst!(epmap_eloop.tsk_pool_todo)
+                catch
+                    # just in case another task does popfirst! before us (unlikely)
+                    yield()
+                    continue
                 end
-            end
 
-            @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
-            @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-            if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
-                if epmap_eloop.checkpoints[pid] !== nothing
-                    push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                end
-                pop!(localresults, pid)
-                pop!(epmap_eloop.checkpoints, pid)
-                put!(epmap_eloop.pid_channel_map_remove, (pid,false))
-                break
-            end
-
-            local tsk
-            try
-                tsk = popfirst!(epmap_eloop.tsk_pool_todo)
-            catch
-                # just in case another task does popfirst! before us (unlikely)
-                yield()
-                continue
-            end
-
-            # compute and reduce
-            try
-                options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
-                yield()
-                journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
-                journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
-            catch e
-                @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
-                journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                if isa(e, TimeoutException) && options.skip_tasks_that_timeout
-                    @warn "skipping task '$tsk' that timed out, compute/reduce step"
-                    push!(epmap_eloop.tsk_pool_done, tsk)
-                    push!(epmap_eloop.tsk_pool_timed_out, tsk)
-                else
-                    push!(epmap_eloop.tsk_pool_todo, tsk)
-                end
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                epmap_eloop.interrupted = r.do_interrupt
-                epmap_eloop.errored = r.do_error
-                if r.do_break || r.do_interrupt
-                    if epmap_eloop.checkpoints[pid] !== nothing
-                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                    end
-                    pop!(localresults, pid)
-                    pop!(epmap_eloop.checkpoints, pid)
-                    put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
-                    break
-                end
-                continue # no need to checkpoint since the task failed and will be re-run (TODO: or abandoned)
-            end
-
-            # checkpoint
-            _next_checkpoint = next_checkpoint(options.id, options.scratch)
-            try
-                @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
-                journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
-                journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
-                @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
-                push!(epmap_eloop.tsk_pool_done, tsk)
-            catch e
-                @warn "pid=$pid ($hostname), checkpoint=$(epmap_eloop.checkpoints[pid]), task loop, caught exception during save_checkpoint"
-                journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
-                @debug "pushing task onto tsk_pool_todo list"
-                if isa(e, TimeoutException) && options.skip_tasks_that_timeout
-                    @warn "skipping task '$tsk' that timed out, checkpoint step"
-                    push!(epmap_eloop.tsk_pool_done, tsk)
-                    push!(epmap_eloop.tsk_pool_timed_out, tsk)
-                else
-                    push!(epmap_eloop.tsk_pool_todo, tsk)
-                end
-                @debug "handling exception"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                @debug "done handling exception"
-                epmap_eloop.interrupted = r.do_interrupt
-                epmap_eloop.errored = r.do_error
-                @debug "caught save checkpoint" r.do_break r.do_interrupt _next_checkpoint
-                # note that `options.rm_checkpoint` should check if the file exists before attempting removal
+                # compute and reduce
                 try
-                    options.rm_checkpoint(_next_checkpoint)
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                    yield()
+                    journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
+                    remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
+                    journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
+                    @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
                 catch e
-                    @warn "unable to delete $(_next_checkpoint), manual clean-up may be required"
-                    logerror(e, Logging.Warn)
-                end
-                if r.do_break || r.do_interrupt
-                    @debug "epmap_eloop.checkpoints[$pid]", epmap_eloop.checkpoints[pid]
-                    if epmap_eloop.checkpoints[pid] !== nothing
-                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                    @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
+                    journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
+                    if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                        @warn "skipping task '$tsk' that timed out, compute/reduce step"
+                        push!(epmap_eloop.tsk_pool_done, tsk)
+                        push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                    else
+                        push!(epmap_eloop.tsk_pool_todo, tsk)
                     end
-                    @debug "popping localresults"
-                    pop!(localresults, pid)
-                    @debug "popping checkpoints"
-                    pop!(epmap_eloop.checkpoints, pid)
-                    @debug "returning pid to elastic loop"
-                    put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
-                    @debug "done returning pid to elastic loop"
-                    break
-                end
-
-                # populate local reduction with the previous checkpoint since we will re-run the task.
-                if epmap_eloop.checkpoints[pid] === nothing
-                    @debug "re-zeroing local result (no existing checkpoints)"
-                    localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
-                else
-                    @debug "re-setting localresult to the previously saved checkpoint"
-                    localresults[pid] = remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
-                end
-
-                continue # there is no new checkpoint, and we need to keep the old checkpoint
-            end
-
-            # delete old checkpoint
-            old_checkpoint,epmap_eloop.checkpoints[pid] = get(epmap_eloop.checkpoints, pid, nothing),_next_checkpoint
-            try
-                if old_checkpoint !== nothing
-                    @debug "deleting old checkpoint"
-                    journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
-                    journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
-                end
-            catch e
-                @warn "pid=$pid ($hostname), task loop, caught exception during remove checkpoint, there may be stray check-point files that will be deleted later"
-                push!(checkpoint_orphans, old_checkpoint)
-                journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                epmap_eloop.interrupted = r.do_interrupt
-                epmap_eloop.errored = r.do_error
-                if r.do_break || r.do_interrupt
-                    if epmap_eloop.checkpoints[pid] !== nothing
-                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    if r.do_break || r.do_interrupt
+                        if epmap_eloop.checkpoints[pid] !== nothing
+                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                        end
+                        pop!(localresults, pid)
+                        pop!(epmap_eloop.checkpoints, pid)
+                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        break
                     end
-                    pop!(localresults, pid)
-                    pop!(epmap_eloop.checkpoints, pid)
-                    put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
-                    break
+                    continue # no need to checkpoint since the task failed and will be re-run (TODO: or abandoned)
+                end
+
+                # checkpoint
+                _next_checkpoint = next_checkpoint(options.id, options.scratch)
+                try
+                    @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                    journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
+                    remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                    journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
+                    @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
+                    push!(epmap_eloop.tsk_pool_done, tsk)
+                catch e
+                    @warn "pid=$pid ($hostname), checkpoint=$(epmap_eloop.checkpoints[pid]), task loop, caught exception during save_checkpoint"
+                    journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
+                    @debug "pushing task onto tsk_pool_todo list"
+                    if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                        @warn "skipping task '$tsk' that timed out, checkpoint step"
+                        push!(epmap_eloop.tsk_pool_done, tsk)
+                        push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                    else
+                        push!(epmap_eloop.tsk_pool_todo, tsk)
+                    end
+                    @debug "handling exception"
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    @debug "done handling exception"
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    @debug "caught save checkpoint" r.do_break r.do_interrupt _next_checkpoint
+                    # note that `options.rm_checkpoint` should check if the file exists before attempting removal
+                    try
+                        options.rm_checkpoint(_next_checkpoint)
+                    catch e
+                        @warn "unable to delete $(_next_checkpoint), manual clean-up may be required"
+                        logerror(e, Logging.Warn)
+                    end
+                    if r.do_break || r.do_interrupt
+                        @debug "epmap_eloop.checkpoints[$pid]", epmap_eloop.checkpoints[pid]
+                        if epmap_eloop.checkpoints[pid] !== nothing
+                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                        end
+                        @debug "popping localresults"
+                        pop!(localresults, pid)
+                        @debug "popping checkpoints"
+                        pop!(epmap_eloop.checkpoints, pid)
+                        @debug "returning pid to elastic loop"
+                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        @debug "done returning pid to elastic loop"
+                        break
+                    end
+
+                    # populate local reduction with the previous checkpoint since we will re-run the task.
+                    if epmap_eloop.checkpoints[pid] === nothing
+                        @debug "re-zeroing local result (no existing checkpoints)"
+                        localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
+                    else
+                        @debug "re-setting localresult to the previously saved checkpoint"
+                        localresults[pid] = remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
+                    end
+
+                    continue # there is no new checkpoint, and we need to keep the old checkpoint
+                end
+
+                # delete old checkpoint
+                old_checkpoint,epmap_eloop.checkpoints[pid] = get(epmap_eloop.checkpoints, pid, nothing),_next_checkpoint
+                try
+                    if old_checkpoint !== nothing
+                        @debug "deleting old checkpoint"
+                        journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
+                        options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
+                        journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
+                    end
+                catch e
+                    @warn "pid=$pid ($hostname), task loop, caught exception during remove checkpoint, there may be stray check-point files that will be deleted later"
+                    push!(checkpoint_orphans, old_checkpoint)
+                    journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    if r.do_break || r.do_interrupt
+                        if epmap_eloop.checkpoints[pid] !== nothing
+                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                        end
+                        pop!(localresults, pid)
+                        pop!(epmap_eloop.checkpoints, pid)
+                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        break
+                    end
                 end
             end
+        catch e
+            @warn "map, uncaught exception in worker loop for pid=$pid"
+            logerror(e, Logging.Warn)
+            @debug "map, putting $pid onto remove channel"
+            isopen(epmap_eloop.pid_channel_map_remove) && put!(epmap_eloop.pid_channel_map_remove, (pid,true))
+            @debug "map, done putting $pid onto remove channel"
         end
     end
     @debug "exited the map worker loop"
@@ -1445,171 +1461,179 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             continue
         end
 
-        @async while true
-            @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
-            epmap_eloop.interrupted && break
+        @async try
+            while true
+                @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
+                epmap_eloop.interrupted && break
 
-            epmap_eloop.reduce_checkpoints_is_dirty[pid] = true
+                epmap_eloop.reduce_checkpoints_is_dirty[pid] = true
 
-            @debug "reduce, pid=$pid, at exit condition, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
-            if length(epmap_eloop.reduce_checkpoints) < 2
-                @debug "reduce, popping pid=$pid from dirty list"
-                pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                @debug "reduce, putting $pid onto reduce remove channel"
-                put!(epmap_eloop.pid_channel_reduce_remove, (pid,false))
-                @debug "reduce, done putting $pid onto reduce remove channel"
-                break
-            end
-
-            @debug "reduce, waiting for lock on pid=$pid"
-            lock(l)
-            @debug "reduce, got lock on pid=$pid"
-
-            n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
-
-            # reduce two checkpoints into a third checkpoint
-            if n_checkpoints > 1
-                @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(epmap_eloop.reduce_machine_count) reduce workers)."
-                local checkpoint1
-                try
-                    @debug "reduce, popping first checkpoint, pid=$pid"
-                    if epmap_eloop.is_reduce_triggered
-                        checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
-                        icheckpoint1 = findfirst(checkpoint->checkpoint == checkpoint1, epmap_eloop.reduce_checkpoints)
-                        icheckpoint1 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint1)
-                    else
-                        checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints)
-                    end
-                    @debug "reduce, popped first checkpoint, pid=$pid" checkpoint1
-                catch e
-                    @warn "reduce, unable to pop checkpoint 1"
-                    logerror(e, Logging.Warn)
-                    epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                    unlock(l)
-                    @debug "reduce, released lock on pid=$pid"
-                    continue
+                @debug "reduce, pid=$pid, at exit condition, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
+                if length(epmap_eloop.reduce_checkpoints) < 2
+                    @debug "reduce, popping pid=$pid from dirty list"
+                    pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                    @debug "reduce, putting $pid onto reduce remove channel"
+                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,false))
+                    @debug "reduce, done putting $pid onto reduce remove channel"
+                    break
                 end
 
-                local checkpoint2
-                try
-                    @debug "reduce, popping second checkpoint, pid=$pid"
-                    if epmap_eloop.is_reduce_triggered
-                        checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
-                        icheckpoint2 = findfirst(checkpoint->checkpoint == checkpoint2, epmap_eloop.reduce_checkpoints)
-                        icheckpoint2 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint2)
-                    else
-                        checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints)
+                @debug "reduce, waiting for lock on pid=$pid"
+                lock(l)
+                @debug "reduce, got lock on pid=$pid"
+
+                n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
+
+                # reduce two checkpoints into a third checkpoint
+                if n_checkpoints > 1
+                    @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(epmap_eloop.reduce_machine_count) reduce workers)."
+                    local checkpoint1
+                    try
+                        @debug "reduce, popping first checkpoint, pid=$pid"
+                        if epmap_eloop.is_reduce_triggered
+                            checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
+                            icheckpoint1 = findfirst(checkpoint->checkpoint == checkpoint1, epmap_eloop.reduce_checkpoints)
+                            icheckpoint1 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint1)
+                        else
+                            checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints)
+                        end
+                        @debug "reduce, popped first checkpoint, pid=$pid" checkpoint1
+                    catch e
+                        @warn "reduce, unable to pop checkpoint 1"
+                        logerror(e, Logging.Warn)
+                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
+                        unlock(l)
+                        @debug "reduce, released lock on pid=$pid"
+                        continue
                     end
-                    @debug "reduce, popped second checkpoint, pid=$pid" checkpoint2
-                catch e
-                    @warn "reduce, unable to pop checkpoint 2"
-                    logerror(e, Logging.Warn)
-                    push!(epmap_eloop.reduce_checkpoints, checkpoint1)
-                    epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1)
+
+                    local checkpoint2
+                    try
+                        @debug "reduce, popping second checkpoint, pid=$pid"
+                        if epmap_eloop.is_reduce_triggered
+                            checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
+                            icheckpoint2 = findfirst(checkpoint->checkpoint == checkpoint2, epmap_eloop.reduce_checkpoints)
+                            icheckpoint2 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint2)
+                        else
+                            checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints)
+                        end
+                        @debug "reduce, popped second checkpoint, pid=$pid" checkpoint2
+                    catch e
+                        @warn "reduce, unable to pop checkpoint 2"
+                        logerror(e, Logging.Warn)
+                        push!(epmap_eloop.reduce_checkpoints, checkpoint1)
+                        epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1)
+                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
+                        unlock(l)
+                        @debug "reduce, released lock on pid=$pid"
+                        continue
+                    end
+
+                    local checkpoint3
+                    try
+                        @debug "reduce, make third checkpoint, pid=$pid"
+                        checkpoint3 = next_checkpoint(options.id, options.scratch)
+                        @debug "reduce, made third checkpoint, pid=$pid" checkpoint3
+                    catch e
+                        @warn "reduce, unable to create checkpoint 3"
+                        logerror(e, Logging.Warn)
+                        push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
+                        epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
+                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
+                        unlock(l)
+                        @debug "reduce, released lock on pid=$pid"
+                        continue
+                    end
+                else
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                     unlock(l)
-                    @debug "reduce, released lock on pid=$pid"
+                    @debug "reduce, no checkpoints to reduce, released lock on pid=$pid"
                     continue
                 end
+                unlock(l)
+                @debug "reduce, released lock on pid=$pid"
 
-                local checkpoint3
                 try
-                    @debug "reduce, make third checkpoint, pid=$pid"
-                    checkpoint3 = next_checkpoint(options.id, options.scratch)
-                    @debug "reduce, made third checkpoint, pid=$pid" checkpoint3
+                    @debug "reducing into checkpoint3, pid=$pid" checkpoint3
+                    journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                    # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                    remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
+                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+                    push!(epmap_eloop.reduce_checkpoints, checkpoint3)
+                    epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
+                    @debug "pushed reduced checkpoint3, pid=$pid" checkpoint3
                 catch e
-                    @warn "reduce, unable to create checkpoint 3"
-                    logerror(e, Logging.Warn)
                     push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
+                    @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    if r.do_break || r.do_interrupt
+                        pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
+                        break
+                    end
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                    unlock(l)
-                    @debug "reduce, released lock on pid=$pid"
                     continue
                 end
-            else
-                epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                unlock(l)
-                @debug "reduce, no checkpoints to reduce, released lock on pid=$pid"
-                continue
-            end
-            unlock(l)
-            @debug "reduce, released lock on pid=$pid"
 
-            try
-                @debug "reducing into checkpoint3, pid=$pid" checkpoint3
-                journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
-                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                push!(epmap_eloop.reduce_checkpoints, checkpoint3)
-                epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
-                @debug "pushed reduced checkpoint3, pid=$pid" checkpoint3
-            catch e
-                push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
-                epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
-                @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
-                epmap_eloop.interrupted = r.do_interrupt
-                epmap_eloop.errored = r.do_error
-                if r.do_break || r.do_interrupt
-                    pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                # remove checkpoint 1
+                try
+                    options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
+                    journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                    # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
+                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+                    options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
+                catch e
+                    @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+                    push!(orphans_remove, checkpoint1, checkpoint2)
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    if r.do_break || r.do_interrupt
+                        pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        break
+                    end
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                    break
+                    continue
                 end
+
+                # remove checkpoint 2
+                try
+                    options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
+                    journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                    # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
+                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+                    options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
+                catch e
+                    @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+                    push!(orphans_remove, checkpoint2)
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    if r.do_break || r.do_interrupt
+                        pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
+                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        break
+                    end
+                end
+
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                continue
             end
-
-            # remove checkpoint 1
-            try
-                options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
-                journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
-                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
-            catch e
-                @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
-                push!(orphans_remove, checkpoint1, checkpoint2)
-                epmap_eloop.interrupted = r.do_interrupt
-                epmap_eloop.errored = r.do_error
-                if r.do_break || r.do_interrupt
-                    pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
-                    break
-                end
-                epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                continue
-            end
-
-            # remove checkpoint 2
-            try
-                options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
-                journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
-                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
-            catch e
-                @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
-                r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
-                push!(orphans_remove, checkpoint2)
-                epmap_eloop.interrupted = r.do_interrupt
-                epmap_eloop.errored = r.do_error
-                if r.do_break || r.do_interrupt
-                    pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
-                    break
-                end
-            end
-
-            epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
+        catch e
+            @warn "reduce, uncaught exception in worker loop for pid=$pid"
+            logerror(e, Logging.Warn)
+            @debug "reduce, putting $pid onto remove channel"
+            isopen(epmap_eloop.pid_channel_reduce_remove) && put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+            @debug "reduce, done putting $pid onto remove channel"
         end
     end
     @debug "reduce, exited the reduce worker loop"
