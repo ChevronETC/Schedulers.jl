@@ -1012,3 +1012,37 @@ end
     @test mapreduce(file->startswith("checkpoint", file), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
+
+@testset "pid_tsk_monitor!, map" begin
+    options = SchedulerOptions()
+    tasks = [1:5;]
+    eloop = Schedulers.ElasticLoop(Nothing, tasks, options; isreduce=false)
+
+    pid_tsks = Dict{Int,Task}()
+    pid_tsks[2] = @async error("")
+    pid_tsks[3] = @async 1
+    pid_tsks[4] = @async sleep(12)
+    sleep(3)
+    Schedulers.pid_tsk_monitor!(eloop.pid_channel_map_remove, pid_tsks)
+    @test take!(eloop.pid_channel_map_remove) == (2, true)
+    @test !isready(eloop.pid_channel_map_remove)
+    @test haskey(pid_tsks, 4)
+    @test length(pid_tsks) == 1
+end
+
+@testset "pid_tsk_monitor!, reduce" begin
+    options = SchedulerOptions()
+    tasks = [1:5;]
+    eloop = Schedulers.ElasticLoop(Nothing, tasks, options; isreduce=true)
+
+    pid_tsks = Dict{Int,Task}()
+    pid_tsks[2] = @async error("")
+    pid_tsks[3] = @async 1
+    pid_tsks[4] = @async sleep(12)
+    sleep(3)
+    Schedulers.pid_tsk_monitor!(eloop.pid_channel_reduce_remove, pid_tsks)
+    @test take!(eloop.pid_channel_reduce_remove) == (2, true)
+    @test !isready(eloop.pid_channel_reduce_remove)
+    @test haskey(pid_tsks, 4)
+    @test length(pid_tsks) == 1
+end
