@@ -472,7 +472,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, retries=0, timeout_multiplier=70)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, retries=0, timeout_function_multiplier=70)
     x,tsks = epmapreduce!(zeros(Float32,10), options, foo7c, 1:100, a, b)
 
     rmprocs(workers())

@@ -305,6 +305,7 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, f, pid, args...
     tic = time()
     while !istaskdone(tsk)
         if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.cutoff_time[], options.null_tsk_runtime_threshold, options.grace_period_ratio)
+            interrupt(pid)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
@@ -1354,7 +1355,6 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
             # delete old checkpoint
             old_checkpoint,epmap_eloop.checkpoints[pid] = get(epmap_eloop.checkpoints, pid, nothing),_next_checkpoint
-            @show "GXTEST", pid, old_checkpoint,epmap_eloop.checkpoints[pid]
             try
                 if old_checkpoint !== nothing
                     @debug "deleting old checkpoint"
