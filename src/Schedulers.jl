@@ -957,7 +957,9 @@ and `pmap_kwargs` are as follows.
 * `quantum=()->32` the maximum number of workers to elastically add at a time
 * `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
-* `preempted=()->false` method for determining of a machine got pre-empted (removed on purpose)[2]
+* `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[2].
+* `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
+* `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
 * `reporttasks=true` log task assignment
 * `journal_init_callback=tsks->nothing` additional method when intializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
@@ -1099,6 +1101,9 @@ and `epmap_kwargs` are as follows.
 * `quantum=()->32` the maximum number of workers to elastically add at a time
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
+* `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
+* `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
+* `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
 * `scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
 * `reporttasks=true` log task assignment
 * `journalfile=""` write a journal showing what was computed where to a json file
