@@ -1643,9 +1643,13 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     end
     @debug "reduce, exited the reduce worker loop"
 
+    length(epmap_eloop.reduce_checkpoints) == 0 && @warn "there are no checkpoints to reduce indicating that no tasks were run"
+
     for i in 1:10
         try
-            options.reducer!(result, load_checkpoint(options.load_checkpoint, epmap_eloop.reduce_checkpoints[1], T))
+            if length(epmap_eloop.reduce_checkpoints) > 0
+                options.reducer!(result, load_checkpoint(options.load_checkpoint, epmap_eloop.reduce_checkpoints[1], T))
+            end
             break
         catch e
             s = min(2.0^(i-1), 60.0) + rand()
@@ -1661,10 +1665,12 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     @debug "deleting orphaned checkpoints"
     if !(options.keepcheckpoints)
-        try
-            options.rm_checkpoint(epmap_eloop.reduce_checkpoints[1])
-        catch
-            @warn "unable to remove final checkpoint $(epmap_eloop.reduce_checkpoints[1])"
+        for checkpoint in epmap_eloop.reduce_checkpoints
+            try
+                options.rm_checkpoint(checkpoint)
+            catch
+                @warn "unable to remove final checkpoint $checkpoint"
+            end
         end
         for checkpoint in orphans_remove
             try
