@@ -1012,3 +1012,29 @@ end
     @test mapreduce(file->startswith(file, "checkpoint"), +, ["x";readdir(tmpdir)]) == 0
     rm(tmpdir; recursive=true, force=true)
 end
+
+@testset "epmapreduce! no tasks completed" begin
+    tmpdir = mktempdir(;cleanup=false)
+
+    function foo7(x, tsk, iter)
+        @show iter
+        if iter < 3
+            sleep(2)
+        else
+            sleep(10)
+        end
+        error("I don't want the task to complete, iteration=$iter")
+    end
+
+    options = SchedulerOptions(;scratch=tmpdir, skip_tasks_that_timeout=true, minworkers=0, maxworkers=1, timeout_multiplier=2)
+
+    global it = Ref{Int}(1)
+    function getiter(it)
+        it[] = it[] + 1
+    end
+    x,tsks = epmapreduce!(zeros(Float32,10), options, (x,i)->(getiter(it); foo7(x, i, it[])), 1:1)
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+    @test x ≈ zeros(Float32, 10)
+    @test tsks == [1]
+end
