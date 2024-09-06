@@ -155,7 +155,8 @@ const _pid_up_timestamp = Dict{Int, Float64}()
 mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
     epmap_use_master::Bool
     initialized_pids::Set{Int}
-    used_pids::Set{Int}
+    used_pids_map::Set{Int}
+    used_pids_reduce::Set{Int}
     pid_channel_map_add::Channel{Int}
     pid_channel_map_remove::Channel{Tuple{Int,Bool}}
     pid_channel_reduce_add::Channel{Int}
@@ -175,7 +176,6 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     tsk_pool_timed_out::Vector{T}
     tsk_pool_reduced::Vector{T}
     tsk_count::Int
-    reduce_machine_count::Int
     reduce_checkpoints::Vector{C}
     reduce_checkpoints_snapshot::Vector{C}
     checkpoints_are_flushed::Bool
@@ -192,6 +192,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.usemaster,
         options.usemaster ? Set{Int}() : Set(1),
         options.usemaster ? Set{Int}() : Set(1),
+        Set{Int}(),
         Channel{Int}(32),
         Channel{Tuple{Int,Bool}}(32),
         Channel{Int}(32),
@@ -211,7 +212,6 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         empty(_tsk_pool_todo),
         empty(_tsk_pool_todo),
         length(_tsk_pool_todo),
-        0,
         C[],
         C[],
         false,
@@ -500,8 +500,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     is_tasks_done_message_sent = false
     is_reduce_done_message_sent = false
 
-    eloop.reduce_machine_count = 0
-
     while true
         @debug "checking for interrupt=$(eloop.interrupted), error=$(eloop.errored)"
         yield()
@@ -631,9 +629,9 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
-        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids && pid ∉ bad_pids), workers())
+        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
 
-        @debug "workers()=$(workers()), free_pids=$free_pids, used_pids=$(eloop.used_pids), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
+        @debug "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce) bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
         yield()
 
         @debug "checking for reduction trigger"
@@ -641,25 +639,23 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         @debug "trigger=$(eloop.is_reduce_triggered)"
 
         for free_pid in free_pids
-            push!(eloop.used_pids, free_pid)
-
             if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed) && length(eloop.checkpoints) == 0
                 eloop.reduce_checkpoints_snapshot = copy(eloop.reduce_checkpoints)
                 eloop.checkpoints_are_flushed = true
             end
 
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
-            @debug "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(eloop.reduce_machine_count)"
+            @debug "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))"
 
-            if is_more_tasks && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints_snapshot), 2) <= eloop.reduce_machine_count
+            wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
+            if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
                 @debug "putting pid=$free_pid onto map channel"
+                push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > eloop.reduce_machine_count
+            elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
                 @debug "putting pid=$free_pid onto reduce channel"
+                push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
-                eloop.reduce_machine_count += 1
-            else
-                free_pid ∈ eloop.used_pids && pop!(eloop.used_pids, free_pid)
             end
         end
 
@@ -679,7 +675,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         end
 
         @debug "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)"
-        @debug "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, and $(length(eloop.used_pids)) busy procs inclusive of process 1)"
+        @debug "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, $(length(eloop.used_pids_map)) map workers, and $(length(eloop.used_pids_reduce)) reduce workers)"
 
         if istaskdone(tsk_addrmprocs)
             try
@@ -698,7 +694,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 tsk_addrmprocs_tic = time()
                 tsk_addrmprocs = @async begin
                     if δ < 0
-                        free_pids = filter(pid->pid ∉ eloop.used_pids, workers())
+                        free_pids = filter(pid->pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
                         push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
                     end
                     @debug "calling rmprocs on $rm_pids"
@@ -737,8 +733,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 yield()
                 isbad && push!(bad_pids, pid)
                 @debug "map channel, $pid is initialized, removing from used_pids"
-                pid ∈ eloop.used_pids && pop!(eloop.used_pids, pid)
-                @debug "map channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids)"
+                pid ∈ eloop.used_pids_map && pop!(eloop.used_pids_map, pid)
+                @debug "map channel, done removing $pid from used_pids_map, used_pids_map=$(eloop.used_pids_map)"
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when removing workers from map"
@@ -750,13 +746,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         try
             while isready(eloop.pid_channel_reduce_remove)
                 pid,isbad = take!(eloop.pid_channel_reduce_remove)
-                eloop.reduce_machine_count -= 1
                 @debug "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized"
                 yield()
                 isbad && push!(bad_pids, pid)
                 @debug "reduce_channel, $pid is initialied, removing from used_pids"
-                pid ∈ eloop.used_pids && pop!(eloop.used_pids, pid)
-                @debug "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids)"
+                pid ∈ eloop.used_pids_reduce && pop!(eloop.used_pids_reduce, pid)
+                @debug "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)"
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when removing workers from reduce"
@@ -1473,8 +1468,15 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = true
 
-                @debug "reduce, pid=$pid, at exit condition, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
-                if length(epmap_eloop.reduce_checkpoints) < 2
+                @debug "reduce, waiting for lock on pid=$pid"
+                lock(l)
+                @debug "reduce, got lock on pid=$pid"
+
+                n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
+
+                @debug "reduce, pid=$pid, at exit condition, n_checkpoints=$n_checkpoints"
+                if n_checkpoints < 2
+                    unlock(l)
                     @debug "reduce, popping pid=$pid from dirty list"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     @debug "reduce, putting $pid onto reduce remove channel"
@@ -1483,15 +1485,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     break
                 end
 
-                @debug "reduce, waiting for lock on pid=$pid"
-                lock(l)
-                @debug "reduce, got lock on pid=$pid"
-
-                n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
-
                 # reduce two checkpoints into a third checkpoint
                 if n_checkpoints > 1
-                    @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(epmap_eloop.reduce_machine_count) reduce workers)."
+                    @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(length(epmap_eloop.used_pids_reduce)) reduce workers)."
                     local checkpoint1
                     try
                         @debug "reduce, popping first checkpoint, pid=$pid"
