@@ -806,7 +806,7 @@ end
         r .+= i
         sleep(5)
         nothing
-        end
+    end
 
     function my_reduce_trigger(eloop, ntasks)
         if length(complete_tasks(eloop)) - ntasks[] > 50
