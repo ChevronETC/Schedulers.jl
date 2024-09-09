@@ -671,7 +671,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             # note that 1. we will only remove a machine if it is not in the 'eloop.used_pids' vector.
             # and 2. we will only remove machines if we are left with at least epmap_minworkers.
             if _epmap_nworkers + δ < _epmap_minworkers
-                δ = _epmap_minworkers - _epmap_nworkers
+                δ = min(_epmap_minworkers - _epmap_nworkers, _epmap_quantum)
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when computing the number of new machines to add"
