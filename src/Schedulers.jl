@@ -184,7 +184,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     interrupted::Bool
     errored::Bool
     pid_failures::Dict{Int,Int}
-    cutoff_time::Ref{Float64}
+    grace_period_start_time::Float64
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
@@ -224,7 +224,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         false,
         false,
         Dict{Int,Int}(),
-        Ref(Inf),
+        Inf,
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
@@ -314,7 +314,7 @@ function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, pree
 end
 
 function robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
-    tsk_times_robust = tsk_times[tsk_times .> null_tsk_runtime_threshold]
+    tsk_times_robust = filter(tsk_time->tsk_time > null_tsk_runtime_threshold, tsk_times)
     if length(tsk_times_robust) >= 0.3 * tsk_count     # Start statistics after 30% of the tasks are done
         return sum(tsk_times_robust) / length(tsk_times_robust)
     else
@@ -322,12 +322,12 @@ function robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
     end
 end
 
-function check_timeout_status(tic, tsk_times, tsk_count, timeout_function_multiplier, cutoff_time_value, null_tsk_runtime_threshold, grace_period_ratio)
+function check_timeout_status(tic, tsk_times, tsk_count, timeout_function_multiplier, grace_period_start_time, null_tsk_runtime_threshold, grace_period_ratio)
     toc = time()
     average_task_time = robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
     if toc - tic > average_task_time * timeout_function_multiplier
         is_timeout = true
-    elseif toc - cutoff_time_value > grace_period_ratio * average_task_time
+    elseif toc - grace_period_start_time > grace_period_ratio * average_task_time
         is_timeout = true
     else
         is_timeout = false
@@ -339,7 +339,7 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
     t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
     while !istaskdone(t)
-        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.cutoff_time[], options.null_tsk_runtime_threshold, options.grace_period_ratio)
+        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
@@ -364,7 +364,8 @@ function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxer
     fails[pid] += 1
     nerrors = sum(values(fails))
 
-    # GXTODO: double check here: bad_pid = false?
+    # If the task times out than we make the conservative assumption that there might be something
+    # wrong with the machine it is running on, hence we set bad_pid=true.
     r = (bad_pid = true, do_break=true, do_interrupt=false, do_error=false)
 
     if nerrors >= epmap_maxerrors
@@ -563,7 +564,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         end
 
         if (length(eloop.tsk_pool_done) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio)) && !is_grace_period
-            eloop.cutoff_time[] = time()
+            eloop.grace_period_start_time = time()
             is_grace_period = true
         end
         is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
@@ -1183,7 +1184,6 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
-# GXTODO: add doc
 ## Notes
 [1] The signiture is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
