@@ -535,7 +535,7 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, retries=0, timeout_multiplier=70)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, retries=0, timeout_function_multiplier=70)
     x,tsks = epmapreduce!(zeros(Float32,10), options, foo7c, 1:100, a, b)
 
     rmprocs(workers())
@@ -1026,7 +1026,7 @@ end
         error("I don't want the task to complete, iteration=$iter")
     end
 
-    options = SchedulerOptions(;scratch=tmpdir, skip_tasks_that_timeout=true, minworkers=0, maxworkers=1, timeout_multiplier=2)
+    options = SchedulerOptions(;scratch=tmpdir, skip_tasks_that_timeout=true, minworkers=0, maxworkers=1, timeout_function_multiplier=2)
 
     global it = Ref{Int}(1)
     function getiter(it)
@@ -1037,4 +1037,39 @@ end
     rm(tmpdir; recursive=true, force=true)
     @test x ≈ zeros(Float32, 10)
     @test tsks == [1]
+end
+
+@testset "epmapreduce! slow/late task termination" begin
+    safe_addprocs(5)
+    
+    @everywhere function fg!(g, ishot, c)
+        tsk_len = [30, 1,  15, 1]
+        tsk_num = [1,  10, 1, 10]
+        timetable = vcat([fill(tsk_len[i], tsk_num[i]) for i in 1:length(tsk_len)]...)
+        sleep(timetable[ishot])
+        g .+= ishot * c
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+
+    options = SchedulerOptions(;
+        scratch=tmpdir,
+        maxworkers = 5,
+        timeout_function_multiplier = 2.,
+        null_tsk_runtime_threshold = 0.1,
+        skip_tsk_tol_ratio = 0.3,
+        grace_period_ratio = 0.1,
+        skip_tasks_that_timeout = true,
+    )
+
+    g = zeros(Float32, 5)
+    g, tsks = epmapreduce!(g, options, fg!, 1 : 22, 2)
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+
+    @test 1 ∈ tsks
+    @test 12 ∈ tsks
+    @test length(tsks) > 2
+    @test g == ones(size(g)) .* (sum([1 : 22;]) - sum(tsks)) * 2
 end

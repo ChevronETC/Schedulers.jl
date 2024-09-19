@@ -184,6 +184,10 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     interrupted::Bool
     errored::Bool
     pid_failures::Dict{Int,Int}
+    grace_period_start_time::Float64
+    null_tsk_runtime_threshold::Float64
+    skip_tsk_tol_ratio::Float64
+    grace_period_ratio::Float64
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -219,7 +223,11 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         Dict{Int,Union{Nothing,C}}(),
         false,
         false,
-        Dict{Int,Int}()
+        Dict{Int,Int}(),
+        Inf,
+        options.null_tsk_runtime_threshold,
+        options.skip_tsk_tol_ratio,
+        options.grace_period_ratio,
     )
 
     if !isreduce
@@ -305,6 +313,44 @@ function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, pree
     fetch(t)
 end
 
+function robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
+    tsk_times_robust = filter(tsk_time->tsk_time > null_tsk_runtime_threshold, tsk_times)
+    if length(tsk_times_robust) >= 0.3 * tsk_count     # Start statistics after 30% of the tasks are done
+        return sum(tsk_times_robust) / length(tsk_times_robust)
+    else
+        return Inf
+    end
+end
+
+function check_timeout_status(tic, tsk_times, tsk_count, timeout_function_multiplier, grace_period_start_time, null_tsk_runtime_threshold, grace_period_ratio)
+    toc = time()
+    average_task_time = robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count)
+    if toc - tic > average_task_time * timeout_function_multiplier
+        is_timeout = true
+    elseif toc - grace_period_start_time > grace_period_ratio * average_task_time
+        is_timeout = true
+    else
+        is_timeout = false
+    end
+    return is_timeout
+end
+
+function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
+    t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
+    tic = time()
+    while !istaskdone(t)
+        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio)
+            throw(TimeoutException(pid, time() - tic))
+        end
+        sleep(1)
+    end
+    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    if istaskfailed(t)
+        fetch(t)
+    end
+    nothing
+end
+
 remotecall_default_threadpool(f, pid, args...; kwargs...) = remotecall(default_threadpool_checkpoint_call, pid, nothing, tsk->nothing, tsk->nothing, 0, f, args...; kwargs...)
 
 function handle_exception(e::PreemptException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
@@ -318,6 +364,8 @@ function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxer
     fails[pid] += 1
     nerrors = sum(values(fails))
 
+    # If the task times out than we make the conservative assumption that there might be something
+    # wrong with the machine it is running on, hence we set bad_pid=true.
     r = (bad_pid = true, do_break=true, do_interrupt=false, do_error=false)
 
     if nerrors >= epmap_maxerrors
@@ -499,6 +547,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
     is_tasks_done_message_sent = false
     is_reduce_done_message_sent = false
+    is_grace_period = false
 
     while true
         @debug "checking for interrupt=$(eloop.interrupted), error=$(eloop.errored)"
@@ -514,6 +563,10 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
+        if (length(eloop.tsk_pool_done) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio)) && !is_grace_period
+            eloop.grace_period_start_time = time()
+            is_grace_period = true
+        end
         is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
         is_more_tasks = length(eloop.tsk_pool_todo) > 0
         is_reduce_active = reduce_checkpoints_is_dirty(eloop) || length(eloop.reduce_checkpoints) > 1 || length(eloop.checkpoints) > 0
@@ -803,6 +856,10 @@ mutable struct SchedulerOptions{C}
     retries::Int
     maxerrors::Int
     timeout_multiplier::Float64
+    timeout_function_multiplier::Float64
+    null_tsk_runtime_threshold::Float64
+    skip_tsk_tol_ratio::Float64
+    grace_period_ratio::Float64
     skip_tasks_that_timeout::Bool
     minworkers::Function
     maxworkers::Function
@@ -837,6 +894,10 @@ function SchedulerOptions(;
         retries = 0,
         maxerrors = typemax(Int),
         timeout_multiplier = 5,
+        timeout_function_multiplier = 5,
+        null_tsk_runtime_threshold = 0.,
+        skip_tsk_tol_ratio = 0,
+        grace_period_ratio = 0,
         skip_tasks_that_timeout = false,
         minworkers = Distributed.nworkers,
         maxworkers = Distributed.nworkers,
@@ -869,6 +930,10 @@ function SchedulerOptions(;
         retries,
         maxerrors,
         Float64(timeout_multiplier),
+        Float64(timeout_function_multiplier),
+        Float64(null_tsk_runtime_threshold),
+        Float64(skip_tsk_tol_ratio),
+        Float64(grace_period_ratio),
         skip_tasks_that_timeout,
         isa(minworkers, Function) ? minworkers : ()->minworkers,
         isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
@@ -903,6 +968,10 @@ function Base.copy(options::SchedulerOptions)
         options.retries,
         options.maxerrors,
         options.timeout_multiplier,
+        options.timeout_function_multiplier,
+        options.null_tsk_runtime_threshold,
+        options.skip_tsk_tol_ratio,
+        options.grace_period_ratio,
         options.skip_tasks_that_timeout,
         options.minworkers,
         options.maxworkers,
@@ -943,7 +1012,11 @@ and `pmap_kwargs` are as follows.
 ## epmap_kwargs
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
-* `timeout_multiplier=5` if any task takes `timeout_multiplier` longer than the mean task time, then abort that task
+* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
+* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) mean (actual) task time, then abort that task
+* `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
+* `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
+* `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) average task time
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
@@ -958,7 +1031,7 @@ and `pmap_kwargs` are as follows.
 * `reporttasks=true` log task assignment
 * `journal_init_callback=tsks->nothing` additional method when intializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
-
+# GXTODO: add doc
 ## Notes
 [1] The number of machines provisioned may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
@@ -1029,7 +1102,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                     options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                     yield()
                     journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                    remotecall_wait_timeout(tsk_times, eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
+                    remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                     push!(eloop.tsk_pool_done, tsk)
                     @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
@@ -1087,7 +1160,11 @@ and `epmap_kwargs` are as follows.
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
-* `timeout_multiplier=5` if any task takes `timeout_multiplier` longer than the mean task time, then abort that task
+* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
+* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) mean (actual) task time, then abort that task
+* `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
+* `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
+* `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) average task time
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
@@ -1107,7 +1184,6 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
-
 ## Notes
 [1] The signiture is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
@@ -1293,7 +1369,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                     yield()
                     journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
-                    remotecall_wait_timeout(tsk_times, epmap_eloop.tsk_count, options.timeout_multiplier, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
+                    remotecall_func_wait_timeout(tsk_times, epmap_eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                     @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
                 catch e
