@@ -648,7 +648,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         if _epmap_minworkers > _epmap_maxworkers
             @warn "epmap_minworkers > epmap_maxworkers, setting epmap_minworkers to epmap_maxworkers"
             _epmap_minworkers = _epmap_maxworkers
-        end
+        else
             _epmap_maxworkers = _epmap_minworkers
         end
 
