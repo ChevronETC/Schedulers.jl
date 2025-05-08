@@ -645,6 +645,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             continue
         end
 
+        if _epmap_minworkers > _epmap_maxworkers
+            @warn "epmap_minworkers > epmap_maxworkers, setting epmap_minworkers to epmap_maxworkers"
+            _epmap_minworkers = _epmap_maxworkers
+        end
+
         uninitialized_pids = filter(pid->(pid ∉ initializing_pids && pid ∉ eloop.initialized_pids), workers())
 
         for uninitialized_pid in uninitialized_pids

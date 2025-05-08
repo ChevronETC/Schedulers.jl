@@ -1073,3 +1073,14 @@ end
     @test length(tsks) > 2
     @test g == ones(size(g)) .* (sum([1 : 22;]) - sum(tsks)) * 2
 end
+
+@testset "minworkers > maxworkers" begin
+    options = SchedulerOptions(;minworkers=10, maxworkers=5)
+
+    tsk = @async epmap(SchedulerOptions(;minworkers=10, maxworkers=5), x->2 .* x, 1:10)
+
+    while !istaskdone(tsk)
+        @test nworkers() <= 5
+        sleep(0.01)
+    end
+end
