@@ -1795,6 +1795,8 @@ default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
+include("epmap_collect.jl")
+
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
 
 end
