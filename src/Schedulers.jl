@@ -578,7 +578,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             put!(eloop.pid_channel_map_add, -1)
             is_tasks_done_message_sent = true
         end
-        
+
         @debug "check for complete reduction when tasks are done ($is_tasks_done) and reduce is not active ($(!is_reduce_active)), and there are no more checkpoints: ($(length(eloop.reduce_checkpoints)) pending, $(length(eloop.checkpoints)) active, $(length(filter(v->v, collect(values(eloop.reduce_checkpoints_is_dirty))))) dirty)"
         if is_tasks_done && !is_reduce_active
             @debug "elastic loop, check for open reduce channel, and if the reduce done message is already sent, isopen(eloop.pid_channel_reduce_add)=$(isopen(eloop.pid_channel_reduce_add)), is_reduce_done_message_sent=$is_reduce_done_message_sent"
@@ -635,7 +635,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             isopen(eloop.pid_channel_reduce_remove) && close(eloop.pid_channel_reduce_remove)
             break
         end
-        
+
         local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum
         try
             _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_quantum()
@@ -807,7 +807,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 @debug "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized"
                 yield()
                 isbad && push!(bad_pids, pid)
-                @debug "reduce_channel, $pid is initialied, removing from used_pids"
+                @debug "reduce_channel, $pid is initialized, removing from used_pids"
                 pid ∈ eloop.used_pids_reduce && pop!(eloop.used_pids_reduce, pid)
                 @debug "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)"
             end
@@ -1034,19 +1034,19 @@ and `pmap_kwargs` are as follows.
 * `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
 * `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
 * `reporttasks=true` log task assignment
-* `journal_init_callback=tsks->nothing` additional method when intializing the journal
+* `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
 # GXTODO: add doc
 ## Notes
 [1] The number of machines provisioned may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
-[2] For example, on Azure Cloud a SPOT instance will be pre-empted if someone is willing to pay more for it
+[2] For example, on Azure Cloud a SPOT instance will be pre-emptied if someone is willing to pay more for it
 """
 function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...)
     eloop = ElasticLoop(Nothing, tasks, options; isreduce=false)
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
-    
+
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
     loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
     fetch(tsk_map)
@@ -1069,7 +1069,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         try
             preempt_channel_future = options.preempt_channel_future(pid)
         catch
-            @warn "failed to retreive preempt_channel_future.  checkpoint/restart functionality disabled."
+            @warn "failed to retrieve preempt_channel_future.  checkpoint/restart functionality disabled."
             preempt_channel_future = nothing
         end
 
@@ -1154,7 +1154,7 @@ epmap(f::Function, tasks, args...; kwargs...) = epmap(SchedulerOptions(), f, tas
 where `f` is the map function, and `tasks` are an iterable set of tasks to map over.  The
 positional arguments `args` and the named arguments `kwargs` are passed to `f` which has
 the method signature: `f(localresult, f, task, args; kwargs...)`.  `localresult` is
-the assoicated partial reduction contribution to `result`.  `epmapreduce!` is parameterized
+the associated partial reduction contribution to `result`.  `epmapreduce!` is parameterized
 by `options::SchedulerOptions` and can be built using `options=SchedulerOptions(;epmap_kwargs...)`
 and `epmap_kwargs` are as follows.
 
@@ -1162,7 +1162,7 @@ and `epmap_kwargs` are as follows.
 * `reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
 * `save_checkpoint = default_save_checkpoint` the method used to save checkpoints[1]
 * `load_checkpoint = default_load_checkpoint` the method used to load a checkpoint[2]
-* `zeros = ()->zeros(eltype(result), size(result))` the method used to initiaize partial reductions
+* `zeros = ()->zeros(eltype(result), size(result))` the method used to initialize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
 * `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
@@ -1181,18 +1181,18 @@ and `epmap_kwargs` are as follows.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
 * `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
 * `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
-* `scratch=["/scratch"]` storage location accesible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
+* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
 * `reporttasks=true` log task assignment
 * `journalfile=""` write a journal showing what was computed where to a json file
-* `journal_init_callback=tsks->nothing` additional method when intializing the journal
+* `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
 ## Notes
-[1] The signiture is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
+[1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
-[2] The signiture is `my_load_checkpoint(checkpoint_file)` where `checkpoint_file` is the file that
+[2] The signature is `my_load_checkpoint(checkpoint_file)` where `checkpoint_file` is the file that
 data will be loaded from.
 [3] The number of machines provisioined may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
@@ -1202,7 +1202,7 @@ This can be useful if you are, for example, constrained by cloud storage through
 
 # Examples
 ## Example 1
-With the assumption that `/scratch` is accesible from all workers:
+With the assumption that `/scratch` is accessible from all workers:
 ```
 using Distributed
 addprocs(2)
@@ -1307,7 +1307,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         @debug "map, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
-        
+
         if pid ∈ keys(localresults) # task loop has already run for this pid
             put!(epmap_eloop.pid_channel_map_remove, (pid,false))
             continue
@@ -1325,7 +1325,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         try
             preempt_channel_future = options.preempt_channel_future(pid)
         catch
-            @warn "failed to retreive preempt_channel_future.  checkpoint/restart functionality disabled."
+            @warn "failed to retrieve preempt_channel_future.  checkpoint/restart functionality disabled."
             preempt_channel_future = nothing
         end
 

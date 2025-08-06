@@ -231,7 +231,7 @@ end
         @test r_tsk == "$tsk"
         rm(joinpath(tempdir(), "task-$s-$tsk.txt"))
     end
-    
+
     for (key,value) in h
         @test value ∈ 10:50
     end
@@ -354,7 +354,7 @@ end
     rm.(files)
 end
 
-@testset "pmapreduce, stable cluster test, backwards compatability" begin
+@testset "pmapreduce, stable cluster test, backwards compatibility" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
     @everywhere function foo6(x, tsk, a; b)
@@ -441,7 +441,7 @@ end
         sleep(1)
         nothing
     end
-    
+
     @everywhere function test_save_checkpoint(checkpoint, localresult)
         x = rand()
         if x > 0.8
@@ -449,7 +449,7 @@ end
         end
         Schedulers.default_save_checkpoint(checkpoint, localresult)
     end
-    
+
     @everywhere function test_load_checkpoint(checkpoint)
         x = rand()
         if x > 0.8
@@ -1041,7 +1041,7 @@ end
 
 @testset "epmapreduce! slow/late task termination" begin
     safe_addprocs(5)
-    
+
     @everywhere function fg!(g, ishot, c)
         tsk_len = [30, 1,  15, 1]
         tsk_num = [1,  10, 1, 10]
