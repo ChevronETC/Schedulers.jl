@@ -51,7 +51,7 @@ end
 
 function journal_write(journal, filename)
     if !isempty(filename)
-        write(filename, json(journal, 2))
+        write(filename, JSON.json(journal, 2))
     end
 end
 
