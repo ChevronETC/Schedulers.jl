@@ -1104,13 +1104,13 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 end
 
                 try
-                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
                     yield()
                     journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                     remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                     push!(eloop.tsk_pool_done, tsk)
-                    @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
+                    @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                     yield()
                 catch e
                     @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
@@ -1371,12 +1371,12 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 # compute and reduce
                 try
-                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                     yield()
                     journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                     remotecall_func_wait_timeout(tsk_times, epmap_eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                    @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
+                    @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
                 catch e
                     @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
@@ -1568,7 +1568,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
                 # reduce two checkpoints into a third checkpoint
                 if n_checkpoints > 1
-                    @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) workers, $(length(epmap_eloop.used_pids_reduce)) reduce workers)."
+                    @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) julia workers, $(options.nworkers()) provisioned workers, $(length(epmap_eloop.used_pids_reduce)) reduce workers)."
                     local checkpoint1
                     try
                         @debug "reduce, popping first checkpoint, pid=$pid"
