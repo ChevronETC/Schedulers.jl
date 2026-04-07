@@ -376,6 +376,11 @@ function handle_exception(e::TimeoutException, pid, hostname, fails, epmap_maxer
     r
 end
 
+# the use of async tasks to allow for timeout logic means we need to handle TaskFailedException's which, in turn, wraps their tasks whose result should be an exception:
+function handle_exception(e::TaskFailedException, pid, hostname, fails, epmap_maxerrors, epmap_retries)
+    handle_exception(e.task.result, pid, hostname, fails, epmap_maxerrors, epmap_retries)
+end
+
 function handle_exception(e, pid, hostname, fails, epmap_maxerrors, epmap_retries)
     logerror(e, Logging.Warn)
 
