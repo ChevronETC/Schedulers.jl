@@ -197,10 +197,10 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.usemaster ? Set{Int}() : Set(1),
         options.usemaster ? Set{Int}() : Set(1),
         Set{Int}(),
-        Channel{Int}(32),
-        Channel{Tuple{Int,Bool}}(32),
-        Channel{Int}(32),
-        Channel{Tuple{Int,Bool}}(32),
+        Channel{Int}(Inf),
+        Channel{Tuple{Int,Bool}}(Inf),
+        Channel{Int}(Inf),
+        Channel{Tuple{Int,Bool}}(Inf),
         Channel{Bool}(1),
         options.addprocs,
         options.init,
@@ -694,14 +694,51 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
+        @debug "checking for workers sent from the map"
+        yield()
+        try
+            while isready(eloop.pid_channel_map_remove)
+                pid,isbad = take!(eloop.pid_channel_map_remove)
+                @debug "map channel, received pid=$pid, making sure that it is initialized"
+                yield()
+                isbad && push!(bad_pids, pid)
+                @debug "map channel, $pid is initialized, removing from used_pids"
+                pid ∈ eloop.used_pids_map && pop!(eloop.used_pids_map, pid)
+                @debug "map channel, done removing $pid from used_pids_map, used_pids_map=$(eloop.used_pids_map)"
+            end
+        catch e
+            @warn "problem in Schedulers.jl elastic loop when removing workers from map"
+            logerror(e, Logging.Debug)
+        end
+
+        @debug "checking for workers sent from the reduce"
+        yield()
+        try
+            while isready(eloop.pid_channel_reduce_remove)
+                pid,isbad = take!(eloop.pid_channel_reduce_remove)
+                @debug "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized"
+                yield()
+                isbad && push!(bad_pids, pid)
+                @debug "reduce_channel, $pid is initialized, removing from used_pids"
+                pid ∈ eloop.used_pids_reduce && pop!(eloop.used_pids_reduce, pid)
+                @debug "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)"
+            end
+        catch e
+            @warn "problem in Schedulers.jl elastic loop when removing workers from reduce"
+            logerror(e, Logging.Debug)
+        end
+
         free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
 
-        @debug "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
-        yield()
-
         @debug "checking for reduction trigger"
+        yield()
         reduce_trigger(eloop, journal, journal_task_callback)
         @debug "trigger=$(eloop.is_reduce_triggered)"
+        yield()
+
+        @debug "channel lengths, pid_channel_map_add=$(length(eloop.pid_channel_map_add.data)), pid_channel_map_remove=$(length(eloop.pid_channel_map_remove.data)), pid_channel_reduce_add=$(length(eloop.pid_channel_reduce_add.data)), pid_channel_reduce_remove=$(length(eloop.pid_channel_reduce_remove.data))"
+        @debug "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
+        yield()
 
         for free_pid in free_pids
             if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed) && length(eloop.checkpoints) == 0
@@ -711,6 +748,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
             @debug "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))"
+            yield()
 
             wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
             if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
@@ -787,40 +825,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         elseif time() - tsk_addrmprocs_tic > addrmprocs_timeout+10 && istaskdone(tsk_addrmprocs_interrupt)
             @warn "addprocs/rmprocs taking longer than expected, cancelling."
             tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmprocs, InterruptException())
-        end
-
-        @debug "checking for workers sent from the map"
-        yield()
-        try
-            while isready(eloop.pid_channel_map_remove)
-                pid,isbad = take!(eloop.pid_channel_map_remove)
-                @debug "map channel, received pid=$pid, making sure that it is initialized"
-                yield()
-                isbad && push!(bad_pids, pid)
-                @debug "map channel, $pid is initialized, removing from used_pids"
-                pid ∈ eloop.used_pids_map && pop!(eloop.used_pids_map, pid)
-                @debug "map channel, done removing $pid from used_pids_map, used_pids_map=$(eloop.used_pids_map)"
-            end
-        catch e
-            @warn "problem in Schedulers.jl elastic loop when removing workers from map"
-            logerror(e, Logging.Debug)
-        end
-
-        @debug "checking for workers sent from the reduce"
-        yield()
-        try
-            while isready(eloop.pid_channel_reduce_remove)
-                pid,isbad = take!(eloop.pid_channel_reduce_remove)
-                @debug "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized"
-                yield()
-                isbad && push!(bad_pids, pid)
-                @debug "reduce_channel, $pid is initialized, removing from used_pids"
-                pid ∈ eloop.used_pids_reduce && pop!(eloop.used_pids_reduce, pid)
-                @debug "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)"
-            end
-        catch e
-            @warn "problem in Schedulers.jl elastic loop when removing workers from reduce"
-            logerror(e, Logging.Debug)
         end
 
         @debug "sleeping for $polling_interval seconds"
@@ -1308,15 +1312,19 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
     # work loop
     @sync while true
-        @debug "map, iterrupted=$(epmap_eloop.interrupted)"
+        @debug "map, interrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
+        @debug "map, taking from pid_channel_map_add"
         pid = take!(epmap_eloop.pid_channel_map_add)
+        @debug "map, took from pid_channel_map_add, pid=$pid"
 
         @debug "map, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
         if pid ∈ keys(localresults) # task loop has already run for this pid
+            @debug "map, putting onto map_remove channel for pid=$pid since it is already in localresults"
             put!(epmap_eloop.pid_channel_map_remove, (pid,false))
+            @debug "map, done putting onto map_remove channel for pid=$pid"
             continue
         end
 
