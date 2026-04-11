@@ -197,10 +197,10 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.usemaster ? Set{Int}() : Set(1),
         options.usemaster ? Set{Int}() : Set(1),
         Set{Int}(),
-        Channel{Int}(32),
-        Channel{Tuple{Int,Bool}}(32),
-        Channel{Int}(32),
-        Channel{Tuple{Int,Bool}}(32),
+        Channel{Int}(Inf),
+        Channel{Tuple{Int,Bool}}(Inf),
+        Channel{Int}(Inf),
+        Channel{Tuple{Int,Bool}}(Inf),
         Channel{Bool}(1),
         options.addprocs,
         options.init,
@@ -697,6 +697,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
 
         @debug "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
+        @debug "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)"
         yield()
 
         @debug "checking for reduction trigger"
