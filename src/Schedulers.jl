@@ -697,7 +697,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
 
         @debug "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
-        @debug "channel lengths: map_add=$(length(eloop.pid_channel_map_add.data)), map_remove=$(length(eloop.pid_channel_map_remove.data)), reduce_add=$(length(eloop.pid_channel_reduce_add.data)), reduce_remove=$(length(eloop.pid_channel_reduce_remove.data))"
+        @debug "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)"
         yield()
 
         @debug "checking for reduction trigger"
