@@ -715,9 +715,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
             wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
             if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
-                @debug "putting pid=$free_pid onto map channel"
+                # @debug "putting pid=$free_pid onto map channel"
                 push!(eloop.used_pids_map, free_pid)
+                @info "putting pid onto map channel, pid=$free_pid"
                 put!(eloop.pid_channel_map_add, free_pid)
+                @info "done putting pid onto map channel, pid=$free_pid"
             elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
                 @debug "putting pid=$free_pid onto reduce channel"
                 push!(eloop.used_pids_reduce, free_pid)
@@ -1309,9 +1311,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
     # work loop
     @sync while true
-        @debug "map, iterrupted=$(epmap_eloop.interrupted)"
+        @debug "map, interrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
+        @info "map, taking pid from map channel"
         pid = take!(epmap_eloop.pid_channel_map_add)
+        @info "map, took pid from map channel, pid=$pid"
 
         @debug "map, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
@@ -1325,10 +1329,13 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
         # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
+        @debug "map, getting local result, pid=$pid"
         localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
+        @debug "map, done getting local result, pid=$pid"
 
         epmap_eloop.checkpoints[pid] = nothing
 
+        @debug "map, retrieving preempt channel future, pid=$pid"
         local preempt_channel_future
         try
             preempt_channel_future = options.preempt_channel_future(pid)
@@ -1336,12 +1343,15 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @warn "failed to retrieve preempt_channel_future.  checkpoint/restart functionality disabled."
             preempt_channel_future = nothing
         end
+        @debug "map, done retrieving preempt channel future, pid=$pid"
 
         @async try
             while true
                 if hostname == ""
                     try
+                        @debug "fetching hostname for pid=$pid with a timeout of 60 seconds"
                         hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                        @debug "fetched hostname for pid=$pid: $hostname"
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds."
                         logerror(e, Logging.Debug)
@@ -1368,6 +1378,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     break
                 end
 
+                @debug "map, getting next task for pid=$pid"
                 local tsk
                 try
                     tsk = popfirst!(epmap_eloop.tsk_pool_todo)
@@ -1376,6 +1387,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     yield()
                     continue
                 end
+                @debug "map, got next task for pid=$pid: $tsk"
 
                 # compute and reduce
                 try
