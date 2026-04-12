@@ -1327,12 +1327,6 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         hostname = ""
 
-        # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
-        # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
-        @debug "map, getting local result, pid=$pid"
-        localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
-        @debug "map, done getting local result, pid=$pid"
-
         epmap_eloop.checkpoints[pid] = nothing
 
         @debug "map, retrieving preempt channel future, pid=$pid"
@@ -1346,6 +1340,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @debug "map, done retrieving preempt channel future, pid=$pid"
 
         @async try
+            # This is an async remotecall.  Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
+            @debug "map, getting local result, pid=$pid"
+            localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
+            @debug "map, done getting local result, pid=$pid"
+
             while true
                 if hostname == ""
                     try
