@@ -1263,7 +1263,9 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
         end
 
         if options.zeros() === nothing
-            options.zeros = ()->zeros(eltype(result), size(result))::T
+            _et = eltype(result)
+            _sz = size(result)
+            options.zeros = ()->zeros(_et, _sz)::T
         end
 
         epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
@@ -1309,7 +1311,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
     # work loop
     @sync while true
-        @debug "map, iterrupted=$(epmap_eloop.interrupted)"
+        @debug "map, interrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
         pid = take!(epmap_eloop.pid_channel_map_add)
 
@@ -1323,12 +1325,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
         hostname = ""
 
-        # It is important that this is async in the event that the allocation in options.zeros is large, and takes a significant amount of time.
-        # Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
-        localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
-
         epmap_eloop.checkpoints[pid] = nothing
 
+        @debug "map, retrieving preempt channel future, pid=$pid"
         local preempt_channel_future
         try
             preempt_channel_future = options.preempt_channel_future(pid)
@@ -1336,12 +1335,21 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @warn "failed to retrieve preempt_channel_future.  checkpoint/restart functionality disabled."
             preempt_channel_future = nothing
         end
+        @debug "map, done retrieving preempt channel future, pid=$pid"
 
         @async try
+            # This is an async remotecall.  Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
+            # this is in the async block for the case where `options.zeros` sends a large amount of data to pid (should not be true in general)
+            @debug "map, getting local result, pid=$pid"
+            localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
+            @debug "map, done getting local result, pid=$pid"
+
             while true
                 if hostname == ""
                     try
+                        @debug "fetching hostname for pid=$pid with a timeout of 60 seconds"
                         hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                        @debug "fetched hostname for pid=$pid: $hostname"
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds."
                         logerror(e, Logging.Debug)
@@ -1368,6 +1376,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     break
                 end
 
+                @debug "map, getting next task for pid=$pid"
                 local tsk
                 try
                     tsk = popfirst!(epmap_eloop.tsk_pool_todo)
@@ -1376,6 +1385,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     yield()
                     continue
                 end
+                @debug "map, got next task for pid=$pid: $tsk"
 
                 # compute and reduce
                 try
