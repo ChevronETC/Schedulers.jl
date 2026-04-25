@@ -304,7 +304,7 @@ function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, pree
     t = @async remotecall_fetch(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
     while !istaskdone(t)
-        if tic - time() > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
+        if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
