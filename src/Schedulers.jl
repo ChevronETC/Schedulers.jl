@@ -1397,7 +1397,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
                 catch e
                     @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
-                    journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
+                    journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
                     if isa(e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task '$tsk' that timed out, compute/reduce step"
                         push!(epmap_eloop.tsk_pool_done, tsk)
