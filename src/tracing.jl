@@ -130,6 +130,9 @@ mutable struct TracingState
     previous_logger::Any
     all_io::Union{IOStream, Nothing}
     errors_io::Union{IOStream, Nothing}
+    log_channel::Union{RemoteChannel, Nothing}
+    drain_task::Union{Task, Nothing}
+    worker_ios::Dict{Int, IOStream}
 end
 
 # ── Setup / Teardown ──────────────────────────────────────────────────────────
@@ -160,9 +163,42 @@ function setup_tracing(config::TracingConfig)::TracingState
 
     previous_logger = Logging.global_logger(logger)
 
+    # Remote channel for worker log records
+    log_channel = RemoteChannel(() -> Channel{Dict{String,Any}}(256))
+    worker_ios = Dict{Int, IOStream}()
+
+    # Drain task: reads worker records from the channel and writes to all.jsonl + per-worker files
+    drain_task = @async begin
+        try
+            for record in log_channel
+                line = sprint(JSON.print, record) * "\n"
+                write(all_io, line)
+                flush(all_io)
+                # Write to per-worker file
+                pid = get(record, "worker_pid", nothing)
+                if pid !== nothing
+                    pid = Int(pid)
+                    if !haskey(worker_ios, pid)
+                        worker_ios[pid] = open(worker_trace_path(config, pid), "a")
+                    end
+                    write(worker_ios[pid], line)
+                    flush(worker_ios[pid])
+                end
+                # Also route errors to errors.jsonl
+                lvl = get(record, "level", "")
+                if lvl in ("Warn", "Error")
+                    write(errors_io, line)
+                    flush(errors_io)
+                end
+            end
+        catch e
+            e isa InvalidStateException || @debug "log drain error" exception=(e, catch_backtrace())
+        end
+    end
+
     @info "tracing started" run_id=config.run_id output_dir=dir
 
-    TracingState(config, previous_logger, all_io, errors_io)
+    TracingState(config, previous_logger, all_io, errors_io, log_channel, drain_task, worker_ios)
 end
 
 """
@@ -175,6 +211,28 @@ function teardown_tracing(state::TracingState)
 
     Logging.global_logger(state.previous_logger)
 
+    # Close the remote channel so the drain task finishes
+    if state.log_channel !== nothing
+        try
+            close(state.log_channel)
+        catch
+        end
+    end
+    # Wait for drain to finish writing
+    if state.drain_task !== nothing
+        try
+            wait(state.drain_task)
+        catch
+        end
+    end
+    # Close per-worker IO handles
+    for (_, io) in state.worker_ios
+        try
+            close(io)
+        catch
+        end
+    end
+
     state.all_io !== nothing && close(state.all_io)
     state.errors_io !== nothing && close(state.errors_io)
     nothing
@@ -183,17 +241,33 @@ end
 # ── Worker-side logger setup ─────────────────────────────────────────────────
 
 """
-    setup_worker_tracing(config::TracingConfig, pid::Int)
+    setup_worker_tracing(log_channel::RemoteChannel, pid::Int)
 
-To be called via `remotecall` on a worker process.  Installs a FormatLogger
-that writes structured JSONL to the worker's trace file while keeping
-the existing logger as a tee target.
+To be called via `remotecall` on a worker process.  Installs a custom logger
+that sends structured JSONL records back to the coordinator via `log_channel`.
 """
-function setup_worker_tracing(config::TracingConfig, pid::Int)
-    path = worker_trace_path(config, pid)
-    mkpath(dirname(path))
-    io = open(path, "a")
-    worker_sink = FormatLogger(_jsonl_format, io)
+function setup_worker_tracing(log_channel::RemoteChannel, pid::Int)
+    hostname = gethostname()
+    worker_sink = FormatLogger() do io, log_args
+        record = Dict{String, Any}(
+            "timestamp" => Dates.format(Dates.now(Dates.UTC), "yyyy-mm-ddTHH:MM:SS.sssZ"),
+            "level"     => string(log_args.level),
+            "module"    => string(log_args._module),
+            "message"   => string(log_args.message),
+            "file"      => string(log_args.file),
+            "line"      => log_args.line,
+            "worker_pid" => pid,
+            "hostname"  => hostname,
+        )
+        for (k, v) in log_args.kwargs
+            record[string(k)] = _safe_serialize(v)
+        end
+        try
+            put!(log_channel, record)
+        catch
+            # Channel closed or coordinator gone — silently drop
+        end
+    end
     existing = Logging.global_logger()
     logger = TeeLogger(existing, worker_sink)
     Logging.global_logger(logger)

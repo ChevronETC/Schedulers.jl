@@ -19,7 +19,7 @@ mutable struct LoopContext
     is_grace_period::Bool
     should_stop::Bool
     manager_cleanup::Any  # cleanup function returned by manager_event_forwarder
-    tracing::Union{TracingConfig, Nothing}
+    tracing_state::Union{TracingState, Nothing}
 end
 
 # --- Event handlers ---
@@ -209,9 +209,9 @@ function discover_workers!(ctx)
                 eloop.epmap_init(uninitialized_pid)
                 yield()
                 # Set up worker-side structured logging
-                if ctx.tracing !== nothing
+                if ctx.tracing_state !== nothing
                     try
-                        remotecall_fetch(setup_worker_tracing, uninitialized_pid, ctx.tracing, uninitialized_pid)
+                        remotecall_fetch(setup_worker_tracing, uninitialized_pid, ctx.tracing_state.log_channel, uninitialized_pid)
                     catch e
                         @debug "failed to set up worker tracing" pid=uninitialized_pid exception=(e, catch_backtrace())
                     end
@@ -461,7 +461,7 @@ function loop(eloop::ElasticLoop, journal, options::SchedulerOptions, tsk_map, t
         false,                                                   # is_grace_period
         false,                                                   # should_stop
         manager_cleanup,                                         # manager_cleanup
-        options.tracing,                                         # tracing
+        tracing_state,                                           # tracing_state
     )
 
     # --- Event producers ---
