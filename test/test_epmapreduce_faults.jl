@@ -48,28 +48,34 @@ end
 
 @testset "pmapreduce, cluster with ErrorException during checkpoint" begin
     safe_addprocs(5)
-    @everywhere using Distributed, Schedulers, Random
-    @everywhere wrkrs = workers()
+    @everywhere using Distributed, Schedulers
 
-    s = randstring(6)
-    @everywhere function foo7b(x, tsk, a, b)
+    # Global counters: fail the first N saves/loads total, then succeed.
+    save_counter = RemoteChannel(()->Channel{Int}(1))
+    put!(save_counter, 0)
+    load_counter = RemoteChannel(()->Channel{Int}(1))
+    put!(load_counter, 0)
+
+    @everywhere function foo7a(x, tsk, a, b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
-        sleep(1)
+        sleep(0.1)
         nothing
     end
 
-    @everywhere function test_save_checkpoint(checkpoint, localresult)
-        x = rand()
-        if x > 0.8
-            error("foo,x=$x")
+    @everywhere function test_save_checkpoint_a(checkpoint, localresult, save_counter)
+        n = take!(save_counter) + 1
+        put!(save_counter, n)
+        if n <= 3
+            error("deterministic save failure #$n")
         end
         Schedulers.default_save_checkpoint(checkpoint, localresult)
     end
 
-    @everywhere function test_load_checkpoint(checkpoint)
-        x = rand()
-        if x > 0.8
-            error("bar,x=$x")
+    @everywhere function test_load_checkpoint_a(checkpoint, load_counter)
+        n = take!(load_counter) + 1
+        put!(load_counter, n)
+        if n <= 2
+            error("deterministic load failure #$n")
         end
         Schedulers.default_load_checkpoint(checkpoint)
     end
@@ -78,8 +84,11 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, load_checkpoint=test_load_checkpoint, save_checkpoint = test_save_checkpoint, retries=0)
-    x,tsks = epmapreduce!(zeros(Float32,10), options, foo7b, 1:20, a, b)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir,
+        load_checkpoint=(cp)->test_load_checkpoint_a(cp, load_counter),
+        save_checkpoint=(cp, lr)->test_save_checkpoint_a(cp, lr, save_counter),
+        retries=0)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo7a, 1:20, a, b)
 
     rmprocs(workers())
 
@@ -91,28 +100,34 @@ end
 @testset "pmapreduce, cluster with ErrorException during checkpoint and retries=1" begin
     # important to test with retries=1 since we need to ensure that we don't reduce things twice
     safe_addprocs(5)
-    @everywhere using Distributed, Schedulers, Random
-    @everywhere wrkrs = workers()
+    @everywhere using Distributed, Schedulers
 
-    s = randstring(6)
+    # Global counters: fail the first N saves/loads total, then succeed.
+    save_counter = RemoteChannel(()->Channel{Int}(1))
+    put!(save_counter, 0)
+    load_counter = RemoteChannel(()->Channel{Int}(1))
+    put!(load_counter, 0)
+
     @everywhere function foo7b(x, tsk, a, b)
         fetch(x)::Vector{Float32} .+= a*b*tsk
-        sleep(1)
+        sleep(0.1)
         nothing
     end
 
-    @everywhere function test_save_checkpoint(checkpoint, localresult)
-        x = rand()
-        if x > 0.8
-            error("foo,x=$x")
+    @everywhere function test_save_checkpoint_b(checkpoint, localresult, save_counter)
+        n = take!(save_counter) + 1
+        put!(save_counter, n)
+        if n <= 3
+            error("deterministic save failure #$n")
         end
         Schedulers.default_save_checkpoint(checkpoint, localresult)
     end
 
-    @everywhere function test_load_checkpoint(checkpoint)
-        x = rand()
-        if x > 0.8
-            error("bar,x=$x")
+    @everywhere function test_load_checkpoint_b(checkpoint, load_counter)
+        n = take!(load_counter) + 1
+        put!(load_counter, n)
+        if n <= 2
+            error("deterministic load failure #$n")
         end
         Schedulers.default_load_checkpoint(checkpoint)
     end
@@ -121,7 +136,10 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir, load_checkpoint=test_load_checkpoint, save_checkpoint = test_save_checkpoint, retries=1)
+    options = SchedulerOptions(;maxworkers=5, scratch=tmpdir,
+        load_checkpoint=(cp)->test_load_checkpoint_b(cp, load_counter),
+        save_checkpoint=(cp, lr)->test_save_checkpoint_b(cp, lr, save_counter),
+        retries=1)
     x,tsks = epmapreduce!(zeros(Float32,10), options, foo7b, 1:20, a, b)
 
     rmprocs(workers())
@@ -163,16 +181,23 @@ end
 
 @testset "pmapreduce, cluster with RemoteException during tasks" begin
     safe_addprocs(5)
-    @everywhere using Distributed, Schedulers, Random
-    s = randstring(6)
-    @everywhere function foo8(x, tsk, a, b)
-        r = rand()
-        if r > 0.9
-            error("throwing a task error because $r is larger than 0.9")
+    @everywhere using Distributed, Schedulers
+
+    # Track which tasks have already failed once so they succeed on retry.
+    failed_once = RemoteChannel(()->Channel{Set{Int}}(1))
+    put!(failed_once, Set{Int}())
+
+    @everywhere function foo8(x, tsk, a, b, failed_once)
+        s = take!(failed_once)
+        if tsk ∈ (2, 5, 8) && tsk ∉ s
+            push!(s, tsk)
+            put!(failed_once, s)
+            error("deterministic first-attempt failure for task $tsk")
         end
+        put!(failed_once, s)
 
         x .+= a*b*tsk
-        sleep(1)
+        sleep(0.1)
         nothing
     end
 
@@ -180,8 +205,8 @@ end
 
     tmpdir = mktempdir(;cleanup=false)
 
-    options = SchedulerOptions(;minworkers=5, maxworkers=5, scratch=tmpdir, retries=0, maxerrors=typemax(Int))
-    x,tsks = epmapreduce!(zeros(Float32,10), options, foo8, 1:10, a, b)
+    options = SchedulerOptions(;minworkers=5, maxworkers=5, scratch=tmpdir, retries=1, maxerrors=typemax(Int))
+    x,tsks = epmapreduce!(zeros(Float32,10), options, foo8, 1:10, a, b, failed_once)
 
     rmprocs(workers())
 

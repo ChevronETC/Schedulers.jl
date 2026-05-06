@@ -20,12 +20,7 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
         t_preempt = @async begin
             take!(preempt_channel)  # blocks until preemption signal — no polling
             Threads.atomic_xchg!(preempted, true)
-            try
-                checkpoint_task(tsk)
-            catch e
-                @warn "error checkpointing task $tsk"
-                logerror(e, Logging.Debug)
-            end
+            # Interrupt f() first — do NOT checkpoint while f() is still running
             istaskdone(t) || @async Base.throwto(t, InterruptException())
         end
 
@@ -34,8 +29,10 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
         catch e
             # Clean up preempt watcher if work failed for non-preempt reason
             istaskdone(t_preempt) || @async Base.throwto(t_preempt, InterruptException())
-            preempted[] && throw(PreemptException())
-            rethrow()
+            if !preempted[]
+                rethrow()
+            end
+            # If preempted, fall through to checkpoint below
         end
 
         # Normal completion — clean up blocked preempt watcher
@@ -43,8 +40,16 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
             @async Base.throwto(t_preempt, InterruptException())
         end
 
-        # If preemption completed, the fetch(t) above already threw via InterruptException
-        preempted[] && throw(PreemptException())
+        # f() is guaranteed done here (completed or interrupted). Safe to checkpoint.
+        if preempted[]
+            try
+                checkpoint_task(tsk)
+            catch e
+                @warn "error checkpointing task $tsk"
+                logerror(e, Logging.Debug)
+            end
+            throw(PreemptException())
+        end
     else
         fetch(t)
     end

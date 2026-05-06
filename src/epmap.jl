@@ -49,7 +49,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
 
     # work loop
     @sync while true
-        eloop.interrupted && break
+        is_interrupted(eloop) && break
         pid = take!(eloop.pid_channel_map_add)
 
         @debug "pid=$pid"
@@ -61,7 +61,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         try
             preempt_channel_future = options.preempt_channel_future(pid)
         catch e
-            @warn "failed to retrieve preempt_channel_future, checkpoint/restart functionality disabled" pid exception=(e, catch_backtrace())
+            @warn "failed to retrieve preempt_channel_future, checkpoint/restart functionality disabled" pid
+            logerror(e, Logging.Debug)
             preempt_channel_future = nothing
         end
 
@@ -78,53 +79,44 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                     end
                 end
 
-                @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
-                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+                @debug "map task loop exit condition" pid tasks_remaining(eloop) is_interrupted(eloop)
+                if tasks_remaining(eloop) == 0 || is_interrupted(eloop)
                     @debug "putting $pid onto map_remove channel"
                     put!(eloop.events, WorkerFreed(pid, false, :map))
                     break
                 end
-                isempty(eloop.tsk_pool_todo) && (yield(); continue)
 
-                local tsk
-                try
-                    tsk = popfirst!(eloop.tsk_pool_todo)
-                catch e
-                    e isa ArgumentError || @warn "unexpected error in popfirst!" exception=(e, catch_backtrace())
-                    yield()
-                    continue
-                end
+                tsk = pop_next_task!(eloop)
+                tsk === nothing && (yield(); continue)
 
                 try
-                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(tasks_remaining(eloop)) tasks left in task-pool."
                     yield()
                     journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                     remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
-                    push!(eloop.tsk_pool_done, tsk)
-                    @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
+                    mark_task_done!(eloop, tsk)
+                    @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tasks_remaining=$(tasks_remaining(eloop)), tasks_done=$(tasks_done_count(eloop)) -!"
                     yield()
                 catch e
-                    @warn "task execution failed" pid hostname tsk failures=get(eloop.pid_failures, pid, 0)
+                    @warn "task execution failed" pid hostname tsk failures=get_pid_failures(eloop, pid)
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
-                    action = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
+                    action = handle_exception(e, pid, hostname, eloop, options.maxerrors, options.retries)
                     actual_e = e isa TaskFailedException ? e.task.result : e
                     if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task that timed out" tsk pid
-                        push!(eloop.tsk_pool_done, tsk)
-                        push!(eloop.tsk_pool_timed_out, tsk)
+                        mark_task_timed_out!(eloop, tsk)
                     elseif !action.retry_task
-                        if !(tsk in eloop.tsk_retried)
+                        if !tsk_was_retried(eloop, tsk)
                             @warn "task failed, allowing one cross-worker retry" tsk pid
-                            push!(eloop.tsk_retried, tsk)
-                            push!(eloop.tsk_pool_todo, tsk)
+                            tsk_retried_add!(eloop, tsk)
+                            requeue_task!(eloop, tsk)
                         else
                             @warn "task permanently failed after cross-worker retry" tsk pid
-                            push!(eloop.tsk_pool_done, tsk)
-                            push!(eloop.tsk_pool_timed_out, tsk)
+                            mark_task_timed_out!(eloop, tsk)
                         end
                     else
-                        push!(eloop.tsk_pool_todo, tsk)
+                        requeue_task!(eloop, tsk)
                     end
                     apply_exception_action!(eloop, action, pid)
                     action.do_break && break

@@ -1,22 +1,30 @@
 function reduce_checkpoints_is_dirty(eloop::ElasticLoop)
-    for value in values(eloop.reduce_checkpoints_is_dirty)
-        if value
-            return value
+    lock(eloop.state_lock) do
+        for value in values(eloop.reduce_checkpoints_is_dirty)
+            if value
+                return value
+            end
         end
+        false
     end
-    false
 end
 
 function save_partial_reduction(eloop)
-    if isempty(eloop.reduce_checkpoints)
-        @warn "reduction is empty, nothing to save."
+    checkpoint = lock(eloop.state_lock) do
+        isempty(eloop.reduce_checkpoints_snapshot) && return nothing
+        eloop.reduce_checkpoints_snapshot[1]
+    end
+    if checkpoint === nothing
+        @debug "save_partial_reduction: snapshot is empty (already consumed or not triggered)"
     else
         try
-            x = deserialize(eloop.reduce_checkpoints_snapshot[1])
-            empty!(eloop.reduce_checkpoints_snapshot)
+            x = deserialize(checkpoint)
+            lock(eloop.state_lock) do
+                empty!(eloop.reduce_checkpoints_snapshot)
+            end
             eloop.epmap_save_partial_reduction(x)
         catch e
-            @error "problem running user-supplied save_partial_reduction"
+            @error "problem running user-supplied save_partial_reduction" checkpoint
             logerror(e, Logging.Debug)
         end
     end
@@ -43,7 +51,10 @@ function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback)
     end
 
     @debug "eloop.is_reduce_triggered=$(eloop.is_reduce_triggered), length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))"
-    if eloop.is_reduce_triggered && eloop.checkpoints_are_flushed && !reduce_checkpoints_is_dirty(eloop) && length(eloop.reduce_checkpoints_snapshot) == 1
+    should_save = eloop.is_reduce_triggered && eloop.checkpoints_are_flushed && !reduce_checkpoints_is_dirty(eloop) && lock(eloop.state_lock) do
+        length(eloop.reduce_checkpoints_snapshot) == 1
+    end
+    if should_save
         @info "saving partial reduction, length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))"
         save_partial_reduction(eloop)
         @info "done saving partial reduction"

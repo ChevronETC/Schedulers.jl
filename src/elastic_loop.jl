@@ -44,7 +44,7 @@ end
 function handle_event!(ctx::LoopContext, event::WorkerInitFailed)
     event.pid ∈ ctx.initializing_pids && pop!(ctx.initializing_pids, event.pid)
     event.pid ∈ ctx.eloop.initialized_pids && pop!(ctx.eloop.initialized_pids, event.pid)
-    haskey(ctx.eloop.pid_failures, event.pid) && pop!(ctx.eloop.pid_failures, event.pid)
+    remove_pid_failures!(ctx.eloop, event.pid)
     push!(ctx.bad_pids, event.pid)
     ctx.pending_addprocs = max(0, ctx.pending_addprocs - 1)
 end
@@ -103,7 +103,7 @@ function handle_event!(ctx::LoopContext, event::InterruptRequested)
     eloop = ctx.eloop
     put!(eloop.pid_channel_map_add, -1)
     isopen(eloop.pid_channel_reduce_add) && put!(eloop.pid_channel_reduce_add, -1)
-    if eloop.errored
+    if is_errored(eloop)
         ctx.should_stop = true
     end
 end
@@ -116,7 +116,7 @@ end
 
 function check_interrupt!(ctx)
     eloop = ctx.eloop
-    if eloop.interrupted
+    if is_interrupted(eloop)
         put!(eloop.pid_channel_map_add, -1)
         isopen(eloop.pid_channel_reduce_add) && put!(eloop.pid_channel_reduce_add, -1)
         ctx.should_stop = true
@@ -125,8 +125,8 @@ end
 
 function check_grace_period!(ctx)
     eloop = ctx.eloop
-    if !ctx.is_grace_period && (length(eloop.tsk_pool_done) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio))
-        eloop.grace_period_start_time = time()
+    if !ctx.is_grace_period && (tasks_done_count(eloop) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio))
+        set_grace_period_start_time!(eloop, time())
         @debug "entering grace period"
         ctx.is_grace_period = true
     end
@@ -134,7 +134,7 @@ end
 
 function check_tasks_done!(ctx)
     eloop = ctx.eloop
-    is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
+    is_tasks_done = tasks_done_count(eloop) == eloop.tsk_count
     if is_tasks_done && !ctx.is_tasks_done_message_sent
         put!(eloop.pid_channel_map_add, -1)
         ctx.is_tasks_done_message_sent = true
@@ -143,8 +143,10 @@ end
 
 function check_reduce_done!(ctx)
     eloop = ctx.eloop
-    is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
-    is_reduce_active = reduce_checkpoints_is_dirty(eloop) || length(eloop.reduce_checkpoints) > 1 || length(eloop.checkpoints) > 0
+    is_tasks_done = tasks_done_count(eloop) == eloop.tsk_count
+    is_reduce_active = lock(eloop.state_lock) do
+        any(values(eloop.reduce_checkpoints_is_dirty)) || length(eloop.reduce_checkpoints) > 1 || length(eloop.checkpoints) > 0
+    end
 
     if is_tasks_done && !is_reduce_active
         if isopen(eloop.pid_channel_reduce_add) && !ctx.is_reduce_done_message_sent
@@ -174,7 +176,7 @@ function discover_workers!(ctx)
             push!(ctx.initializing_pids, uninitialized_pid)
             @async try
                 yield()
-                eloop.pid_failures[uninitialized_pid] = 0
+                init_pid_failures!(eloop, uninitialized_pid)
                 yield()
                 load_modules_on_new_workers(uninitialized_pid)
                 yield()
@@ -184,7 +186,8 @@ function discover_workers!(ctx)
                 yield()
                 isopen(eloop.events) && put!(eloop.events, WorkerInitialized(uninitialized_pid))
             catch e
-                @warn "problem initializing worker, removing from cluster" pid=uninitialized_pid exception=(e, catch_backtrace())
+                @warn "problem initializing worker, removing from cluster" pid=uninitialized_pid
+                logerror(e, Logging.Warn; pid=uninitialized_pid)
                 isopen(eloop.events) && put!(eloop.events, WorkerInitFailed(uninitialized_pid))
             end
         end
@@ -196,8 +199,10 @@ function assign_free_workers!(ctx)
     all_pids = eloop.epmap_use_master ? procs() : workers()
     free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ ctx.bad_pids), all_pids)
 
-    is_more_tasks = length(eloop.tsk_pool_todo) > 0
-    is_more_checkpoints = length(eloop.reduce_checkpoints) > 1
+    is_more_tasks = tasks_remaining(eloop) > 0
+    is_more_checkpoints = lock(eloop.state_lock) do
+        length(eloop.reduce_checkpoints) > 1
+    end
 
     for free_pid in free_pids
         try_assign_worker!(ctx, free_pid; is_more_tasks, is_more_checkpoints)
@@ -213,26 +218,39 @@ function try_assign_worker!(ctx, pid; is_more_tasks=nothing, is_more_checkpoints
     (pid ∈ eloop.used_pids_map || pid ∈ eloop.used_pids_reduce) && return
 
     if is_more_tasks === nothing
-        is_more_tasks = length(eloop.tsk_pool_todo) > 0
+        is_more_tasks = tasks_remaining(eloop) > 0
     end
     if is_more_checkpoints === nothing
-        is_more_checkpoints = length(eloop.reduce_checkpoints) > 1
+        is_more_checkpoints = lock(eloop.state_lock) do
+            length(eloop.reduce_checkpoints) > 1
+        end
     end
 
-    if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed) && length(eloop.checkpoints) == 0
-        eloop.reduce_checkpoints_snapshot = copy(eloop.reduce_checkpoints)
-        eloop.checkpoints_are_flushed = true
+    if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
+        lock(eloop.state_lock) do
+            if length(eloop.checkpoints) == 0
+                eloop.reduce_checkpoints_snapshot = copy(eloop.reduce_checkpoints)
+                eloop.checkpoints_are_flushed = true
+            end
+        end
     end
 
     is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
-    wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
+    wait_for_reduced_trigger = eloop.is_reduce_triggered && lock(eloop.state_lock) do
+        div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
+    end
 
     if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
         push!(eloop.used_pids_map, pid)
         put!(eloop.pid_channel_map_add, pid)
-    elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
-        push!(eloop.used_pids_reduce, pid)
-        put!(eloop.pid_channel_reduce_add, pid)
+    elseif is_more_checkpoints && !is_waiting_on_flush
+        should_assign = lock(eloop.state_lock) do
+            div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
+        end
+        if should_assign
+            push!(eloop.used_pids_reduce, pid)
+            put!(eloop.pid_channel_reduce_add, pid)
+        end
     end
 end
 
@@ -261,7 +279,9 @@ function scale_workers!(ctx)
 
     δ, n_remaining_tasks = 0, 0
     try
-        n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
+        n_remaining_tasks = lock(eloop.state_lock) do
+            eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
+        end
         δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
         if _epmap_nworkers + δ < _epmap_minworkers
             δ = min(_epmap_minworkers - _epmap_nworkers, _epmap_quantum)
@@ -295,7 +315,8 @@ function scale_workers!(ctx)
                 try
                     robust_rmprocs(rm_pids; waitfor=ctx.addrmprocs_timeout)
                 catch e
-                    @warn "unable to run rmprocs within timeout" pids=rm_pids timeout=ctx.addrmprocs_timeout exception=(e, catch_backtrace())
+                    @warn "unable to run rmprocs within timeout" pids=rm_pids timeout=ctx.addrmprocs_timeout
+                    logerror(e, Logging.Debug)
                 end
                 for rm_pid in rm_pids
                     haskey(ctx.wrkrs, rm_pid) && delete!(ctx.wrkrs, rm_pid)
@@ -311,7 +332,8 @@ function scale_workers!(ctx)
                         eloop.epmap_addprocs(δ)
                         put!(eloop.events, AddRmProcsCompleted(true))
                     catch e
-                        @warn "addprocs failed" exception=(e, catch_backtrace())
+                        @warn "addprocs failed"
+                        logerror(e, Logging.Warn)
                         put!(eloop.events, AddRmProcsCompleted(false))
                     end
                 end

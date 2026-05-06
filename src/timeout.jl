@@ -74,7 +74,7 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
             report = true
             tic_report[] = time()
         end
-        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio, tsk, report)
+        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, get_grace_period_start_time(eloop), options.null_tsk_runtime_threshold, options.grace_period_ratio, tsk, report)
             Base.throwto(t, TimeoutException(pid, time() - tic))
         end
     end

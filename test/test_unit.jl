@@ -108,38 +108,42 @@ end
 end
 
 @testset "handle_exception - PreemptException" begin
-    fails = Dict(1 => 0)
-    r = Schedulers.handle_exception(Schedulers.PreemptException(), 1, "host1", fails, 10, 3)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    Schedulers.init_pid_failures!(eloop, 1)
+    r = Schedulers.handle_exception(Schedulers.PreemptException(), 1, "host1", eloop, 10, 3)
     @test r.bad_pid == true
     @test r.do_break == true
     @test r.do_interrupt == false
     @test r.do_error == false
     @test r.retry_task == true  # worker fault: retry on different worker
     # PreemptException should NOT increment fails
-    @test fails[1] == 0
+    @test Schedulers.get_pid_failures(eloop, 1) == 0
 end
 
 @testset "handle_exception - TimeoutException" begin
-    fails = Dict(1 => 0)
-    r = Schedulers.handle_exception(Schedulers.TimeoutException(1, 5.0), 1, "host1", fails, 10, 3)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    Schedulers.init_pid_failures!(eloop, 1)
+    r = Schedulers.handle_exception(Schedulers.TimeoutException(1, 5.0), 1, "host1", eloop, 10, 3)
     @test r.bad_pid == true
     @test r.do_break == true
     @test r.do_interrupt == false
     @test r.do_error == false
     @test r.retry_task == true  # worker fault: retry on different worker
-    @test fails[1] == 1
+    @test Schedulers.get_pid_failures(eloop, 1) == 1
 
     # Trigger maxerrors
-    fails2 = Dict(1 => 9)
-    r2 = Schedulers.handle_exception(Schedulers.TimeoutException(1, 5.0), 1, "host1", fails2, 10, 3)
+    eloop2 = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    lock(eloop2.state_lock) do; eloop2.pid_failures[1] = 9; end
+    r2 = Schedulers.handle_exception(Schedulers.TimeoutException(1, 5.0), 1, "host1", eloop2, 10, 3)
     @test r2.do_interrupt == true
     @test r2.do_error == true
     @test r2.retry_task == true  # still worker fault even at maxerrors
 end
 
 @testset "handle_exception - InterruptException" begin
-    fails = Dict(1 => 0)
-    r = Schedulers.handle_exception(InterruptException(), 1, "host1", fails, 10, 3)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    Schedulers.init_pid_failures!(eloop, 1)
+    r = Schedulers.handle_exception(InterruptException(), 1, "host1", eloop, 10, 3)
     @test r.bad_pid == false
     @test r.do_break == false
     @test r.do_interrupt == true
@@ -148,9 +152,10 @@ end
 end
 
 @testset "handle_exception - ProcessExitedException" begin
-    fails = Dict(1 => 0)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    Schedulers.init_pid_failures!(eloop, 1)
     e = ProcessExitedException(1)
-    r = Schedulers.handle_exception(e, 1, "host1", fails, 10, 3)
+    r = Schedulers.handle_exception(e, 1, "host1", eloop, 10, 3)
     @test r.bad_pid == true
     @test r.do_break == true
     @test r.do_interrupt == false
@@ -159,18 +164,20 @@ end
 end
 
 @testset "handle_exception - generic with retries exceeded" begin
-    fails = Dict(1 => 3)
-    r = Schedulers.handle_exception(ErrorException("test"), 1, "host1", fails, 100, 3)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    lock(eloop.state_lock) do; eloop.pid_failures[1] = 3; end
+    r = Schedulers.handle_exception(ErrorException("test"), 1, "host1", eloop, 100, 3)
     @test r.bad_pid == false  # task fault: worker is fine
     @test r.do_break == true  # free the worker for other tasks
     @test r.do_interrupt == false
     @test r.do_error == false
     @test r.retry_task == false  # task fault: don't retry
-    @test fails[1] == 4  # incremented
+    @test Schedulers.get_pid_failures(eloop, 1) == 4  # incremented
 
     # Generic error within retry count — retry on same worker
-    fails2 = Dict(1 => 0)
-    r2 = Schedulers.handle_exception(ErrorException("test"), 1, "host1", fails2, 100, 3)
+    eloop2 = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    Schedulers.init_pid_failures!(eloop2, 1)
+    r2 = Schedulers.handle_exception(ErrorException("test"), 1, "host1", eloop2, 100, 3)
     @test r2.bad_pid == false
     @test r2.do_break == false
     @test r2.do_interrupt == false
@@ -179,8 +186,9 @@ end
 end
 
 @testset "handle_exception - generic with maxerrors exceeded" begin
-    fails = Dict(1 => 0, 2 => 9)
-    r = Schedulers.handle_exception(ErrorException("test"), 1, "host1", fails, 10, 100)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    lock(eloop.state_lock) do; eloop.pid_failures[1] = 0; eloop.pid_failures[2] = 9; end
+    r = Schedulers.handle_exception(ErrorException("test"), 1, "host1", eloop, 10, 100)
     @test r.do_break == true
     @test r.do_interrupt == true
     @test r.do_error == true
@@ -192,10 +200,11 @@ end
     t = @async error("wrapped error")
     try; wait(t); catch; end
     e = TaskFailedException(t)
-    fails = Dict(1 => 0)
-    r = Schedulers.handle_exception(e, 1, "host1", fails, 100, 3)
+    eloop = Schedulers.ElasticLoop(String, 1:1, Schedulers.SchedulerOptions(); isreduce=false)
+    Schedulers.init_pid_failures!(eloop, 1)
+    r = Schedulers.handle_exception(e, 1, "host1", eloop, 100, 3)
     # Should unwrap and handle the inner ErrorException
-    @test fails[1] == 1
+    @test Schedulers.get_pid_failures(eloop, 1) == 1
 end
 
 @testset "default_reducer!" begin
@@ -596,8 +605,9 @@ end
     options = SchedulerOptions(;minworkers=0, maxworkers=5)
     eloop = Schedulers.ElasticLoop(String, 1:5, options; isreduce=true)
 
-    # Empty reduce_checkpoints → should warn, not error
-    @test_logs (:warn, "reduction is empty, nothing to save.") Schedulers.save_partial_reduction(eloop)
+    # Empty reduce_checkpoints_snapshot → should be a no-op (debug log, no error)
+    Schedulers.save_partial_reduction(eloop)
+    @test true  # no error thrown
 end
 
 @testset "save_partial_reduction with checkpoint" begin

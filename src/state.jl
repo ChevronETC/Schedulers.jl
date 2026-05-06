@@ -156,3 +156,27 @@ function set_grace_period_start_time!(eloop, t)
         eloop.grace_period_start_time = t
     end
 end
+
+function set_errored!(eloop)
+    lock(eloop.state_lock) do
+        eloop.errored = true
+    end
+end
+
+function tsk_retried_add!(eloop, tsk)
+    lock(eloop.state_lock) do
+        push!(eloop.tsk_retried, tsk)
+    end
+end
+
+function tsk_was_retried(eloop, tsk)
+    lock(eloop.state_lock) do
+        tsk in eloop.tsk_retried
+    end
+end
+
+function total_pid_failures(eloop)
+    lock(eloop.state_lock) do
+        sum(values(eloop.pid_failures); init=0)
+    end
+end
