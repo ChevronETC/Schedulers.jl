@@ -26,6 +26,6 @@ include("epmapreduce.jl")
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
 export ManagerEvent, ManagerWorkerJoined, ManagerWorkerLost, ManagerClusterUpdate, ManagerHealthReport, ManagerQueuePosition
-export TracingConfig
+export TracingConfig, run_dir
 
 end

@@ -441,7 +441,7 @@ function loop(eloop::ElasticLoop, journal, options::SchedulerOptions, tsk_map, t
     # Start manager event forwarder (if provided by backend)
     manager_cleanup = nothing
     try
-        manager_cleanup = options.manager_event_forwarder(eloop.events)
+        manager_cleanup = options.manager_event_forwarder(eloop.events, options.tracing)
     catch e
         @warn "failed to start manager event forwarder" exception=(e, catch_backtrace())
     end
