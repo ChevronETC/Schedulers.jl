@@ -47,6 +47,7 @@ struct ExceptionAction
     do_break::Bool
     do_interrupt::Bool
     do_error::Bool
+    retry_task::Bool  # true = worker fault (retry on another worker), false = task fault (don't retry)
 end
 
 # --- ElasticLoop ---
@@ -81,6 +82,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     interrupted::Bool
     errored::Bool
     pid_failures::Dict{Int,Int}
+    tsk_retried::Set{Int}
     grace_period_start_time::Float64
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
@@ -121,6 +123,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         false,
         false,
         Dict{Int,Int}(),
+        Set{Int}(),
         Inf,
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,

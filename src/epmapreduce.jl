@@ -240,15 +240,25 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 catch e
                     @warn "task execution failed" pid hostname tsk failures=get(epmap_eloop.pid_failures, pid, 0)
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     actual_e = e isa TaskFailedException ? e.task.result : e
                     if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task that timed out, compute/reduce step" tsk pid
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                    elseif !action.retry_task
+                        if !(tsk in epmap_eloop.tsk_retried)
+                            @warn "task failed, allowing one cross-worker retry" tsk pid
+                            push!(epmap_eloop.tsk_retried, tsk)
+                            push!(epmap_eloop.tsk_pool_todo, tsk)
+                        else
+                            @warn "task permanently failed after cross-worker retry" tsk pid
+                            push!(epmap_eloop.tsk_pool_done, tsk)
+                            push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                        end
                     else
                         push!(epmap_eloop.tsk_pool_todo, tsk)
                     end
-                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
                     epmap_eloop.errored = epmap_eloop.errored || action.do_error
                     if action.do_break || action.do_interrupt
@@ -276,17 +286,17 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @warn "checkpoint save failed" pid hostname checkpoint=epmap_eloop.checkpoints[pid] tsk
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
                     @debug "pushing task onto tsk_pool_todo list"
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     actual_e = e isa TaskFailedException ? e.task.result : e
                     if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task that timed out, checkpoint step" tsk pid
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
                     else
+                        # Checkpoint failure is infrastructure, not task fault — always retry
                         push!(epmap_eloop.tsk_pool_todo, tsk)
                     end
                     @debug "handling exception"
-                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                    @debug "done handling exception"
                     epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
                     epmap_eloop.errored = epmap_eloop.errored || action.do_error
                     @debug "caught save checkpoint" action.do_break action.do_interrupt _next_checkpoint

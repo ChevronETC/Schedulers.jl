@@ -107,15 +107,25 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 catch e
                     @warn "task execution failed" pid hostname tsk failures=get(eloop.pid_failures, pid, 0)
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
+                    action = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
                     actual_e = e isa TaskFailedException ? e.task.result : e
                     if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task that timed out" tsk pid
                         push!(eloop.tsk_pool_done, tsk)
                         push!(eloop.tsk_pool_timed_out, tsk)
+                    elseif !action.retry_task
+                        if !(tsk in eloop.tsk_retried)
+                            @warn "task failed, allowing one cross-worker retry" tsk pid
+                            push!(eloop.tsk_retried, tsk)
+                            push!(eloop.tsk_pool_todo, tsk)
+                        else
+                            @warn "task permanently failed after cross-worker retry" tsk pid
+                            push!(eloop.tsk_pool_done, tsk)
+                            push!(eloop.tsk_pool_timed_out, tsk)
+                        end
                     else
                         push!(eloop.tsk_pool_todo, tsk)
                     end
-                    action = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
                     apply_exception_action!(eloop, action, pid)
                     action.do_break && break
                 end

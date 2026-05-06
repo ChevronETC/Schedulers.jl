@@ -113,7 +113,8 @@ end
     @test r.bad_pid == true
     @test r.do_break == true
     @test r.do_interrupt == false
-    @test r.do_error == true
+    @test r.do_error == false
+    @test r.retry_task == true  # worker fault: retry on different worker
     # PreemptException should NOT increment fails
     @test fails[1] == 0
 end
@@ -125,6 +126,7 @@ end
     @test r.do_break == true
     @test r.do_interrupt == false
     @test r.do_error == false
+    @test r.retry_task == true  # worker fault: retry on different worker
     @test fails[1] == 1
 
     # Trigger maxerrors
@@ -132,6 +134,7 @@ end
     r2 = Schedulers.handle_exception(Schedulers.TimeoutException(1, 5.0), 1, "host1", fails2, 10, 3)
     @test r2.do_interrupt == true
     @test r2.do_error == true
+    @test r2.retry_task == true  # still worker fault even at maxerrors
 end
 
 @testset "handle_exception - InterruptException" begin
@@ -141,6 +144,7 @@ end
     @test r.do_break == false
     @test r.do_interrupt == true
     @test r.do_error == false
+    @test r.retry_task == false  # control flow, not a task to retry
 end
 
 @testset "handle_exception - ProcessExitedException" begin
@@ -151,24 +155,27 @@ end
     @test r.do_break == true
     @test r.do_interrupt == false
     @test r.do_error == false
+    @test r.retry_task == true  # worker fault: retry on different worker
 end
 
 @testset "handle_exception - generic with retries exceeded" begin
     fails = Dict(1 => 3)
     r = Schedulers.handle_exception(ErrorException("test"), 1, "host1", fails, 100, 3)
-    @test r.bad_pid == true
-    @test r.do_break == true
+    @test r.bad_pid == false  # task fault: worker is fine
+    @test r.do_break == true  # free the worker for other tasks
     @test r.do_interrupt == false
     @test r.do_error == false
+    @test r.retry_task == false  # task fault: don't retry
     @test fails[1] == 4  # incremented
 
-    # Generic error within retry count — no action
+    # Generic error within retry count — retry on same worker
     fails2 = Dict(1 => 0)
     r2 = Schedulers.handle_exception(ErrorException("test"), 1, "host1", fails2, 100, 3)
     @test r2.bad_pid == false
     @test r2.do_break == false
     @test r2.do_interrupt == false
     @test r2.do_error == false
+    @test r2.retry_task == true  # still has retries left
 end
 
 @testset "handle_exception - generic with maxerrors exceeded" begin
@@ -177,6 +184,7 @@ end
     @test r.do_break == true
     @test r.do_interrupt == true
     @test r.do_error == true
+    @test r.retry_task == false  # task fault even at maxerrors
 end
 
 @testset "handle_exception - TaskFailedException unwrap" begin
