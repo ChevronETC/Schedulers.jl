@@ -240,7 +240,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 catch e
                     @warn "task execution failed" pid hostname tsk failures=get(epmap_eloop.pid_failures, pid, 0)
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
-                    if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                    actual_e = e isa TaskFailedException ? e.task.result : e
+                    if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task that timed out, compute/reduce step" tsk pid
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
@@ -275,7 +276,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @warn "checkpoint save failed" pid hostname checkpoint=epmap_eloop.checkpoints[pid] tsk
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
                     @debug "pushing task onto tsk_pool_todo list"
-                    if isa(e, TimeoutException) && options.skip_tasks_that_timeout
+                    actual_e = e isa TaskFailedException ? e.task.result : e
+                    if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task that timed out, checkpoint step" tsk pid
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
