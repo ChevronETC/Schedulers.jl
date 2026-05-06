@@ -161,7 +161,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
         if pid ∈ keys(localresults) # task loop has already run for this pid
-            put!(epmap_eloop.pid_channel_map_remove, (pid,false))
+            put!(epmap_eloop.events, WorkerFreed(pid, false, :map))
             continue
         end
 
@@ -173,8 +173,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         local preempt_channel_future
         try
             preempt_channel_future = options.preempt_channel_future(pid)
-        catch
-            @warn "failed to retrieve preempt_channel_future.  checkpoint/restart functionality disabled."
+        catch e
+            @warn "failed to retrieve preempt_channel_future, checkpoint/restart functionality disabled" pid exception=(e, catch_backtrace())
             preempt_channel_future = nothing
         end
         @debug "map, done retrieving preempt channel future, pid=$pid"
@@ -200,7 +200,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                         end
                         pop!(localresults, pid)
                         pop!(epmap_eloop.checkpoints, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+                        put!(epmap_eloop.events, WorkerFreed(pid, true, :reduce))
                         @debug "...finished cleanup for hostname failure for pid=$pid."
                         break
                     end
@@ -214,7 +214,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     end
                     pop!(localresults, pid)
                     pop!(epmap_eloop.checkpoints, pid)
-                    put!(epmap_eloop.pid_channel_map_remove, (pid,false))
+                    put!(epmap_eloop.events, WorkerFreed(pid, false, :map))
                     break
                 end
 
@@ -222,8 +222,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 local tsk
                 try
                     tsk = popfirst!(epmap_eloop.tsk_pool_todo)
-                catch
-                    # just in case another task does popfirst! before us (unlikely)
+                catch e
+                    e isa ArgumentError || @warn "unexpected error in popfirst!" exception=(e, catch_backtrace())
                     yield()
                     continue
                 end
@@ -238,25 +238,25 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                     @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
                 catch e
-                    @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
+                    @warn "task execution failed" pid hostname tsk failures=get(epmap_eloop.pid_failures, pid, 0)
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
                     if isa(e, TimeoutException) && options.skip_tasks_that_timeout
-                        @warn "skipping task '$tsk' that timed out, compute/reduce step"
+                        @warn "skipping task that timed out, compute/reduce step" tsk pid
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
                     else
                         push!(epmap_eloop.tsk_pool_todo, tsk)
                     end
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
+                    epmap_eloop.errored = epmap_eloop.errored || action.do_error
+                    if action.do_break || action.do_interrupt
                         if epmap_eloop.checkpoints[pid] !== nothing
                             push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                         end
                         pop!(localresults, pid)
                         pop!(epmap_eloop.checkpoints, pid)
-                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.events, WorkerFreed(pid, action.bad_pid, :map))
                         break
                     end
                     continue # no need to checkpoint since the task failed and will be re-run (TODO: or abandoned)
@@ -272,30 +272,29 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                     push!(epmap_eloop.tsk_pool_done, tsk)
                 catch e
-                    @warn "pid=$pid ($hostname), checkpoint=$(epmap_eloop.checkpoints[pid]), task loop, caught exception during save_checkpoint"
+                    @warn "checkpoint save failed" pid hostname checkpoint=epmap_eloop.checkpoints[pid] tsk
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
                     @debug "pushing task onto tsk_pool_todo list"
                     if isa(e, TimeoutException) && options.skip_tasks_that_timeout
-                        @warn "skipping task '$tsk' that timed out, checkpoint step"
+                        @warn "skipping task that timed out, checkpoint step" tsk pid
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
                     else
                         push!(epmap_eloop.tsk_pool_todo, tsk)
                     end
                     @debug "handling exception"
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     @debug "done handling exception"
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    @debug "caught save checkpoint" r.do_break r.do_interrupt _next_checkpoint
+                    epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
+                    epmap_eloop.errored = epmap_eloop.errored || action.do_error
+                    @debug "caught save checkpoint" action.do_break action.do_interrupt _next_checkpoint
                     # note that `options.rm_checkpoint` should check if the file exists before attempting removal
                     try
                         options.rm_checkpoint(_next_checkpoint)
                     catch e
-                        @warn "unable to delete $(_next_checkpoint), manual clean-up may be required"
-                        logerror(e, Logging.Debug)
+                        @warn "unable to delete checkpoint, manual clean-up may be required" checkpoint=_next_checkpoint exception=(e, catch_backtrace())
                     end
-                    if r.do_break || r.do_interrupt
+                    if action.do_break || action.do_interrupt
                         @debug "epmap_eloop.checkpoints[$pid]", epmap_eloop.checkpoints[pid]
                         if epmap_eloop.checkpoints[pid] !== nothing
                             push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
@@ -305,7 +304,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                         @debug "popping checkpoints"
                         pop!(epmap_eloop.checkpoints, pid)
                         @debug "returning pid to elastic loop"
-                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.events, WorkerFreed(pid, action.bad_pid, :map))
                         @debug "done returning pid to elastic loop"
                         break
                     end
@@ -332,28 +331,27 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                         journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                     end
                 catch e
-                    @warn "pid=$pid ($hostname), task loop, caught exception during remove checkpoint, there may be stray check-point files that will be deleted later"
+                    @warn "checkpoint remove failed, stray check-point files will be deleted later" pid hostname checkpoint=old_checkpoint
                     push!(checkpoint_orphans, old_checkpoint)
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
+                    epmap_eloop.errored = epmap_eloop.errored || action.do_error
+                    if action.do_break || action.do_interrupt
                         if epmap_eloop.checkpoints[pid] !== nothing
                             push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                         end
                         pop!(localresults, pid)
                         pop!(epmap_eloop.checkpoints, pid)
-                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.events, WorkerFreed(pid, action.bad_pid, :map))
                         break
                     end
                 end
             end
         catch e
-            @warn "map, uncaught exception in worker loop for pid=$pid"
-            logerror(e, Logging.Debug)
+            @warn "uncaught exception in map worker loop" pid exception=(e, catch_backtrace())
             @debug "map, putting $pid onto remove channel"
-            isopen(epmap_eloop.pid_channel_map_remove) && put!(epmap_eloop.pid_channel_map_remove, (pid,true))
+            isopen(epmap_eloop.events) && put!(epmap_eloop.events, WorkerFreed(pid, true, :map))
             @debug "map, done putting $pid onto remove channel"
         end
     end
@@ -398,7 +396,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         catch e
             @warn "unable to determine host name for pid=$pid"
             logerror(e, Logging.Debug)
-            put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+            put!(epmap_eloop.events, WorkerFreed(pid, true, :reduce))
             continue
         end
 
@@ -421,7 +419,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     @debug "reduce, popping pid=$pid from dirty list"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
                     @debug "reduce, putting $pid onto reduce remove channel"
-                    put!(epmap_eloop.pid_channel_reduce_remove, (pid,false))
+                    put!(epmap_eloop.events, WorkerFreed(pid, false, :reduce))
                     @debug "reduce, done putting $pid onto reduce remove channel"
                     break
                 end
@@ -507,14 +505,14 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 catch e
                     push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
-                    @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    @warn "reduce operation failed" pid hostname
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
+                    epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
+                    epmap_eloop.errored = epmap_eloop.errored || action.do_error
+                    if action.do_break || action.do_interrupt
                         pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.events, WorkerFreed(pid, action.bad_pid, :reduce))
                         epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                         break
                     end
@@ -531,15 +529,15 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
                 catch e
-                    @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    @warn "reduce checkpoint 1 remove failed" pid hostname checkpoint=checkpoint1
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                     push!(orphans_remove, checkpoint1, checkpoint2)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
+                    epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
+                    epmap_eloop.errored = epmap_eloop.errored || action.do_error
+                    if action.do_break || action.do_interrupt
                         pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.events, WorkerFreed(pid, action.bad_pid, :reduce))
                         break
                     end
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
@@ -555,15 +553,15 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
                 catch e
-                    @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    @warn "reduce checkpoint 2 remove failed" pid hostname checkpoint=checkpoint2
+                    action = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
                     push!(orphans_remove, checkpoint2)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
+                    epmap_eloop.interrupted = epmap_eloop.interrupted || action.do_interrupt
+                    epmap_eloop.errored = epmap_eloop.errored || action.do_error
+                    if action.do_break || action.do_interrupt
                         pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.events, WorkerFreed(pid, action.bad_pid, :reduce))
                         break
                     end
                 end
@@ -571,10 +569,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
             end
         catch e
-            @warn "reduce, uncaught exception in worker loop for pid=$pid"
-            logerror(e, Logging.Debug)
+            @warn "uncaught exception in reduce worker loop" pid exception=(e, catch_backtrace())
             @debug "reduce, putting $pid onto remove channel"
-            isopen(epmap_eloop.pid_channel_reduce_remove) && put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+            isopen(epmap_eloop.events) && put!(epmap_eloop.events, WorkerFreed(pid, true, :reduce))
             @debug "reduce, done putting $pid onto remove channel"
         end
     end
@@ -590,8 +587,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             break
         catch e
             s = min(2.0^(i-1), 60.0) + rand()
-            @warn "failed to reduce from checkpoint on master, retry ($i of 10) in $s seconds, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
-            logerror(e, Logging.Debug)
+            @warn "failed to reduce from checkpoint on master" retry=i retries=10 sleep=s checkpoints=epmap_eloop.reduce_checkpoints exception=(e, catch_backtrace())
             if i == 10 || !isfile(epmap_eloop.reduce_checkpoints[1])
                 throw(e)
             end
@@ -605,15 +601,15 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         for checkpoint in epmap_eloop.reduce_checkpoints
             try
                 options.rm_checkpoint(checkpoint)
-            catch
-                @warn "unable to remove final checkpoint $checkpoint"
+            catch e
+                @warn "unable to remove final checkpoint" checkpoint exception=(e, catch_backtrace())
             end
         end
         for checkpoint in orphans_remove
             try
                 options.rm_checkpoint(checkpoint)
-            catch
-                @warn "unable to remove orphan checkpoint: $checkpoint"
+            catch e
+                @warn "unable to remove orphan checkpoint" checkpoint exception=(e, catch_backtrace())
             end
         end
     end

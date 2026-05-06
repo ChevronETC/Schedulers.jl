@@ -367,13 +367,11 @@ end
     @test isempty(eloop.tsk_pool_done)
     @test isempty(eloop.tsk_pool_reduced)
     @test !isopen(eloop.pid_channel_reduce_add)
-    @test !isopen(eloop.pid_channel_reduce_remove)
 
     # With reduce — all channels open
     eloop_r = Schedulers.ElasticLoop(String, 1:5, options; isreduce=true)
     @test eloop_r.tsk_count == 5
     @test isopen(eloop_r.pid_channel_reduce_add)
-    @test isopen(eloop_r.pid_channel_reduce_remove)
 end
 
 @testset "ElasticLoop with usemaster" begin

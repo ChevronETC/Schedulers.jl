@@ -7,6 +7,48 @@ end
 
 struct PreemptException <: Exception end
 
+struct WorkerLostException <: Exception
+    pid::Int
+    hostname::String
+end
+WorkerLostException(pid::Int) = WorkerLostException(pid, "")
+
+struct TooManyErrorsException <: Exception
+    nerrors::Int
+    maxerrors::Int
+end
+
+struct InitializationException <: Exception
+    pid::Int
+    phase::String  # "hostname", "modules", "functions", "init"
+    cause::Exception
+end
+
+struct CheckpointException <: Exception
+    pid::Int
+    checkpoint::Any
+    operation::String  # "save", "load", "remove"
+    cause::Exception
+end
+
+struct ReductionException <: Exception
+    cause::Exception
+end
+
+struct ScalingException <: Exception
+    operation::String  # "addprocs", "rmprocs"
+    cause::Exception
+end
+
+# --- ExceptionAction ---
+
+struct ExceptionAction
+    bad_pid::Bool
+    do_break::Bool
+    do_interrupt::Bool
+    do_error::Bool
+end
+
 # --- ElasticLoop ---
 
 mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
@@ -15,9 +57,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     used_pids_map::Set{Int}
     used_pids_reduce::Set{Int}
     pid_channel_map_add::Channel{Int}
-    pid_channel_map_remove::Channel{Tuple{Int,Bool}}
     pid_channel_reduce_add::Channel{Int}
-    pid_channel_reduce_remove::Channel{Tuple{Int,Bool}}
     reduce_trigger_channel::Channel{Bool}
     epmap_addprocs::FAddProcs
     epmap_init::FInit
@@ -57,9 +97,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.usemaster ? Set{Int}() : Set(1),
         Set{Int}(),
         Channel{Int}(Inf),
-        Channel{Tuple{Int,Bool}}(Inf),
         Channel{Int}(Inf),
-        Channel{Tuple{Int,Bool}}(Inf),
         Channel{Bool}(1),
         options.addprocs,
         options.init,
@@ -93,7 +131,6 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
 
     if !isreduce
         close(eloop.pid_channel_reduce_add)
-        close(eloop.pid_channel_reduce_remove)
     end
 
     eloop

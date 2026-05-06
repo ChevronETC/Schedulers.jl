@@ -60,8 +60,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
         local preempt_channel_future
         try
             preempt_channel_future = options.preempt_channel_future(pid)
-        catch
-            @warn "failed to retrieve preempt_channel_future.  checkpoint/restart functionality disabled."
+        catch e
+            @warn "failed to retrieve preempt_channel_future, checkpoint/restart functionality disabled" pid exception=(e, catch_backtrace())
             preempt_channel_future = nothing
         end
 
@@ -73,7 +73,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds"
                         logerror(e, Logging.Debug)
-                        put!(eloop.pid_channel_map_remove, (pid, true))
+                        put!(eloop.events, WorkerFreed(pid, true, :map))
                         break
                     end
                 end
@@ -81,7 +81,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
                 if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
                     @debug "putting $pid onto map_remove channel"
-                    put!(eloop.pid_channel_map_remove, (pid,false))
+                    put!(eloop.events, WorkerFreed(pid, false, :map))
                     break
                 end
                 isempty(eloop.tsk_pool_todo) && (yield(); continue)
@@ -89,8 +89,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 local tsk
                 try
                     tsk = popfirst!(eloop.tsk_pool_todo)
-                catch
-                    # just in case another task does popfirst! before us (unlikely)
+                catch e
+                    e isa ArgumentError || @warn "unexpected error in popfirst!" exception=(e, catch_backtrace())
                     yield()
                     continue
                 end
@@ -105,29 +105,26 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                     @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                     yield()
                 catch e
-                    @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
+                    @warn "task execution failed" pid hostname tsk failures=get(eloop.pid_failures, pid, 0)
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
-                    if isa(e, TimeoutException) && options.skip_tasks_that_timeout
-                        @warn "skipping task '$tsk' that timed out"
+                    actual_e = e isa TaskFailedException ? e.task.result : e
+                    if isa(actual_e, TimeoutException) && options.skip_tasks_that_timeout
+                        @warn "skipping task that timed out" tsk pid
                         push!(eloop.tsk_pool_done, tsk)
                         push!(eloop.tsk_pool_timed_out, tsk)
                     else
                         push!(eloop.tsk_pool_todo, tsk)
                     end
-                    r = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
-                    if r.do_break || r.do_interrupt
-                        put!(eloop.pid_channel_map_remove, (pid,r.bad_pid))
-                    end
-                    eloop.interrupted = r.do_interrupt
-                    eloop.errored = r.do_error
-                    r.do_break && break
+                    action = handle_exception(e, pid, hostname, eloop.pid_failures, options.maxerrors, options.retries)
+                    apply_exception_action!(eloop, action, pid)
+                    action.do_break && break
                 end
             end
         catch e
             @warn "uncaught exception in worker loop for pid=$pid"
             logerror(e, Logging.Debug)
             @debug "putting $pid onto remove channel"
-            isopen(eloop.pid_channel_map_remove) && put!(eloop.pid_channel_map_remove, (pid,true))
+            isopen(eloop.events) && put!(eloop.events, WorkerFreed(pid, true, :map))
             @debug "done putting $pid onto remove channel"
         end
     end

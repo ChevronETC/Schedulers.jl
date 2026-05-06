@@ -66,7 +66,8 @@ function robust_rmprocs(pids; waitfor)
                         Distributed.kill(w.manager, pid, w.config)
                     end
                 end
-            catch
+            catch e
+                @debug "error during robust_rmprocs worker cleanup" pid exception=(e, catch_backtrace())
             finally
                 unlock(Distributed.worker_lock)
             end
