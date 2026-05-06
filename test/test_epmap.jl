@@ -296,40 +296,53 @@ end
 @testset "pmap with task checkpoint and restart" begin
     s = Dict{Int,Future}()
     p = Dict{Int,Future}()
+    lk = Dict{Int,Future}()
 
     function init(pid, s)
         s[pid] = remotecall(ones, pid, Int, 1)
         p[pid] = remotecall(Channel{Bool}, pid, 1)
+        lk[pid] = remotecall(ReentrantLock, pid)
     end
 
     r = randstring('a':'z', 6)
 
-    function foo5d(tsk, s, r)
+    function foo5d(tsk, s, lk, r)
         _s = fetch(s[myid()])::Vector{Int}
+        _lk = fetch(lk[myid()])::ReentrantLock
         for i = _s[1]:10
-            _s .= i
+            lock(_lk) do
+                _s .= i
+            end
             touch("testfile-$r-$tsk-$i.txt")
             @info "_s on pid=$(myid()) is $(_s[1])"
             sleep(5)
         end
-        _s .= 1
+        lock(_lk) do
+            _s .= 1
+        end
     end
 
-    function checkpoint_task(tsk, s)
+    function checkpoint_task(tsk, s, lk)
         @info "checkpoint task..."
         _s = fetch(s[myid()])::Vector{Int}
-        write("task_checkpoint_$tsk.bin", _s)
-        @info "...checkpoint task with state=$(_s[1])."
+        _lk = fetch(lk[myid()])::ReentrantLock
+        lock(_lk) do
+            write("task_checkpoint_$tsk.bin", _s)
+            @info "...checkpoint task with state=$(_s[1])."
+        end
     end
 
-    function restart_task!(tsk, s)
+    function restart_task!(tsk, s, lk)
         @info "restart task..."
         _s = fetch(s[myid()])::Vector{Int}
-        if isfile("task_checkpoint_$tsk.bin")
-            read!("task_checkpoint_$tsk.bin", _s)
-            rm("task_checkpoint_$tsk.bin")
+        _lk = fetch(lk[myid()])::ReentrantLock
+        lock(_lk) do
+            if isfile("task_checkpoint_$tsk.bin")
+                read!("task_checkpoint_$tsk.bin", _s)
+                rm("task_checkpoint_$tsk.bin")
+            end
+            @info "...restart task, " _s
         end
-        @info "...restart task, " _s
     end
 
     function signal_preempt(p)
@@ -340,12 +353,12 @@ end
         minworkers = 0,
         maxworkers = 2,
         init = pid->init(pid, s),
-        checkpoint_task = tsk->checkpoint_task(tsk, s),
-        restart_task = tsk->restart_task!(tsk, s),
+        checkpoint_task = tsk->checkpoint_task(tsk, s, lk),
+        restart_task = tsk->restart_task!(tsk, s, lk),
         preempt_channel_future = pid->p[pid]
     )
 
-    t = @async epmap(options, i->foo5d(i,s,r), 1:4)
+    t = @async epmap(options, i->foo5d(i,s,lk,r), 1:4)
 
     sleep(25)
     remotecall_wait(signal_preempt, workers()[1], p)
