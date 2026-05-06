@@ -6,7 +6,7 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
     t = Threads.@spawn begin
         try
             restart_task(tsk)
-        catch
+        catch e
             @warn "error restarting task $tsk"
             logerror(e, Logging.Debug)
         end
@@ -15,22 +15,37 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
 
     if preempt_channel_future !== nothing
         preempt_channel = fetch(preempt_channel_future)::Channel{Bool}
-        # this loop runs on the interactive thread
-        while !istaskdone(t)
-            if isready(preempt_channel)
-                take!(preempt_channel)
-                try
-                    checkpoint_task(tsk)
-                catch e
-                    @warn "error checkpointing task $tsk"
-                    logerror(e, Logging.Debug)
-                end
-                @async Base.throwto(t, InterruptException())
-                throw(PreemptException())
-            end
-            sleep(0.1)
-        end
-    end
+        preempted = Threads.Atomic{Bool}(false)
 
-    fetch(t)
+        t_preempt = @async begin
+            take!(preempt_channel)  # blocks until preemption signal — no polling
+            Threads.atomic_xchg!(preempted, true)
+            try
+                checkpoint_task(tsk)
+            catch e
+                @warn "error checkpointing task $tsk"
+                logerror(e, Logging.Debug)
+            end
+            istaskdone(t) || @async Base.throwto(t, InterruptException())
+        end
+
+        try
+            fetch(t)
+        catch e
+            # Clean up preempt watcher if work failed for non-preempt reason
+            istaskdone(t_preempt) || @async Base.throwto(t_preempt, InterruptException())
+            preempted[] && throw(PreemptException())
+            rethrow()
+        end
+
+        # Normal completion — clean up blocked preempt watcher
+        if !istaskdone(t_preempt)
+            @async Base.throwto(t_preempt, InterruptException())
+        end
+
+        # If preemption completed, the fetch(t) above already threw via InterruptException
+        preempted[] && throw(PreemptException())
+    else
+        fetch(t)
+    end
 end

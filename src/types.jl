@@ -45,6 +45,8 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
+    state_lock::ReentrantLock
+    events::Channel{SchedulerEvent}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -85,6 +87,8 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
+        ReentrantLock(),
+        Channel{SchedulerEvent}(Inf),
     )
 
     if !isreduce
