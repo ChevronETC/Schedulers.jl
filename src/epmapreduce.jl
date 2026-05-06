@@ -119,7 +119,7 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
         tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
         @debug "waiting for tsk_loop"
-        loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        loop(epmap_eloop, epmap_journal, options, tsk_map, tsk_reduce)
         @debug "fetching from tsk_reduce"
         result = fetch(tsk_reduce)
         @debug "finished fetching from tsk_reduce"

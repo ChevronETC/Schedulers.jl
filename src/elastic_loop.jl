@@ -18,6 +18,8 @@ mutable struct LoopContext
     is_reduce_done_message_sent::Bool
     is_grace_period::Bool
     should_stop::Bool
+    manager_cleanup::Any  # cleanup function returned by manager_event_forwarder
+    tracing::Union{TracingConfig, Nothing}
 end
 
 # --- Event handlers ---
@@ -108,6 +110,28 @@ function handle_event!(ctx::LoopContext, event::InterruptRequested)
     end
 end
 
+# --- Manager backend events (reactive only, no logging — backend logs go through logger tree) ---
+
+function handle_event!(ctx::LoopContext, event::ManagerWorkerJoined)
+    # Available for reactive behavior (e.g. scaling decisions)
+end
+
+function handle_event!(ctx::LoopContext, event::ManagerWorkerLost)
+    # Available for reactive behavior (e.g. rebalancing)
+end
+
+function handle_event!(ctx::LoopContext, event::ManagerClusterUpdate)
+    # Available for reactive behavior
+end
+
+function handle_event!(ctx::LoopContext, event::ManagerHealthReport)
+    # Available for reactive behavior
+end
+
+function handle_event!(ctx::LoopContext, event::ManagerQueuePosition)
+    # Available for reactive behavior
+end
+
 function handle_event!(ctx::LoopContext, event::SchedulerEvent)
     @warn "unhandled scheduler event" type=typeof(event)
 end
@@ -184,6 +208,14 @@ function discover_workers!(ctx)
                 yield()
                 eloop.epmap_init(uninitialized_pid)
                 yield()
+                # Set up worker-side structured logging
+                if ctx.tracing !== nothing
+                    try
+                        remotecall_fetch(setup_worker_tracing, uninitialized_pid, ctx.tracing, uninitialized_pid)
+                    catch e
+                        @debug "failed to set up worker tracing" pid=uninitialized_pid exception=(e, catch_backtrace())
+                    end
+                end
                 isopen(eloop.events) && put!(eloop.events, WorkerInitialized(uninitialized_pid))
             catch e
                 @warn "problem initializing worker, removing from cluster" pid=uninitialized_pid
@@ -391,9 +423,28 @@ end
 
 # --- Main event-driven loop ---
 
-function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
+function loop(eloop::ElasticLoop, journal, options::SchedulerOptions, tsk_map, tsk_reduce)
+    journal_task_callback = options.journal_task_callback
     scaling_interval = parse(Float64, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
+
+    # Start structured tracing (if configured)
+    tracing_state = nothing
+    if options.tracing !== nothing
+        try
+            tracing_state = setup_tracing(options.tracing)
+        catch e
+            @warn "failed to start tracing" exception=(e, catch_backtrace())
+        end
+    end
+
+    # Start manager event forwarder (if provided by backend)
+    manager_cleanup = nothing
+    try
+        manager_cleanup = options.manager_event_forwarder(eloop.events)
+    catch e
+        @warn "failed to start manager event forwarder" exception=(e, catch_backtrace())
+    end
 
     ctx = LoopContext(
         eloop, journal, journal_task_callback, tsk_map, tsk_reduce,
@@ -409,6 +460,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         false,                                                   # is_reduce_done_message_sent
         false,                                                   # is_grace_period
         false,                                                   # should_stop
+        manager_cleanup,                                         # manager_cleanup
+        options.tracing,                                         # tracing
     )
 
     # --- Event producers ---
@@ -454,7 +507,23 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         end
     finally
         close(scale_timer)
+        # Clean up manager event forwarder
+        if ctx.manager_cleanup !== nothing
+            try
+                ctx.manager_cleanup()
+            catch e
+                @warn "failed to clean up manager event forwarder" exception=(e, catch_backtrace())
+            end
+        end
         isopen(eloop.events) && close(eloop.events)
+        # Tear down structured tracing
+        if tracing_state !== nothing
+            try
+                teardown_tracing(tracing_state)
+            catch e
+                @debug "failed to tear down tracing" exception=(e, catch_backtrace())
+            end
+        end
     end
 
     # If loop exited due to error, propagate

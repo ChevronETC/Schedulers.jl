@@ -1,6 +1,6 @@
 module Schedulers
 
-using Dates, Distributed, JSON, Logging, Printf, Random, Serialization, Statistics
+using Dates, Distributed, JSON, Logging, LoggingExtras, Printf, Random, Serialization, Statistics
 
 epmap_default_addprocs = n->addprocs(n)
 epmap_default_preempt_channel_future = pid->nothing
@@ -11,6 +11,7 @@ epmap_default_init = pid->nothing
 include("logging.jl")
 include("journal.jl")
 include("events.jl")
+include("tracing.jl")
 include("types.jl")
 include("state.jl")
 include("errors.jl")
@@ -24,5 +25,7 @@ include("epmap.jl")
 include("epmapreduce.jl")
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
+export ManagerEvent, ManagerWorkerJoined, ManagerWorkerLost, ManagerClusterUpdate, ManagerHealthReport, ManagerQueuePosition
+export TracingConfig
 
 end

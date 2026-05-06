@@ -212,6 +212,11 @@ mutable struct SchedulerOptions{C}
     reduce_trigger::Function
     save_partial_reduction::Function
     gethostname::Function
+    # manager backend integration:
+    manager_event_forwarder::Function  # (Channel{SchedulerEvent}) -> cleanup_fn or nothing
+    manager_metrics::Function          # () -> NamedTuple
+    # tracing:
+    tracing::Union{TracingConfig, Nothing}
 end
 
 function SchedulerOptions(;
@@ -249,7 +254,10 @@ function SchedulerOptions(;
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
-        gethostname = gethostname)
+        gethostname = gethostname,
+        manager_event_forwarder = ch->nothing,
+        manager_metrics = ()->(;),
+        tracing::Union{TracingConfig, Nothing} = nothing)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -284,7 +292,10 @@ function SchedulerOptions(;
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction,
-        gethostname)
+        gethostname,
+        manager_event_forwarder,
+        manager_metrics,
+        tracing)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -322,5 +333,8 @@ function Base.copy(options::SchedulerOptions)
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction,
-        options.gethostname)
+        options.gethostname,
+        options.manager_event_forwarder,
+        options.manager_metrics,
+        options.tracing)
 end

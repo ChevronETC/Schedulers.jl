@@ -40,7 +40,7 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
 
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
-    loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    loop(eloop, journal, options, tsk_map, @async nothing)
     fetch(tsk_map)
 end
 
@@ -71,6 +71,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 if hostname == ""
                     try
                         hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                        set_task_context!(; worker_pid=pid, hostname=hostname)
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds"
                         logerror(e, Logging.Debug)
@@ -89,6 +90,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 tsk = pop_next_task!(eloop)
                 tsk === nothing && (yield(); continue)
 
+                set_task_context!(; task_id=tsk)
                 try
                     options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(tasks_remaining(eloop)) tasks left in task-pool."
                     yield()
@@ -128,6 +130,8 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             @debug "putting $pid onto remove channel"
             isopen(eloop.events) && put!(eloop.events, WorkerFreed(pid, true, :map))
             @debug "done putting $pid onto remove channel"
+        finally
+            clear_task_context!()
         end
     end
     @debug "exiting the map loop"
