@@ -329,8 +329,8 @@ function scale_workers!(ctx)
         catch e
             @warn "problem adding or removing processes"
             logerror(e, Logging.Warn)
-            ctx.pending_addprocs = 0
         end
+        ctx.pending_addprocs = 0
 
         if δ < 0 || length(ctx.bad_pids) > 0
             rm_pids = Int[]
