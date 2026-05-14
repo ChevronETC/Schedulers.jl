@@ -1117,8 +1117,10 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 isempty(eloop.tsk_pool_todo) && (yield(); continue)
 
                 local tsk
+                local n_tasks_remaining
                 try
                     tsk = popfirst!(eloop.tsk_pool_todo)
+                    n_tasks_remaining = length(eloop.tsk_pool_todo)
                 catch
                     # just in case another task does popfirst! before us (unlikely)
                     yield()
@@ -1126,7 +1128,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 end
 
                 try
-                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(length(eloop.tsk_pool_todo)) tasks left in task-pool."
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $n_tasks_remaining tasks left in task-pool."
                     yield()
                     journal_start!(journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                     remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, f, pid, tsk, args...; kwargs...)
@@ -1392,8 +1394,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 @debug "map, getting next task for pid=$pid"
                 local tsk
+                local n_tasks_remaining
                 try
                     tsk = popfirst!(epmap_eloop.tsk_pool_todo)
+                    n_tasks_remaining = length(epmap_eloop.tsk_pool_todo)
                 catch
                     # just in case another task does popfirst! before us (unlikely)
                     yield()
@@ -1403,7 +1407,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 # compute and reduce
                 try
-                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
+                    options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $n_tasks_remaining tasks left in task-pool."
                     yield()
                     journal_start!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, hostname)
                     remotecall_func_wait_timeout(tsk_times, epmap_eloop, options, preempt_channel_future, options.checkpoint_task, options.restart_task, tsk, epmapreduce_fetch_apply, pid, localresults[pid], T, options.epmapreduce_fetch, f, tsk, args...; kwargs...)
