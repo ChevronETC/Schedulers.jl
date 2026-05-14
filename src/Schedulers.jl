@@ -171,6 +171,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     epmap_maxworkers::FMaxWorkers
     epmap_quantum::FQuantum
     epmap_nworkers::FNWorkers
+    ppi::Int
     tsk_pool_todo::Vector{T}
     tsk_pool_done::Vector{T}
     tsk_pool_timed_out::Vector{T}
@@ -211,6 +212,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.maxworkers,
         options.quantum,
         options.nworkers,
+        options.ppi,
         _tsk_pool_todo,
         empty(_tsk_pool_todo),
         empty(_tsk_pool_todo),
@@ -790,9 +792,10 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 end
             elseif δ > 0
                 try
-                    @debug "adding $δ procs"
+                    local n_to_add = cld(δ, eloop.ppi)
+                    @debug "adding $n_to_add procs (δ=$δ workers, ppi=$(eloop.ppi))"
                     tsk_addrmprocs_tic = time()
-                    tsk_addrmprocs = @async eloop.epmap_addprocs(δ)
+                    tsk_addrmprocs = @async eloop.epmap_addprocs(n_to_add)
                     sleep(2) # TODO: this seems needed for running with Distributed.SSHManager on a local cluster
                 catch e
                     @error "problem adding new processes"
@@ -893,6 +896,7 @@ mutable struct SchedulerOptions{C}
     nworkers::Function
     usemaster::Bool
     quantum::Function
+    ppi::Int
     addprocs::Function
     init::Function
     preempt_channel_future::Function
@@ -931,6 +935,7 @@ function SchedulerOptions(;
         nworkers = ()->Distributed.nprocs()-1,
         usemaster = false,
         quantum = ()->32,
+        ppi = 1,
         addprocs = Distributed.addprocs,
         init = epmap_default_init,
         preempt_channel_future = epmap_default_preempt_channel_future,
@@ -967,6 +972,7 @@ function SchedulerOptions(;
         nworkers,
         usemaster,
         isa(quantum, Function) ? quantum : ()->quantum,
+        ppi,
         addprocs,
         init,
         preempt_channel_future,
@@ -1005,6 +1011,7 @@ function Base.copy(options::SchedulerOptions)
         options.nworkers,
         options.usemaster,
         options.quantum,
+        options.ppi,
         options.addprocs,
         options.init,
         options.preempt_channel_future,
@@ -1050,6 +1057,7 @@ and `pmap_kwargs` are as follows.
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[1]
 * `quantum=()->32` the maximum number of workers to elastically add at a time
+* `ppi=1` processes per instance — number of julia workers per provisioned machine. Used to divide the elastic scaling delta before calling `addprocs`.
 * `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[2].
