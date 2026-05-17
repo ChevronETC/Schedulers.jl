@@ -744,6 +744,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         try
             n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
             δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
+            # Rate-limit scale-down: remove at most `quantum` workers per cycle to prevent
+            # a runaway cascade where tasks complete faster than workers can be removed,
+            # collapsing a 700-worker cluster to near-zero in minutes.
+            if δ < 0
+                δ = max(δ, -_epmap_quantum)
+            end
             # note that 1. we will only remove a machine if it is not in the 'eloop.used_pids' vector.
             # and 2. we will only remove machines if we are left with at least epmap_minworkers.
             if _epmap_nworkers + δ < _epmap_minworkers
