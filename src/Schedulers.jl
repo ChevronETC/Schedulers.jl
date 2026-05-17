@@ -243,7 +243,7 @@ struct TimeoutException <: Exception
     elapsed::Float64
 end
 
-maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? median(tsk_times)*timeout_multiplier : Inf
+maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.3*tsk_count)) ? median(tsk_times)*timeout_multiplier : Inf
 
 struct PreemptException <: Exception end
 
@@ -320,11 +320,8 @@ function robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count, tsk, r
     if report
         @debug "calculating robust average for tsk=$tsk, length(tsk_times)=$(length(tsk_times)), length(tsk_times_robust)=$(length(tsk_times_robust)), tsk_count=$tsk_count, null_tsk_runtime_threshold=$null_tsk_runtime_threshold, tsk_times=$(my_extrema(tsk_times)), tsk_times_robust=$(my_extrema(tsk_times_robust))"
     end
-    if length(tsk_times_robust) >= 0.3 * tsk_count     # Start statistics after 30% of the tasks are done
-        return sum(tsk_times_robust) / length(tsk_times_robust)
-    else
-        return Inf
-    end
+
+    length(tsk_times_robust) >= 0.3 * tsk_count ? median(tsk_times_robust) : Inf
 end
 
 function check_timeout_status(tic, tsk_times, tsk_count, timeout_function_multiplier, grace_period_start_time, null_tsk_runtime_threshold, grace_period_ratio, tsk, report)
