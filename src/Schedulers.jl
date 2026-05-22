@@ -243,7 +243,7 @@ struct TimeoutException <: Exception
     elapsed::Float64
 end
 
-maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
+maximum_task_time(tsk_times, tsk_count, timeout_multiplier, timeout_baseline) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : timeout_baseline
 
 struct PreemptException <: Exception end
 
@@ -284,11 +284,11 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
     fetch(t)
 end
 
-function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
+function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, timeout_baseline, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
     t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
     while !istaskdone(t)
-        if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
+        if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier, timeout_baseline)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
@@ -300,11 +300,11 @@ function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, preem
     nothing
 end
 
-function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
+function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, timeout_baseline, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
     t = @async remotecall_fetch(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
     while !istaskdone(t)
-        if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
+        if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier, timeout_baseline)
             throw(TimeoutException(pid, time() - tic))
         end
         sleep(1)
@@ -883,6 +883,7 @@ mutable struct SchedulerOptions{C}
     retries::Int
     maxerrors::Int
     timeout_multiplier::Float64
+    timeout_baseline::Float64
     timeout_function_multiplier::Float64
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
@@ -921,6 +922,7 @@ function SchedulerOptions(;
         retries = 0,
         maxerrors = typemax(Int),
         timeout_multiplier = 5,
+        timeout_baseline = 300,
         timeout_function_multiplier = 5,
         null_tsk_runtime_threshold = 0.,
         skip_tsk_tol_ratio = 0,
@@ -957,6 +959,7 @@ function SchedulerOptions(;
         retries,
         maxerrors,
         Float64(timeout_multiplier),
+        Float64(timeout_baseline),
         Float64(timeout_function_multiplier),
         Float64(null_tsk_runtime_threshold),
         Float64(skip_tsk_tol_ratio),
@@ -995,6 +998,7 @@ function Base.copy(options::SchedulerOptions)
         options.retries,
         options.maxerrors,
         options.timeout_multiplier,
+        options.timeout_baseline,
         options.timeout_function_multiplier,
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
@@ -1040,6 +1044,7 @@ and `pmap_kwargs` are as follows.
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
 * `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
+* `timeout_baseline=300` the minimum duration (in seconds) for a non-map task to be considered significant and thus included in the timeout measurement.[1]
 * `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) mean (actual) task time, then abort that task
 * `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
@@ -1048,11 +1053,11 @@ and `pmap_kwargs` are as follows.
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
-* `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[1]
+* `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[2]
 * `quantum=()->32` the maximum number of workers to elastically add at a time
 * `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
-* `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[2].
+* `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[3].
 * `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
 * `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
 * `reporttasks=true` log task assignment
@@ -1060,10 +1065,11 @@ and `pmap_kwargs` are as follows.
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
 # GXTODO: add doc
 ## Notes
-[1] The number of machines provisioned may be greater than the number of workers in the cluster since with
+[1] Non-map tasks include hostname fetches.
+[2] The number of machines provisioned may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
-[2] For example, on Azure Cloud a SPOT instance will be pre-emptied if someone is willing to pay more for it
+[3] For example, on Azure Cloud a SPOT instance will be pre-emptied if someone is willing to pay more for it
 """
 function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...)
     eloop = ElasticLoop(Nothing, tasks, options; isreduce=false)
@@ -1099,7 +1105,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
             while true
                 if hostname == ""
                     try
-                        hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                        hostname = remotecall_fetch_timeout(60, 1, 1, 60, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds"
                         logerror(e, Logging.Debug)
@@ -1190,6 +1196,7 @@ and `epmap_kwargs` are as follows.
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
 * `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
+* `timeout_baseline=300` the minimum duration (in seconds) for a non-map task to be considered significant and thus included in the timeout measurement.[3]
 * `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) mean (actual) task time, then abort that task
 * `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
@@ -1198,14 +1205,14 @@ and `epmap_kwargs` are as follows.
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
-* `nworkers=nworkers` the number of machines currently provisioned for work[3]
+* `nworkers=nworkers` the number of machines currently provisioned for work[4]
 * `quantum=()->32` the maximum number of workers to elastically add at a time
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
 * `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
 * `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
-* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
+* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[5]
 * `reporttasks=true` log task assignment
 * `journalfile=""` write a journal showing what was computed where to a json file
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
@@ -1218,10 +1225,11 @@ and `epmap_kwargs` are as follows.
 written to, and `x` is the data that will be written.
 [2] The signature is `my_load_checkpoint(checkpoint_file)` where `checkpoint_file` is the file that
 data will be loaded from.
-[3] The number of machines provisioined may be greater than the number of workers in the cluster since with
+[3] Non-map tasks include hostname fetches, I/O operations for checkpoint and reduction operations, etc.
+[4] The number of machines provisioined may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
-[4] If more than one scratch location is selected, then check-point files will be distributed across those locations.
+[5] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
 
 # Examples
@@ -1364,7 +1372,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 if hostname == ""
                     try
                         @debug "fetching hostname for pid=$pid with a timeout of 60 seconds"
-                        hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                        hostname = remotecall_fetch_timeout(60, 1, 1, 60, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
                         @debug "fetched hostname for pid=$pid: $hostname"
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds."
@@ -1443,7 +1451,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 try
                     @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                     journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                    remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                    remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.timeout_baseline, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                     @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                     push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1504,7 +1512,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     if old_checkpoint !== nothing
                         journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
                         @debug "deleting old checkpoint, pid=$pid, tsk=$tsk, tsk_count=$(epmap_eloop.tsk_count), length(rm_times)=$(length(rm_times)), options.timeout_multiplier=$(options.timeout_multiplier), maximum_task_time=$(maximum_task_time(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier))"
-                        options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
+                        options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.timeout_baseline, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
                         @debug "...done deleting old checkpoint, pid=$pid, tsk=$tsk"
                         journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                     end
@@ -1557,9 +1565,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     l = ReentrantLock()
 
-    # Seeding with a large value to account for potential throttling of various cloud storage services
-    reduce_times = Float64[300.0]
-    rm_times = Float64[300.0]
+    reduce_times = Float64[]
+    rm_times = Float64[]
 
     @sync while true
         @debug "reduce, interrupted=$(epmap_eloop.interrupted)"
@@ -1571,7 +1578,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
         hostname = ""
         try
-            hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+            hostname = remotecall_fetch_timeout(60, 1, 1, 60, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
         catch e
             @warn "unable to determine host name for pid=$pid"
             logerror(e, Logging.Debug)
@@ -1676,11 +1683,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     @debug "reducing into checkpoint3, pid=$pid" checkpoint3
                     journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                     # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
+                    remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, options.timeout_baseline, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
-                    @debug "pushed reduced checkpoint3, pid=$pid" checkpoint3
+                    @debug "pushed reduced checkpoint3, pid=$pid, reduce_times_length=$(length(reduce_times)), reduce_times_extrema=$(extrema(reduce_times))" checkpoint3
                 catch e
                     push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
@@ -1704,9 +1711,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
                     journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                     # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
+                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, options.timeout_baseline, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                    options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
+                    options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid, rm_times_length=$(length(remove_times)), remove_times_extrema=$(extrema(remove_times))" checkpoint1
                 catch e
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
@@ -1728,9 +1735,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
                     journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                     # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
+                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, options.timeout_baseline, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                    options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
+                    options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid, rm_times_length=$(length(remove_times)), remove_times_extrema=$(extrema(remove_times))" checkpoint2
                 catch e
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
@@ -1759,6 +1766,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     length(epmap_eloop.reduce_checkpoints) == 0 && @warn "there are no checkpoints to reduce indicating that no tasks were run"
 
+    @debug "final reduction on master, epmap_eloop.reduce_checkpoints=$(epmap_eloop.reduce_checkpoints)"
     for i in 1:10
         try
             if length(epmap_eloop.reduce_checkpoints) > 0
