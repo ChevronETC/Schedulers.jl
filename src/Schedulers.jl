@@ -1838,7 +1838,7 @@ load_checkpoint(load_checkpoint_method, checkpoint, ::Type{T}) where {T} = load_
 default_save_checkpoint(checkpoint, localresult) = serialize(checkpoint, localresult)
 default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 
-default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
+default_rm_checkpoint(checkpoint) = @async rm(checkpoint; force=true)
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
 
