@@ -1511,7 +1511,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 try
                     if old_checkpoint !== nothing
                         journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                        @debug "deleting old checkpoint, pid=$pid, tsk=$tsk, tsk_count=$(epmap_eloop.tsk_count), length(rm_times)=$(length(rm_times)), options.timeout_multiplier=$(options.timeout_multiplier), maximum_task_time=$(maximum_task_time(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier))"
+                        @debug "deleting old checkpoint, pid=$pid, tsk=$tsk, tsk_count=$(epmap_eloop.tsk_count), length(rm_times)=$(length(rm_times)), options.timeout_multiplier=$(options.timeout_multiplier), maximum_task_time=$(maximum_task_time(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, options.timeout_baseline))"
                         options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, Inf, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
                         @debug "...done deleting old checkpoint, pid=$pid, tsk=$tsk"
                         journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
