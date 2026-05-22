@@ -243,7 +243,7 @@ struct TimeoutException <: Exception
     elapsed::Float64
 end
 
-maximum_task_time(tsk_times, tsk_count, timeout_multiplier, timeout_baseline) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : timeout_baseline
+maximum_task_time(tsk_times, tsk_count, timeout_multiplier, timeout_baseline) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? min(timeout_baseline, maximum(tsk_times)*timeout_multiplier) : timeout_baseline
 
 struct PreemptException <: Exception end
 
