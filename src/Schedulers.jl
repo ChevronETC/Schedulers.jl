@@ -243,7 +243,7 @@ struct TimeoutException <: Exception
     elapsed::Float64
 end
 
-maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
+maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? median(tsk_times)*timeout_multiplier : Inf
 
 struct PreemptException <: Exception end
 
@@ -255,7 +255,7 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
     t = Threads.@spawn begin
         try
             restart_task(tsk)
-        catch
+        catch e
             @warn "error restarting task $tsk"
             logerror(e, Logging.Debug)
         end
