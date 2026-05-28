@@ -243,7 +243,7 @@ struct TimeoutException <: Exception
     elapsed::Float64
 end
 
-maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? maximum(tsk_times)*timeout_multiplier : Inf
+maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.5*tsk_count)) ? median(tsk_times)*timeout_multiplier : Inf
 
 struct PreemptException <: Exception end
 
@@ -255,7 +255,7 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
     t = Threads.@spawn begin
         try
             restart_task(tsk)
-        catch
+        catch e
             @warn "error restarting task $tsk"
             logerror(e, Logging.Debug)
         end
@@ -1680,7 +1680,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
-                    @debug "pushed reduced checkpoint3, pid=$pid" checkpoint3
+                    @debug "pushed reduced checkpoint3, pid=$pid, reduce_times_length=$(length(reduce_times)), reduce_times_extrema=$(length(reduce_times) > 0 ? extrema(reduce_times) : (0.0,0.0))" checkpoint3
                 catch e
                     push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
@@ -1706,7 +1706,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
                     options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                    options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid" checkpoint1
+                    options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid, rm_times_length=$(length(rm_times)), rm_times_extrema=$(length(rm_times) > 0 ? extrema(rm_times) : (0.0,0.0))" checkpoint1
                 catch e
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
@@ -1730,7 +1730,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
                     options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                    options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid" checkpoint2
+                    options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid, rm_times_length=$(length(rm_times)), rm_times_extrema=$(length(rm_times) > 0 ? extrema(rm_times) : (0.0,0.0))" checkpoint2
                 catch e
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
