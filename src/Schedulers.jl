@@ -1036,11 +1036,11 @@ and `pmap_kwargs` are as follows.
 ## epmap_kwargs
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=typemax(Int)` the maximum number of errors before we give-up and exit
-* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
-* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) mean (actual) task time, then abort that task
+* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the median (miscellaneous) task time, then abort that task
+* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) median (actual) task time, then abort that task
 * `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
-* `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) average task time
+* `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) median task time
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
@@ -1186,11 +1186,11 @@ and `epmap_kwargs` are as follows.
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initialize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
-* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the mean (miscellaneous) task time, then abort that task
-* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) mean (actual) task time, then abort that task
+* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the median (miscellaneous) task time, then abort that task
+* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) median (actual) task time, then abort that task
 * `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
-* `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) average task time
+* `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) median task time
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
