@@ -525,7 +525,7 @@ function robust_rmprocs(pids; waitfor)
             end
             unremoved = [wrkr.id for wrkr in filter(w -> w.state !== Distributed.W_TERMINATED, rmprocset)]
 
-            lock(Distributed.worker_lock) do
+            lock(Distributed.worker_lock) do _
                 try
                     for pid in unremoved
                         @debug "robust_rmprocs, setting worker state, and calling kill"
@@ -569,7 +569,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
     # async tasks to show log messages if the loop is stuck for more than loop_log_timeout seconds
     timer_loop_log = Timer(loop_log_timeout; interval=loop_log_timeout) do _
-        lock(loop_log_cache_lock) do
+        lock(loop_log_cache_lock) do _
             try
                 loop_iteration_elapsed_time = time() - loop_tic
                 if loop_iteration_elapsed_time > loop_log_timeout
@@ -587,7 +587,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
     while true
         # initializing cache of log messages that are only shown if the loop is stuck for more than loop_log_timeout seconds
-        lock(loop_log_cache_lock) do
+        lock(loop_log_cache_lock) do _
             try
                 loop_tic = time()
                 empty!(loop_log_cache)
