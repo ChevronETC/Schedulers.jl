@@ -525,19 +525,20 @@ function robust_rmprocs(pids; waitfor)
             end
             unremoved = [wrkr.id for wrkr in filter(w -> w.state !== Distributed.W_TERMINATED, rmprocset)]
 
-            lock(Distributed.worker_lock) do _
-                try
-                    for pid in unremoved
-                        @debug "robust_rmprocs, setting worker state, and calling kill"
-                        if haskey(Distributed.map_pid_wrkr, pid)
-                            w = Distributed.map_pid_wrkr[pid]
-                            Distributed.set_worker_state(w, Distributed.W_TERMINATED)
-                            Distributed.deregister_worker(pid)
-                            Distributed.kill(w.manager, pid, w.config)
-                        end
+            lock(Distributed.worker_lock)
+            try
+                for pid in unremoved
+                    @debug "robust_rmprocs, setting worker state, and calling kill"
+                    if haskey(Distributed.map_pid_wrkr, pid)
+                        w = Distributed.map_pid_wrkr[pid]
+                        Distributed.set_worker_state(w, Distributed.W_TERMINATED)
+                        Distributed.deregister_worker(pid)
+                        Distributed.kill(w.manager, pid, w.config)
                     end
-                catch
                 end
+            catch
+            finally
+                unlock(Distributed.worker_lock)
             end
         catch e
             @warn "rmprocs fall-back strategy failed."
@@ -569,32 +570,34 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
     # async tasks to show log messages if the loop is stuck for more than loop_log_timeout seconds
     timer_loop_log = Timer(loop_log_timeout; interval=loop_log_timeout) do _
-        lock(loop_log_cache_lock) do _
-            try
-                loop_iteration_elapsed_time = time() - loop_tic
-                if loop_iteration_elapsed_time > loop_log_timeout
-                    @debug "triggered elastic loop logging due to timeout indicating that the loop is stuck, loop_iteration_elapsed_time=$loop_iteration_elapsed_time, loop_log_timeout=$loop_log_timeout"
-                    for msg in loop_log_cache
-                        @debug msg
-                    end
+        lock(loop_log_cache_lock)
+        try
+            loop_iteration_elapsed_time = time() - loop_tic
+            if loop_iteration_elapsed_time > loop_log_timeout
+                @debug "triggered elastic loop logging due to timeout indicating that the loop is stuck, loop_iteration_elapsed_time=$loop_iteration_elapsed_time, loop_log_timeout=$loop_log_timeout"
+                for msg in loop_log_cache
+                    @debug msg
                 end
-            catch e
-                @warn "caught error in loop timeout logging"
-                logerror(e, Logging.Debug)
             end
+        catch e
+            @warn "caught error in loop timeout logging"
+            logerror(e, Logging.Debug)
+        finally
+            unlock(loop_log_cache_lock)
         end
     end
 
     while true
         # initializing cache of log messages that are only shown if the loop is stuck for more than loop_log_timeout seconds
-        lock(loop_log_cache_lock) do _
-            try
-                loop_tic = time()
-                empty!(loop_log_cache)
-            catch e
-                @warn "caught error in loop iteration"
-                logerror(e, Logging.Debug)
-            end
+        lock(loop_log_cache_lock)
+        try
+            loop_tic = time()
+            empty!(loop_log_cache)
+        catch e
+            @warn "caught error in loop iteration"
+            logerror(e, Logging.Debug)
+        finally
+            unlock(loop_log_cache_lock)
         end
 
         push!(loop_log_cache, "checking for interrupt=$(eloop.interrupted), error=$(eloop.errored)")
