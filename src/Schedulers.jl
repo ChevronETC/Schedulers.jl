@@ -469,8 +469,8 @@ Given `eloop::ElasticLoop`, return a list of tasks that are complete and reduced
 """
 reduced_tasks(eloop::ElasticLoop) = eloop.tsk_pool_reduced
 
-function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback)
-    @debug "running user reduce trigger"
+function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback, loop_log_cache)
+    push!(loop_log_cache, "running user reduce trigger")
     try
         eloop.epmap_reduce_trigger(eloop)
     catch e
@@ -478,7 +478,7 @@ function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback)
         logerror(e, Logging.Debug)
     end
 
-    @debug "checking for reduce trigger"
+    push!(loop_log_cache, "checking for reduce trigger")
     if !isempty(eloop.reduce_trigger_channel)
         take!(eloop.reduce_trigger_channel)
         if !(eloop.is_reduce_triggered)
@@ -487,7 +487,7 @@ function reduce_trigger(eloop::ElasticLoop, journal, journal_task_callback)
         end
     end
 
-    @debug "eloop.is_reduce_triggered=$(eloop.is_reduce_triggered), length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))"
+    push!(loop_log_cache, "eloop.is_reduce_triggered=$(eloop.is_reduce_triggered), length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))")
     if eloop.is_reduce_triggered && eloop.checkpoints_are_flushed && !reduce_checkpoints_is_dirty(eloop) && length(eloop.reduce_checkpoints_snapshot) == 1
         @info "saving partial reduction, length(eloop.checkpoints)=$(length(eloop.checkpoints)), length(eloop.reduce_checkpoints)=$(length(eloop.reduce_checkpoints))"
         save_partial_reduction(eloop)
@@ -563,8 +563,44 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     is_reduce_done_message_sent = false
     is_grace_period = false
 
+    loop_log_cache = Vector{String}()
+    loop_log_timeout = parse(Float32, get(ENV, "JULIA_SCHEDULERS_LOOP_LOG_TIMEOUT", "300"))
+    loop_log_cache_lock = ReentrantLock()
+    loop_tic = time()
+
+    # async tasks to show log messages if the loop is stuck for more than loop_log_timeout seconds
+    timer_loop_log = Timer(loop_log_timeout; interval=loop_log_timeout) do _
+        lock(loop_log_cache_lock)
+        try
+            loop_iteration_elapsed_time = time() - loop_tic
+            if loop_iteration_elapsed_time > loop_log_timeout
+                @debug "triggered elastic loop logging due to timeout indicating that the loop is stuck, loop_iteration_elapsed_time=$loop_iteration_elapsed_time, loop_log_timeout=$loop_log_timeout"
+                for msg in loop_log_cache
+                    @debug msg
+                end
+            end
+        catch e
+            @warn "caught error in loop timeout logging"
+            logerror(e, Logging.Debug)
+        finally
+            unlock(loop_log_cache_lock)
+        end
+    end
+
     while true
-        @debug "checking for interrupt=$(eloop.interrupted), error=$(eloop.errored)"
+        # initializing cache of log messages that are only shown if the loop is stuck for more than loop_log_timeout seconds
+        lock(loop_log_cache_lock)
+        try
+            loop_tic = time()
+            empty!(loop_log_cache)
+        catch e
+            @warn "caught error in loop iteration"
+            logerror(e, Logging.Debug)
+        finally
+            unlock(loop_log_cache_lock)
+        end
+
+        push!(loop_log_cache, "checking for interrupt=$(eloop.interrupted), error=$(eloop.errored)")
         yield()
         if eloop.interrupted
             put!(eloop.pid_channel_map_add, -1)
@@ -577,7 +613,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        @debug "check for setting grace period timestamp, length(eloop.tsk_pool_done)=$(length(eloop.tsk_pool_done)), eloop.tsk_count=$(eloop.tsk_count), eloop.skip_tsk_tol_ratio=$(eloop.skip_tsk_tol_ratio), lhs=$(length(eloop.tsk_pool_done) / eloop.tsk_count), rhs=$(1 - eloop.skip_tsk_tol_ratio)), is_grace_period=$is_grace_period"
+        push!(loop_log_cache, "check for setting grace period timestamp, length(eloop.tsk_pool_done)=$(length(eloop.tsk_pool_done)), eloop.tsk_count=$(eloop.tsk_count), eloop.skip_tsk_tol_ratio=$(eloop.skip_tsk_tol_ratio), lhs=$(length(eloop.tsk_pool_done) / eloop.tsk_count), rhs=$(1 - eloop.skip_tsk_tol_ratio)), is_grace_period=$is_grace_period")
         # once we complete 100*eloop.skip_tsk_tol_ratio percent of the tasks, we enter a grace period where we timeout tasks that reach the end of the grace period.
         if (length(eloop.tsk_pool_done) / eloop.tsk_count > (1 - eloop.skip_tsk_tol_ratio)) && !is_grace_period
             eloop.grace_period_start_time = time()
@@ -589,14 +625,14 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         is_reduce_active = reduce_checkpoints_is_dirty(eloop) || length(eloop.reduce_checkpoints) > 1 || length(eloop.checkpoints) > 0
         is_more_checkpoints = length(eloop.reduce_checkpoints) > 1
 
-        @debug "check for complete tasks when the number of completed tasks ($(length(eloop.tsk_pool_done))) equals the total number of tasks ($(eloop.tsk_count)))"
+        push!(loop_log_cache, "check for complete tasks when the number of completed tasks ($(length(eloop.tsk_pool_done))) equals the total number of tasks ($(eloop.tsk_count)))")
         yield()
         if is_tasks_done && !is_tasks_done_message_sent
             put!(eloop.pid_channel_map_add, -1)
             is_tasks_done_message_sent = true
         end
 
-        @debug "check for complete reduction when tasks are done ($is_tasks_done) and reduce is not active ($(!is_reduce_active)), and there are no more checkpoints: ($(length(eloop.reduce_checkpoints)) pending, $(length(eloop.checkpoints)) active, $(length(filter(v->v, collect(values(eloop.reduce_checkpoints_is_dirty))))) dirty)"
+        push!(loop_log_cache, "check for complete reduction when tasks are done ($is_tasks_done) and reduce is not active ($(!is_reduce_active)), and there are no more checkpoints: ($(length(eloop.reduce_checkpoints)) pending, $(length(eloop.checkpoints)) active, $(length(filter(v->v, collect(values(eloop.reduce_checkpoints_is_dirty))))) dirty)")
         if is_tasks_done && !is_reduce_active
             @debug "elastic loop, check for open reduce channel, and if the reduce done message is already sent, isopen(eloop.pid_channel_reduce_add)=$(isopen(eloop.pid_channel_reduce_add)), is_reduce_done_message_sent=$is_reduce_done_message_sent"
             if isopen(eloop.pid_channel_reduce_add) && !is_reduce_done_message_sent
@@ -615,7 +651,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
-        @debug "check for complete/failed tsk_map"
+        push!(loop_log_cache, "check for complete/failed tsk_map")
         yield()
         if istaskdone(tsk_map)
             @debug "map task done"
@@ -636,7 +672,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
-        @debug "check for failed reduce_map"
+        push!(loop_log_cache, "check for failed reduce_map")
         if istaskfailed(tsk_reduce)
             @error "reduce task failed"
             if !istaskdone(tsk_map)
@@ -646,7 +682,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        @debug "check for complete map and reduce tasks, map: $(istaskdone(tsk_map)), reduce: $(istaskdone(tsk_reduce))"
+        push!(loop_log_cache, "check for complete map and reduce tasks, map: $(istaskdone(tsk_map)), reduce: $(istaskdone(tsk_reduce))")
         yield()
         if istaskdone(tsk_map) && istaskdone(tsk_reduce)
             isopen(eloop.pid_channel_reduce_add) && close(eloop.pid_channel_reduce_add)
@@ -677,19 +713,19 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 wrkrs[uninitialized_pid] = Distributed.map_pid_wrkr[uninitialized_pid]
                 push!(initializing_pids, uninitialized_pid)
                 @async try
-                    @debug "initializing failure count on $uninitialized_pid"
+                    push!(loop_log_cache, "initializing failure count on $uninitialized_pid")
                     yield()
                     eloop.pid_failures[uninitialized_pid] = 0
-                    @debug "loading modules on $uninitialized_pid"
+                    push!(loop_log_cache, "loading modules on $uninitialized_pid")
                     yield()
                     load_modules_on_new_workers(uninitialized_pid)
-                    @debug "loading functions on $uninitialized_pid"
+                    push!(loop_log_cache, "loading functions on $uninitialized_pid")
                     yield()
                     load_functions_on_new_workers(uninitialized_pid)
-                    @debug "calling init on new $uninitialized_pid"
+                    push!(loop_log_cache, "calling init on new $uninitialized_pid")
                     yield()
                     eloop.epmap_init(uninitialized_pid)
-                    @debug "done loading functions modules, and calling init on $uninitialized_pid"
+                    push!(loop_log_cache, "done loading functions modules, and calling init on $uninitialized_pid")
                     yield()
                     _pid_up_timestamp[uninitialized_pid] = time()
                     push!(eloop.initialized_pids, uninitialized_pid)
@@ -707,13 +743,13 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
 
         free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
 
-        @debug "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)"
-        @debug "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)"
+        push!(loop_log_cache, "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)")
+        push!(loop_log_cache, "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)")
         yield()
 
-        @debug "checking for reduction trigger"
-        reduce_trigger(eloop, journal, journal_task_callback)
-        @debug "trigger=$(eloop.is_reduce_triggered)"
+        push!(loop_log_cache, "checking for reduction trigger")
+        reduce_trigger(eloop, journal, journal_task_callback, loop_log_cache)
+        push!(loop_log_cache, "trigger=$(eloop.is_reduce_triggered)")
 
         for free_pid in free_pids
             if eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed) && length(eloop.checkpoints) == 0
@@ -722,15 +758,15 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
 
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
-            @debug "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))"
+            push!(loop_log_cache, "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))")
 
             wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
             if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
-                @debug "putting pid=$free_pid onto map channel"
+                push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
             elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
-                @debug "putting pid=$free_pid onto reduce channel"
+                push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
             end
@@ -751,8 +787,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             logerror(e, Logging.Debug)
         end
 
-        @debug "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)"
-        @debug "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, $(length(eloop.used_pids_map)) map workers, and $(length(eloop.used_pids_reduce)) reduce workers)"
+        push!(loop_log_cache, "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)")
+        push!(loop_log_cache, "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, $(length(eloop.used_pids_map)) map workers, and $(length(eloop.used_pids_reduce)) reduce workers)")
 
         if istaskdone(tsk_addrmprocs)
             try
@@ -774,7 +810,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         free_pids = filter(pid->pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
                         push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
                     end
-                    @debug "calling rmprocs on $rm_pids"
+                    push!(loop_log_cache, "calling rmprocs on $rm_pids")
                     try
                         robust_rmprocs(rm_pids; waitfor=addrmprocs_timeout)
                     catch
@@ -787,7 +823,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 end
             elseif δ > 0
                 try
-                    @debug "adding $δ procs"
+                    push!(loop_log_cache, "adding $δ procs")
                     tsk_addrmprocs_tic = time()
                     tsk_addrmprocs = @async eloop.epmap_addprocs(δ)
                     sleep(2) # TODO: this seems needed for running with Distributed.SSHManager on a local cluster
@@ -801,44 +837,47 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             tsk_addrmprocs_interrupt = @async Base.throwto(tsk_addrmprocs, InterruptException())
         end
 
-        @debug "checking for workers sent from the map"
+        push!(loop_log_cache, "checking for workers sent from the map")
         yield()
         try
             while isready(eloop.pid_channel_map_remove)
                 pid,isbad = take!(eloop.pid_channel_map_remove)
-                @debug "map channel, received pid=$pid, making sure that it is initialized"
+                push!(loop_log_cache, "map channel, received pid=$pid, making sure that it is initialized")
                 yield()
                 isbad && push!(bad_pids, pid)
-                @debug "map channel, $pid is initialized, removing from used_pids"
+                push!(loop_log_cache, "map channel, $pid is initialized, removing from used_pids")
                 pid ∈ eloop.used_pids_map && pop!(eloop.used_pids_map, pid)
-                @debug "map channel, done removing $pid from used_pids_map, used_pids_map=$(eloop.used_pids_map)"
+                push!(loop_log_cache, "map channel, done removing $pid from used_pids_map, used_pids_map=$(eloop.used_pids_map)")
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when removing workers from map"
             logerror(e, Logging.Debug)
         end
 
-        @debug "checking for workers sent from the reduce"
+        push!(loop_log_cache, "checking for workers sent from the reduce")
         yield()
         try
             while isready(eloop.pid_channel_reduce_remove)
                 pid,isbad = take!(eloop.pid_channel_reduce_remove)
-                @debug "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized"
+                push!(loop_log_cache, "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized")
                 yield()
                 isbad && push!(bad_pids, pid)
-                @debug "reduce_channel, $pid is initialized, removing from used_pids"
+                push!(loop_log_cache, "reduce_channel, $pid is initialized, removing from used_pids")
                 pid ∈ eloop.used_pids_reduce && pop!(eloop.used_pids_reduce, pid)
-                @debug "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)"
+                push!(loop_log_cache, "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)")
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when removing workers from reduce"
             logerror(e, Logging.Debug)
         end
 
-        @debug "sleeping for $polling_interval seconds"
+        push!(loop_log_cache, "sleeping for $polling_interval seconds")
         sleep(polling_interval)
     end
     @debug "exited the elastic loop"
+
+    # interrupr the loop logging task
+    close(timer_loop_log)
 
     @debug "cancel any pending add/rm procs task"
     while true
