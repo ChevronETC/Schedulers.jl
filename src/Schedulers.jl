@@ -320,8 +320,13 @@ function robust_average(tsk_times, null_tsk_runtime_threshold, tsk_count, tsk, r
     if report
         @debug "calculating robust average for tsk=$tsk, length(tsk_times)=$(length(tsk_times)), length(tsk_times_robust)=$(length(tsk_times_robust)), tsk_count=$tsk_count, null_tsk_runtime_threshold=$null_tsk_runtime_threshold, tsk_times=$(my_extrema(tsk_times)), tsk_times_robust=$(my_extrema(tsk_times_robust))"
     end
-
-    length(tsk_times_robust) >= 0.3 * tsk_count ? median(tsk_times_robust) : Inf
+    if length(tsk_times_robust) >= 0.3 * tsk_count     # Start statistics after 30% of the tasks are done
+        return median(tsk_times_robust)
+    elseif length(tsk_times) > 0.6 * tsk_count # in case the user has set null_tsk_runtime_threshold too high, we will still calculate a value so that we still get a finite timeout
+        return median(tsk_times)
+    else
+        return Inf
+    end
 end
 
 function check_timeout_status(tic, tsk_times, tsk_count, timeout_function_multiplier, grace_period_start_time, null_tsk_runtime_threshold, grace_period_ratio, tsk, report)
