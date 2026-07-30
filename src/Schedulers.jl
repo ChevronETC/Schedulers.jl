@@ -1491,12 +1491,12 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 catch e
                     @warn "pid=$pid ($hostname), checkpoint=$(epmap_eloop.checkpoints[pid]), task loop, caught exception during save_checkpoint"
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=true)
-                    @debug "pushing task onto tsk_pool_todo list"
                     if isa(e, TimeoutException) && options.skip_tasks_that_timeout
                         @warn "skipping task '$tsk' that timed out, checkpoint step"
                         push!(epmap_eloop.tsk_pool_done, tsk)
                         push!(epmap_eloop.tsk_pool_timed_out, tsk)
                     else
+                        @debug "pushing task onto tsk_pool_todo list"
                         push!(epmap_eloop.tsk_pool_todo, tsk)
                     end
                     @debug "handling exception"
