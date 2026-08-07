@@ -659,7 +659,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         push!(loop_log_cache, "check for complete/failed tsk_map")
         yield()
         if istaskdone(tsk_map)
-            @debug "map task done"
+            @debug "map task done" maxlog=1
             isopen(eloop.pid_channel_map_add) && close(eloop.pid_channel_map_add)
             isopen(eloop.pid_channel_map_remove) && close(eloop.pid_channel_map_remove)
             if istaskfailed(tsk_map)
