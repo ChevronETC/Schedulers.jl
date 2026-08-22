@@ -1853,14 +1853,22 @@ function next_checkpoint(id, scratch)
 end
 
 function reduce(reducer!, save_checkpoint_method, fetch_method, load_checkpoint_method, checkpoint1, checkpoint2, checkpoint3, ::Type{T}) where {T}
+    # Aggressively free worker memory before reduction to avoid OOM (the worker may
+    # have just finished a large compute task whose garbage has not been collected yet).
+    GC.gc(true)
+    Sys.islinux() && ccall(:malloc_trim, Cint, (Csize_t,), 0)
     @debug "reduce, load checkpoint 1"
     c1 = load_checkpoint(load_checkpoint_method, checkpoint1, T)
     @debug "reduce, load checkpoint 2"
     c2 = load_checkpoint(load_checkpoint_method, checkpoint2, T)
     @debug "reduce, reducer"
     reducer!(c2, c1)
+    c1 = nothing  # free checkpoint 1 before serializing checkpoint 3
+    GC.gc(false)
     @debug "reduce, serialize"
     save_checkpoint(save_checkpoint_method, fetch_method, checkpoint3, c2, T)
+    c2 = nothing
+    GC.gc(false)
     @debug "reduce, done"
     nothing
 end
