@@ -152,7 +152,7 @@ end
 # for performance metrics, track when the pid is started
 const _pid_up_timestamp = Dict{Int, Float64}()
 
-mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
+mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FMaxReduceWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
     epmap_use_master::Bool
     initialized_pids::Set{Int}
     used_pids_map::Set{Int}
@@ -169,6 +169,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     epmap_save_partial_reduction::FSave
     epmap_minworkers::FMinWorkers
     epmap_maxworkers::FMaxWorkers
+    epmap_maxreduceworkers::FMaxReduceWorkers
     epmap_quantum::FQuantum
     epmap_nworkers::FNWorkers
     tsk_pool_todo::Vector{T}
@@ -209,6 +210,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.save_partial_reduction,
         options.minworkers,
         options.maxworkers,
+        options.maxreduceworkers,
         options.quantum,
         options.nworkers,
         _tsk_pool_todo,
@@ -695,9 +697,9 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum
+        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers,_epmap_quantum
         try
-            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_quantum()
+            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_maxreduceworkers(),eloop.epmap_quantum()
         catch e
             @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers,quantum"
             logerror(e, Logging.Debug)
@@ -770,7 +772,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
+            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
                 push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -931,6 +933,7 @@ mutable struct SchedulerOptions{C}
     skip_tasks_that_timeout::Bool
     minworkers::Function
     maxworkers::Function
+    maxreduceworkers::Function
     nworkers::Function
     usemaster::Bool
     quantum::Function
@@ -969,6 +972,7 @@ function SchedulerOptions(;
         skip_tasks_that_timeout = false,
         minworkers = Distributed.nworkers,
         maxworkers = Distributed.nworkers,
+        maxreduceworkers = typemax(Int),
         nworkers = ()->Distributed.nprocs()-1,
         usemaster = false,
         quantum = ()->32,
@@ -1005,6 +1009,7 @@ function SchedulerOptions(;
         skip_tasks_that_timeout,
         isa(minworkers, Function) ? minworkers : ()->minworkers,
         isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
+        isa(maxreduceworkers, Function) ? maxreduceworkers : ()->maxreduceworkers,
         nworkers,
         usemaster,
         isa(quantum, Function) ? quantum : ()->quantum,
@@ -1043,6 +1048,7 @@ function Base.copy(options::SchedulerOptions)
         options.skip_tasks_that_timeout,
         options.minworkers,
         options.maxworkers,
+        options.maxreduceworkers,
         options.nworkers,
         options.usemaster,
         options.quantum,
