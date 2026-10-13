@@ -210,11 +210,11 @@ end
             sleep(9999999) # block
         else
             sleep(2)
-            addprocs(n)
+            addprocs(1) # a slow manager adds one worker per call, so the loop calls again
         end
     end
 
-    options = SchedulerOptions(;maxworkers=5, addprocs=myaddprocs, quantum=1)
+    options = SchedulerOptions(;maxworkers=5, addprocs=myaddprocs)
     epmap(options, foo5b, 1:100, s)
 
     h = Dict()
@@ -979,6 +979,19 @@ end
     for fieldname in fieldnames(SchedulerOptions)
         @test getfield(options, fieldname) == getfield(_options, fieldname)
     end
+end
+
+@testset "quantum is deprecated and growth asks for the whole shortfall" begin
+    using Distributed, Schedulers
+
+    requested = Int[]
+    myaddprocs(n) = (push!(requested, n); addprocs(n))
+    options = @test_logs (:warn, r"quantum") SchedulerOptions(; maxworkers=4, addprocs=myaddprocs, quantum=1)
+    epmap(options, tsk -> sleep(0.5), 1:20)
+    rmprocs(workers())
+
+    @test first(requested) == 4
+    @test sum(requested) == 4
 end
 
 @testset "logerror" begin
