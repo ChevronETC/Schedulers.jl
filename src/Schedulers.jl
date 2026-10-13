@@ -962,12 +962,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum
+        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers
         evaluated_at = time_ns()
         try
-            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_quantum()
+            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers()
         catch e
-            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers,quantum"
+            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers"
             logerror(e, Logging.Debug)
             continue
         end
@@ -1050,11 +1050,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         δ,n_remaining_tasks = 0,0
         try
             n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
-            δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
+            δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers)
             # note that 1. we will only remove a machine if it is not in the 'eloop.used_pids' vector.
             # and 2. we will only remove machines if we are left with at least epmap_minworkers.
             if _epmap_nworkers + δ < _epmap_minworkers
-                δ = min(_epmap_minworkers - _epmap_nworkers, _epmap_quantum)
+                δ = _epmap_minworkers - _epmap_nworkers
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when computing the number of new machines to add"
@@ -1066,7 +1066,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 clamp(n_remaining_tasks, _epmap_minworkers, _epmap_maxworkers), :active, evaluated_at))
         end
 
-        push!(loop_log_cache, "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)")
+        push!(loop_log_cache, "add machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)")
         push!(loop_log_cache, "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, $(length(eloop.used_pids_map)) map workers, and $(length(eloop.used_pids_reduce)) reduce workers)")
 
         if istaskdone(tsk_addrmprocs)
@@ -1290,7 +1290,7 @@ function SchedulerOptions(;
         maxworkers = Distributed.nworkers,
         nworkers = ()->Distributed.nprocs()-1,
         usemaster = false,
-        quantum = ()->32,
+        quantum = nothing,
         addprocs = Distributed.addprocs,
         init = epmap_default_init,
         preempt_channel_future = epmap_default_preempt_channel_future,
@@ -1316,6 +1316,7 @@ function SchedulerOptions(;
         worker_group = nothing,
         demand = nothing,
         reclaim = nothing)
+    quantum === nothing || @warn "SchedulerOptions: `quantum` is deprecated and ignored; the elastic loop asks for its whole shortfall, up to `maxworkers`, and the cluster manager paces provisioning" maxlog=1
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1418,7 +1419,7 @@ and `pmap_kwargs` are as follows.
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[1]
-* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `quantum` deprecated and ignored: the loop asks for its whole shortfall, up to `maxworkers`
 * `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[2].
@@ -1573,7 +1574,7 @@ and `epmap_kwargs` are as follows.
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=nworkers` the number of machines currently provisioned for work[3]
-* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `quantum` deprecated and ignored: the loop asks for its whole shortfall, up to `maxworkers`
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
