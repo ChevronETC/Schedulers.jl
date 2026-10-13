@@ -88,8 +88,8 @@ epmap(SchedulerOptions(;minworkers=5, maxworkers=15), foo, 1:20)
 rmprocs(workers())
 ```
 
-In addition `options.quantum` and `options.addprocs` can be
-used to control how workers are added.  `Distributed.rmprocs` is used to shrink
+In addition `options.addprocs` can be used to control how workers are added; each
+loop pass asks it for the whole shortfall, up to `maxworkers`.  `Distributed.rmprocs` is used to shrink
 the number of workers.  Further, note that the `epmap_nworkers` method
 allows you to specify a method that returns the current number of allocated
 workers.  This is useful for cloud computing where there is latency associated
