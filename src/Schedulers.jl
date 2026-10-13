@@ -1244,15 +1244,16 @@ and `epmap_kwargs` are as follows.
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
+* `maxreduceworkers=typemax(Int)` maximum number of workers that can be used for the reduction step[3]
 * `usemaster=false` assign tasks to the master process?
-* `nworkers=nworkers` the number of machines currently provisioned for work[3]
+* `nworkers=nworkers` the number of machines currently provisioned for work[4]
 * `quantum=()->32` the maximum number of workers to elastically add at a time
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
 * `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
 * `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
-* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
+* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[5]
 * `reporttasks=true` log task assignment
 * `journalfile=""` write a journal showing what was computed where to a json file
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
@@ -1265,10 +1266,11 @@ and `epmap_kwargs` are as follows.
 written to, and `x` is the data that will be written.
 [2] The signature is `my_load_checkpoint(checkpoint_file)` where `checkpoint_file` is the file that
 data will be loaded from.
-[3] The number of machines provisioined may be greater than the number of workers in the cluster since with
+[3] This works as a client side throttle for the reduction step and is useful when there are both a large number of workers and a large amount of data.
+[4] The number of machines provisioined may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
-[4] If more than one scratch location is selected, then check-point files will be distributed across those locations.
+[5] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
 
 # Examples
