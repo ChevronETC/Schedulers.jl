@@ -446,7 +446,8 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
             close_grace_window!(eloop)
             cancel_remote_call(t, pid, token, options.cancel_timeout) && throw(TaskCancelledException(pid, time() - tic))
         end
-        timeout === nothing || throw(TimeoutException(pid, time() - tic))
+        # without skipping, a task cut by the grace period would only run again
+        (timeout === :function || (timeout === :grace && options.skip_tasks_that_timeout)) && throw(TimeoutException(pid, time() - tic))
         sleep(1)
     end
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
