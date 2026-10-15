@@ -1195,6 +1195,32 @@ end
     rm(dir; recursive=true, force=true)
 end
 
+@testset "epmap grace period without skipping lets tasks finish" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pids = workers()
+    dir = mktempdir()
+
+    @everywhere function f_noskip(tsk, dir)
+        sleep(2)
+        touch(joinpath(dir, "done-$tsk"))
+        nothing
+    end
+
+    added = Ref(0)
+    options = SchedulerOptions(; minworkers=4, maxworkers=4, addprocs=n -> (added[] += n; nothing),
+        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1)
+    journal, tsks = epmap(options, f_noskip, 1:16, dir)
+
+    @test isempty(tsks)
+    @test all(tsk -> isfile(joinpath(dir, "done-$tsk")), 1:16)
+    @test added[] == 0
+    @test workers() == pids
+
+    rmprocs(workers())
+    rm(dir; recursive=true, force=true)
+end
+
 @testset "minworkers > maxworkers" begin
     options = SchedulerOptions(;minworkers=10, maxworkers=5)
 
