@@ -210,11 +210,11 @@ end
             sleep(9999999) # block
         else
             sleep(2)
-            addprocs(n)
+            addprocs(1) # a slow manager adds one worker per call, so the loop calls again
         end
     end
 
-    options = SchedulerOptions(;maxworkers=5, addprocs=myaddprocs, quantum=1)
+    options = SchedulerOptions(;maxworkers=5, addprocs=myaddprocs)
     epmap(options, foo5b, 1:100, s)
 
     h = Dict()
@@ -981,6 +981,19 @@ end
     end
 end
 
+@testset "quantum is deprecated and growth asks for the whole shortfall" begin
+    using Distributed, Schedulers
+
+    requested = Int[]
+    myaddprocs(n) = (push!(requested, n); addprocs(n))
+    options = @test_logs (:warn, r"quantum") SchedulerOptions(; maxworkers=4, addprocs=myaddprocs, quantum=1)
+    epmap(options, tsk -> sleep(0.5), 1:20)
+    rmprocs(workers())
+
+    @test first(requested) == 4
+    @test sum(requested) == 4
+end
+
 @testset "logerror" begin
     try
         notafunction()
@@ -1083,4 +1096,307 @@ end
         @test nworkers() <= 5
         sleep(0.01)
     end
+end
+
+@testset "worker group retirement planning" begin
+    plan = Schedulers.plan_group_retirement
+    groups = Dict(:a => [2, 3, 4, 5], :b => [6, 7, 8, 9])
+
+    # An idle primary with busy siblings is not removed; the group stops taking work.
+    retiring, rm_pids = plan(groups, Set([3, 4, 5, 6, 7, 8, 9]), Set{Any}(), 4)
+    @test retiring == Set([:a]) && isempty(rm_pids)
+    # A task completing while retirement is pending makes the whole group removable.
+    retiring, rm_pids = plan(groups, Set([6, 7, 8, 9]), retiring, 4)
+    @test rm_pids == [2, 3, 4, 5]
+    # Excess smaller than a group retires nothing (round down to whole groups).
+    @test plan(groups, Set{Int}(), Set{Any}(), 3) == (Set{Any}(), Int[])
+    # Groups with fewer busy workers retire first.
+    @test first(plan(groups, Set([2]), Set{Any}(), 4)) == Set([:b])
+    # A retiring group whose members have all exited is forgotten.
+    @test first(plan(Dict(:b => [6]), Set{Int}(), Set([:a]), 0)) == Set{Any}()
+
+    keys_cache = Dict{Int,Any}()
+    grouped, unknown = Schedulers.worker_groups!(keys_cache, pid -> pid == 9 ? nothing : div(pid, 2), [1, 2, 3, 9])
+    @test grouped == Dict(1 => [2, 3]) && unknown == [9]
+    @test keys_cache == Dict(2 => 1, 3 => 1)
+
+    @test Schedulers.trim_worker_groups(groups, 4) == [2, 3, 4, 5]
+    @test Schedulers.trim_worker_groups(groups, 5) == Int[]
+    @test Schedulers.trim_worker_groups(groups, 8, Set([:b])) == [6, 7, 8, 9]
+end
+
+@testset "epmap with grouped workers" begin
+    safe_addprocs(6)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    s = randstring(6)
+    @everywhere function foo_grouped(tsk, s)
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk,$(myid())")
+        sleep(tsk <= 2 ? 20 : 2)
+    end
+
+    # Long tasks run 10x the median; a high multiplier keeps them from timing out.
+    options = SchedulerOptions(; maxworkers=6, minworkers=2, timeout_function_multiplier=100,
+        worker_group=pid -> get(pairs, pid, nothing))
+    epmap(options, foo_grouped, 1:12, s)
+
+    remaining = workers()
+    @test length(remaining) == 2
+    @test pairs[remaining[1]] == pairs[remaining[2]]
+    for tsk = 1:12
+        file = joinpath(tempdir(), "task-$s-$tsk.txt")
+        @test split(read(file, String), ",")[1] == "$tsk"
+        rm(file)
+    end
+    rmprocs(workers())
+end
+
+@testset "demand feed" begin
+    observation(n, phase=:active) = DemandObservation(n, phase, time_ns())
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs); queue_limit=1)
+
+    # With no loop attached, a request is answered at once with the resting state.
+    asked = time_ns()
+    resting = request_evaluation(feed; timeout=0.1)
+    @test resting.phase == :idle && resting.workers == 0 && resting.evaluated_at >= asked
+
+    Schedulers._attach!(feed)
+    @test_throws ArgumentError Schedulers._attach!(feed)
+
+    # A request is answered only by an evaluation that began after it.
+    early = observation(3)
+    request = @async request_evaluation(feed; timeout=10)
+    @test timedwait(() -> !isempty(feed.requests), 5) == :ok
+    @test request_evaluation(feed; timeout=0.1) === nothing    # the queue is full
+    Schedulers._observe!(feed, early)
+    sleep(0.1)
+    @test !istaskdone(request)
+    fresh = observation(5)
+    Schedulers._observe!(feed, fresh)
+    @test fetch(request) == fresh
+
+    # A loop that does not answer in time yields nothing.
+    @test request_evaluation(feed; timeout=0.2) === nothing
+
+    Schedulers._detach!(feed, observation(2, :idle))
+    @test last(published).phase == :idle
+    @test request_evaluation(feed; timeout=0.1).workers == 2
+
+    # The loop never waits for publish; undelivered observations are replaced.
+    release = Base.Event()
+    seen = Int[]
+    slow = DemandFeed(obs -> (wait(release); push!(seen, obs.workers)))
+    Schedulers._attach!(slow)
+    Schedulers._observe!(slow, observation(1))
+    sleep(0.1)
+    for n in 2:5
+        Schedulers._observe!(slow, observation(n))
+    end
+    notify(release)
+    Schedulers._detach!(slow, observation(0, :idle))
+    @test seen == [1, 0]
+end
+
+@testset "epmap with a demand feed" begin
+    safe_addprocs(2)
+    @everywhere using Distributed, Schedulers
+    @everywhere demand_task(tsk) = sleep(2)
+
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs))
+    grown = Ref(0)
+    options = SchedulerOptions(; minworkers=1, maxworkers=4, demand=feed, reporttasks=false,
+        addprocs=n -> (grown[] += n; Int[]))
+    run = @async epmap(options, demand_task, 1:8)
+
+    @test timedwait(() -> !isempty(published), 10) == :ok
+    asked = time_ns()
+    answer = request_evaluation(feed; timeout=10)
+    @test answer !== nothing && answer.phase == :active && answer.evaluated_at >= asked
+    @test 1 <= answer.workers <= 4
+    fetch(run)
+
+    @test grown[] == 0                                 # growth belongs to the resource manager
+    @test first(published).workers == 4                # clamp(8 remaining, 1, 4)
+    @test all(obs -> obs.phase == :active, published[1:end-1])
+    @test last(published) == DemandObservation(1, :idle, last(published).evaluated_at)
+    resting = request_evaluation(feed; timeout=0.1)
+    @test (resting.workers, resting.phase) == (1, :idle)
+    rmprocs(workers())
+end
+
+@testset "epmap with a demand feed stops on error" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    @everywhere demand_failing(tsk) = error("task $tsk failed")
+
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs))
+    options = SchedulerOptions(; maxerrors=1, minworkers=1, maxworkers=1, demand=feed,
+        reporttasks=false)
+    @test_throws Exception epmap(options, demand_failing, 1:4)
+    @test last(published).phase == :stopping
+    @test request_evaluation(feed; timeout=0.1).phase == :stopping
+    rmprocs(workers())
+end
+
+@testset "a stalled elastic loop fails evaluation closed" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    @everywhere demand_slow(tsk) = sleep(1)
+
+    stalled = Ref(false)
+    published = Ref(0)
+    feed = DemandFeed(_ -> (published[] += 1))
+    options = SchedulerOptions(; minworkers=1, maxworkers=1, demand=feed, reporttasks=false,
+        nworkers=() -> (stalled[] && sleep(4); Distributed.nprocs() - 1))
+    run = @async epmap(options, demand_slow, 1:12)
+
+    @test request_evaluation(feed; timeout=10) !== nothing
+    stalled[] = true
+    sleep(1.5)
+    before = published[]
+    @test request_evaluation(feed; timeout=1) === nothing
+    @test published[] == before
+    stalled[] = false
+    @test request_evaluation(feed; timeout=10) !== nothing
+    fetch(run)
+    rmprocs(workers())
+end
+
+@testset "epmap with reclaimed workers" begin
+    @everywhere function reclaim_task(tsk, dir)
+        write(joinpath(dir, "task-$tsk"), string(myid()))
+        sleep(2)
+    end
+    succeeded_once(journal, tsks) = all(tsk -> length(journal["tasks"][tsk]["trials"]) == 1 &&
+        journal["tasks"][tsk]["trials"][1]["status"] == "succeeded", tsks)
+
+    # Without groups: the reclaimed worker finishes its task, then leaves.
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    dir = mktempdir()
+    victim = first(workers())
+    reclaim_at = Ref(Inf)
+    options = SchedulerOptions(; minworkers=3, maxworkers=4, reporttasks=false,
+        timeout_function_multiplier=100, addprocs=n -> nothing,
+        reclaim=() -> time() > reclaim_at[] ? [victim] : Int[])
+    run = @async epmap(options, reclaim_task, 1:16, dir)
+    sleep(4)
+    reclaim_at[] = time()
+    journal, _ = fetch(run)
+    @test succeeded_once(journal, 1:16)
+    @test victim ∉ workers()
+    ran = [parse(Int, read(joinpath(dir, "task-$tsk"), String)) for tsk in 1:16]
+    @test count(==(victim), ran) <= 3
+    rmprocs(workers())
+
+    # With groups: the whole group of a reclaimed worker retires once idle.
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    victim = first(workers())
+    siblings = [pid for pid in workers() if pairs[pid] == pairs[victim]]
+    reclaim_at[] = Inf
+    options = SchedulerOptions(; minworkers=2, maxworkers=4, reporttasks=false,
+        timeout_function_multiplier=100, addprocs=n -> nothing,
+        worker_group=pid -> get(pairs, pid, nothing),
+        reclaim=() -> time() > reclaim_at[] ? [victim] : Int[])
+    run = @async epmap(options, reclaim_task, 1:16, mktempdir())
+    sleep(4)
+    reclaim_at[] = time()
+    journal, _ = fetch(run)
+    @test succeeded_once(journal, 1:16)
+    @test isempty(intersect(siblings, workers()))
+    @test length(workers()) == 2
+    rmprocs(workers())
+end
+
+@testset "epmapreduce! with a demand feed" begin
+    safe_addprocs(3)
+    @everywhere using Distributed, Schedulers
+    @everywhere function demand_reduce_task(x, tsk, dir)
+        sleep(0.5)
+        x .+= tsk
+        write(joinpath(dir, "task-$tsk"), string(time_ns()))
+        nothing
+    end
+    @everywhere demand_slow_reducer!(x, y) = (sleep(1.5); x .+= y; nothing)
+
+    dir = mktempdir()
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs))
+    grown = Ref(0)
+    options = SchedulerOptions(; minworkers=0, maxworkers=8, demand=feed, reporttasks=false,
+        scratch=mktempdir(), reducer! = demand_slow_reducer!, addprocs=n -> (grown[] += n; Int[]))
+    x, _ = epmapreduce!(zeros(Float32, 4), options, demand_reduce_task, 1:12, dir)
+
+    @test x ≈ sum(1:12) * ones(4)
+    @test grown[] == 0
+    @test first(published).workers == 8               # clamp(12 tasks, 0, 8)
+    @test all(obs -> obs.phase == :active, published[1:end-1])
+    @test last(published).phase == :idle
+    # Pending reductions keep demand up after the last map task finishes.
+    map_done = maximum(parse(UInt64, read(joinpath(dir, "task-$tsk"), String)) for tsk in 1:12)
+    @test any(obs -> obs.phase == :active && obs.evaluated_at > map_done && obs.workers >= 1,
+              published)
+    rmprocs(workers())
+end
+
+@testset "epmap with a demand feed waits for its first worker" begin
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs))
+    options = SchedulerOptions(; minworkers=0, maxworkers=2, demand=feed, reporttasks=false,
+        nworkers=() -> nprocs() - 1)
+    run = @async epmap(options, tsk -> (sleep(0.2); myid()), 1:4)
+
+    @test timedwait(() -> !isempty(published), 10) == :ok
+    sleep(3)
+    @test !istaskdone(run)
+    @test all(obs -> (obs.workers, obs.phase) == (2, :active), published)
+    safe_addprocs(1)                                   # the resource manager admits a worker
+    journal, _ = fetch(run)
+    @test all(tsk -> journal["tasks"][tsk]["trials"][end]["pid"] != 1, 1:4)
+    @test last(published).phase == :idle
+    rmprocs(workers())
+end
+
+@testset "epmap with a demand feed follows changing bounds" begin
+    safe_addprocs(2)
+    @everywhere using Distributed, Schedulers
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs))
+    bound = Ref(6)
+    options = SchedulerOptions(; minworkers=1, maxworkers=() -> bound[], demand=feed,
+        reporttasks=false)
+    run = @async epmap(options, tsk -> sleep(1), 1:30)
+    since(t) = filter(obs -> obs.evaluated_at > t, published)
+
+    @test timedwait(() -> any(obs -> obs.workers == 6, published), 10) == :ok
+    lowered = time_ns()
+    bound[] = 3
+    @test timedwait(() -> any(obs -> obs.workers == 3, since(lowered)), 10) == :ok
+    raised = time_ns()
+    bound[] = 5
+    @test timedwait(() -> any(obs -> obs.workers == 5, since(raised)), 10) == :ok
+    @test all(obs -> obs.workers <= 3, filter(obs -> obs.evaluated_at < raised, since(lowered)))
+    fetch(run)
+    rmprocs(workers())
+end
+
+@testset "epmap with a demand feed retires whole groups" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    published = DemandObservation[]
+    feed = DemandFeed(obs -> push!(published, obs))
+    options = SchedulerOptions(; minworkers=2, maxworkers=4, demand=feed, reporttasks=false,
+        timeout_function_multiplier=100, worker_group=pid -> get(pairs, pid, nothing))
+    epmap(options, tsk -> sleep(tsk <= 2 ? 6 : 1), 1:8)
+
+    remaining = workers()
+    @test length(remaining) == 2 && pairs[remaining[1]] == pairs[remaining[2]]
+    @test (last(published).workers, last(published).phase) == (2, :idle)
+    rmprocs(workers())
 end

@@ -152,6 +152,134 @@ end
 # for performance metrics, track when the pid is started
 const _pid_up_timestamp = Dict{Int, Float64}()
 
+"""
+    DemandObservation(workers, phase, evaluated_at)
+
+One evaluation of how many worker processes an elastic loop can use. `phase` is
+`:active` while it dispatches work, `:idle` after it finished normally, and
+`:stopping` after an error or interrupt. `evaluated_at` is the `time_ns()` when
+the evaluation began.
+"""
+struct DemandObservation
+    workers::Int
+    phase::Symbol
+    evaluated_at::UInt64
+end
+
+"""
+    DemandFeed(publish; queue_limit=16)
+
+Demand hooks for a resource manager that admits capacity against the
+application's current need. Pass it as `SchedulerOptions(; demand=feed)`.
+
+Each pass of the elastic loop evaluates the useful number of workers,
+`clamp(remaining tasks and reductions, minworkers, maxworkers)`, and hands it to
+`publish(::DemandObservation)` on a separate task. The loop never waits for
+`publish`; an observation not yet delivered is replaced by a newer one. When the
+loop ends it publishes `:idle` with the number of workers it kept, or
+`:stopping` after an error or interrupt. In demand mode the loop never calls
+`addprocs`: growth belongs to the resource manager. Retirement is unchanged, so
+pair the feed with `worker_group` when a resource runs several worker processes.
+
+[`request_evaluation`](@ref) answers an admission check with an evaluation made
+after the request. A feed serves one loop at a time and can be reused by
+consecutive loops.
+"""
+mutable struct DemandFeed
+    publish::Function
+    queue_limit::Int
+    lock::ReentrantLock
+    attached::Bool
+    resting::DemandObservation        # the answer while no loop is attached
+    pending::Union{Nothing,DemandObservation}
+    delivering::Bool
+    requests::Vector{Tuple{UInt64,Channel{DemandObservation}}}
+end
+
+DemandFeed(publish::Function; queue_limit::Integer=16) = DemandFeed(publish, Int(queue_limit),
+    ReentrantLock(), false, DemandObservation(0, :idle, time_ns()), nothing, false,
+    Tuple{UInt64,Channel{DemandObservation}}[])
+
+"""
+    request_evaluation(feed; timeout=10) -> Union{DemandObservation,Nothing}
+
+A fresh evaluation of the loop's demand: the first that began after this call.
+With no loop running, the resting state (`:idle` or `:stopping`) is returned,
+evaluated now. Returns `nothing` when the loop does not answer within `timeout`
+seconds or too many requests are waiting; treat that as "do not admit".
+"""
+function request_evaluation(feed::DemandFeed; timeout::Real=10)
+    received = time_ns()
+    reply = Channel{DemandObservation}(1)
+    queued = lock(feed.lock) do
+        feed.attached || return DemandObservation(feed.resting.workers, feed.resting.phase, received)
+        length(feed.requests) < feed.queue_limit || return false
+        push!(feed.requests, (received, reply))
+        true
+    end
+    queued isa DemandObservation && return queued
+    queued || return nothing
+    timedwait(() -> isready(reply), Float64(timeout); pollint=0.02)
+    lock(feed.lock) do
+        filter!(request -> request[2] !== reply, feed.requests)
+    end
+    isready(reply) ? take!(reply) : nothing
+end
+
+function _attach!(feed::DemandFeed)
+    lock(feed.lock) do
+        feed.attached && throw(ArgumentError("a DemandFeed serves one elastic loop at a time"))
+        feed.attached = true
+    end
+    nothing
+end
+
+# Answer the requests `obs` was evaluated after (all of them when detaching),
+# then queue `obs` for publishing.
+function _observe!(feed::DemandFeed, obs::DemandObservation; answer_all::Bool=false)
+    lock(feed.lock) do
+        filter!(feed.requests) do (received, reply)
+            (answer_all || received <= obs.evaluated_at) || return true
+            put!(reply, obs)
+            false
+        end
+        feed.pending = obs
+        if !feed.delivering
+            feed.delivering = true
+            @async _deliver(feed)
+        end
+    end
+    nothing
+end
+
+function _deliver(feed::DemandFeed)
+    while true
+        obs = lock(feed.lock) do
+            next = feed.pending
+            feed.pending = nothing
+            next === nothing && (feed.delivering = false)
+            next
+        end
+        obs === nothing && return
+        try
+            feed.publish(obs)
+        catch e
+            @warn "demand publish failed"
+            logerror(e, Logging.Debug)
+        end
+    end
+end
+
+function _detach!(feed::DemandFeed, obs::DemandObservation; flush_timeout::Real=5)
+    lock(feed.lock) do
+        feed.attached = false
+        feed.resting = obs
+    end
+    _observe!(feed, obs; answer_all=true)
+    timedwait(() -> lock(() -> !feed.delivering, feed.lock), Float64(flush_timeout); pollint=0.02)
+    nothing
+end
+
 mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FMaxReduceWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
     epmap_use_master::Bool
     initialized_pids::Set{Int}
@@ -189,6 +317,13 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
+    worker_group::Union{Nothing,Function}
+    group_keys::Dict{Int,Any}
+    retiring_groups::Set{Any}
+    retiring_pids::Set{Int}
+    demand::Union{Nothing,DemandFeed}
+    reclaim::Union{Nothing,Function}
+    reclaimed_pids::Set{Int}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -230,6 +365,13 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
+        options.worker_group,
+        Dict{Int,Any}(),
+        Set{Any}(),
+        Set{Int}(),
+        options.demand,
+        options.reclaim,
+        Set{Int}(),
     )
 
     if !isreduce
@@ -554,6 +696,131 @@ function robust_rmprocs(pids; waitfor)
     end
 end
 
+"""
+    worker_groups!(group_keys, worker_group, pids) -> (groups, unknown)
+
+Group the workers in `pids` (excluding the master) by `worker_group(pid)`,
+caching each pid's key in `group_keys` once known. Pids whose group is not
+known yet (`worker_group` returned `nothing` or failed) are returned in `unknown`.
+"""
+function worker_groups!(group_keys::Dict{Int,Any}, worker_group::Function, pids)
+    groups = Dict{Any,Vector{Int}}()
+    unknown = Int[]
+    for pid in pids
+        pid == 1 && continue
+        key = get(group_keys, pid, nothing)
+        if key === nothing
+            key = try
+                worker_group(pid)
+            catch e
+                @warn "worker_group failed for pid=$pid"
+                logerror(e, Logging.Debug)
+                nothing
+            end
+            if key === nothing
+                push!(unknown, pid)
+                continue
+            end
+            group_keys[pid] = key
+        end
+        push!(get!(Vector{Int}, groups, key), pid)
+    end
+    foreach(sort!, values(groups))
+    groups, unknown
+end
+
+"""
+    plan_group_retirement(groups, busy, retiring, excess) -> (retiring, rm_pids)
+
+One pass of group-aware retirement. `groups` maps keys to their live pids,
+`busy` holds pids running map or reduce work, `retiring` holds the keys of
+groups already retiring, and `excess` is the number of workers to shed.
+Retiring groups count toward `excess`; further groups retire, fewest busy
+workers first, only while whole groups fit in what remains. Retiring groups
+that are entirely idle are returned for removal. Groups stay retiring until
+no member is alive, so none of their workers receives new work.
+"""
+function plan_group_retirement(groups::AbstractDict, busy, retiring, excess::Integer)
+    retiring = Set{Any}(key for key in retiring if haskey(groups, key))
+    shed = excess - sum(key -> length(groups[key]), retiring; init=0)
+    candidates = sort!([key for key in keys(groups) if key ∉ retiring];
+        by=key -> (count(in(busy), groups[key]), length(groups[key]), first(groups[key])))
+    for key in candidates
+        n = length(groups[key])
+        n <= shed || continue
+        push!(retiring, key)
+        shed -= n
+    end
+    rm_pids = Int[]
+    for key in retiring
+        any(in(busy), groups[key]) || append!(rm_pids, groups[key])
+    end
+    retiring, sort!(rm_pids)
+end
+
+"""
+Update the loop's retiring groups for one pass and return the pids to remove:
+idle retiring groups, plus failed or idle reclaimed pids whose group was never known.
+"""
+function retire_worker_groups!(eloop::ElasticLoop, bad_pids::Set{Int}, δ::Integer)
+    live = workers()
+    groups, _ = worker_groups!(eloop.group_keys, eloop.worker_group, live)
+    busy = union(eloop.used_pids_map, eloop.used_pids_reduce)
+    lone_bad = Int[]
+    for pid in bad_pids
+        key = get(eloop.group_keys, pid, nothing)
+        if key !== nothing
+            push!(eloop.retiring_groups, key)
+        elseif pid ∈ live
+            push!(lone_bad, pid)
+        end
+    end
+    empty!(bad_pids)
+    for pid in eloop.reclaimed_pids
+        key = get(eloop.group_keys, pid, nothing)
+        if key !== nothing
+            push!(eloop.retiring_groups, key)
+        elseif pid ∈ live && pid ∉ busy
+            push!(lone_bad, pid)
+        end
+    end
+    eloop.retiring_groups, rm_pids = plan_group_retirement(
+        groups, busy, eloop.retiring_groups, max(-δ, 0) - length(lone_bad))
+    eloop.retiring_pids = Set{Int}(pid for key in eloop.retiring_groups for pid in groups[key])
+    sort!(union(rm_pids, lone_bad))
+end
+
+# Pids the resource manager wants back this pass; they get no new work.
+function reclaimed_pids(eloop::ElasticLoop)
+    eloop.reclaim === nothing && return Set{Int}()
+    try
+        Set{Int}(eloop.reclaim())
+    catch e
+        @warn "reclaim callback failed"
+        logerror(e, Logging.Debug)
+        Set{Int}()
+    end
+end
+
+retiring(eloop::ElasticLoop, pid) = pid ∈ eloop.retiring_pids || pid ∈ eloop.reclaimed_pids
+
+"""
+Pids of whole groups to remove after a run: every retiring group, then other
+groups (smallest first) while at least `minworkers` workers remain.
+"""
+function trim_worker_groups(groups::AbstractDict, minworkers::Integer, retiring=Set{Any}())
+    remaining = sum(length, values(groups); init=0)
+    rm_pids = Int[]
+    for key in sort!(collect(keys(groups));
+            by=key -> (key ∉ retiring, length(groups[key]), first(groups[key])))
+        n = length(groups[key])
+        (key ∈ retiring || remaining - n >= minworkers) || continue
+        append!(rm_pids, groups[key])
+        remaining -= n
+    end
+    sort!(rm_pids)
+end
+
 function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
@@ -697,11 +964,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers,_epmap_quantum
+        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers
+        evaluated_at = time_ns()
         try
-            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_maxreduceworkers(),eloop.epmap_quantum()
+            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_maxreduceworkers()
         catch e
-            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers,quantum"
+            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers,maxreduceworkers"
             logerror(e, Logging.Debug)
             continue
         end
@@ -748,7 +1016,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
-        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
+        eloop.reclaimed_pids = reclaimed_pids(eloop)
+        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids && !retiring(eloop, pid)), workers())
 
         push!(loop_log_cache, "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)")
         push!(loop_log_cache, "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)")
@@ -783,18 +1052,23 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         δ,n_remaining_tasks = 0,0
         try
             n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
-            δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
+            δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers)
             # note that 1. we will only remove a machine if it is not in the 'eloop.used_pids' vector.
             # and 2. we will only remove machines if we are left with at least epmap_minworkers.
             if _epmap_nworkers + δ < _epmap_minworkers
-                δ = min(_epmap_minworkers - _epmap_nworkers, _epmap_quantum)
+                δ = _epmap_minworkers - _epmap_nworkers
             end
         catch e
             @warn "problem in Schedulers.jl elastic loop when computing the number of new machines to add"
             logerror(e, Logging.Debug)
         end
 
-        push!(loop_log_cache, "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)")
+        if eloop.demand !== nothing
+            _observe!(eloop.demand, DemandObservation(
+                clamp(n_remaining_tasks, _epmap_minworkers, _epmap_maxworkers), :active, evaluated_at))
+        end
+
+        push!(loop_log_cache, "add machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)")
         push!(loop_log_cache, "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, $(length(eloop.used_pids_map)) map workers, and $(length(eloop.used_pids_reduce)) reduce workers)")
 
         if istaskdone(tsk_addrmprocs)
@@ -805,16 +1079,33 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 logerror(e, Logging.Debug)
             end
 
-            if δ < 0 || length(bad_pids) > 0
+            group_rm_pids = eloop.worker_group === nothing ? nothing : retire_worker_groups!(eloop, bad_pids, δ)
+            idle_reclaimed = group_rm_pids !== nothing ? Int[] : [pid for pid in eloop.reclaimed_pids
+                if pid ∈ workers() && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce]
+            if group_rm_pids !== nothing && !isempty(group_rm_pids)
+                push!(loop_log_cache, "retiring worker groups, calling rmprocs on $group_rm_pids")
+                tsk_addrmprocs_tic = time()
+                tsk_addrmprocs = @async begin
+                    try
+                        robust_rmprocs(group_rm_pids; waitfor=addrmprocs_timeout)
+                    catch
+                        @warn "unable to run rmprocs on $group_rm_pids in $addrmprocs_timeout seconds."
+                    end
+                    for rm_pid in group_rm_pids
+                        haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
+                    end
+                end
+            elseif group_rm_pids === nothing && (δ < 0 || length(bad_pids) > 0 || !isempty(idle_reclaimed))
                 rm_pids = Int[]
                 while !isempty(bad_pids)
                     push!(rm_pids, pop!(bad_pids))
                 end
+                append!(rm_pids, setdiff(idle_reclaimed, rm_pids))
                 δ += length(rm_pids)
                 tsk_addrmprocs_tic = time()
                 tsk_addrmprocs = @async begin
                     if δ < 0
-                        free_pids = filter(pid->pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
+                        free_pids = filter(pid->pid ∉ rm_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
                         push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
                     end
                     push!(loop_log_cache, "calling rmprocs on $rm_pids")
@@ -828,7 +1119,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
                     end
                 end
-            elseif δ > 0
+            elseif δ > 0 && eloop.demand === nothing
                 try
                     push!(loop_log_cache, "adding $δ procs")
                     tsk_addrmprocs_tic = time()
@@ -900,16 +1191,25 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     # ensure we are left with epmap_minworkers
     @debug "elastic loop, trimminig workers"
     try
-        _workers = workers()
-        if 1 ∈ _workers
-            popfirst!(_workers)
-        end
-        n = length(_workers) - eloop.epmap_minworkers()
-        if n > 0
-            @debug "trimming $n workers"
-            tsk_addrmprocs_tic = time()
-            tsk_addrmprocs = robust_rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
-            @debug "done trimming $n workers"
+        if eloop.worker_group !== nothing
+            groups, unknown = worker_groups!(eloop.group_keys, eloop.worker_group, workers())
+            rm_pids = trim_worker_groups(groups, eloop.epmap_minworkers() - length(unknown), eloop.retiring_groups)
+            if !isempty(rm_pids)
+                @debug "trimming worker groups" rm_pids
+                robust_rmprocs(rm_pids; waitfor=addrmprocs_timeout)
+            end
+        else
+            _workers = workers()
+            if 1 ∈ _workers
+                popfirst!(_workers)
+            end
+            n = length(_workers) - eloop.epmap_minworkers()
+            if n > 0
+                @debug "trimming $n workers"
+                tsk_addrmprocs_tic = time()
+                tsk_addrmprocs = robust_rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
+                @debug "done trimming $n workers"
+            end
         end
     catch e
         @warn "problem trimming workers after map-reduce"
@@ -918,6 +1218,22 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     @debug "elastic loop, done trimming workers"
 
     nothing
+end
+
+# Run the elastic loop with its demand feed attached; publish how it ended, however it ends.
+function with_demand(f::Function, eloop::ElasticLoop, tasks_failed::Function)
+    feed = eloop.demand
+    feed === nothing && return f()
+    _attach!(feed)
+    finished = false
+    try
+        result = f()
+        finished = !(eloop.errored || eloop.interrupted || tasks_failed())
+        result
+    finally
+        _detach!(feed, DemandObservation(count(!=(1), workers()),
+            finished ? :idle : :stopping, time_ns()))
+    end
 end
 
 default_reducer!(x, y) = (x .+= y; nothing)
@@ -959,6 +1275,9 @@ mutable struct SchedulerOptions{C}
     reduce_trigger::Function
     save_partial_reduction::Function
     gethostname::Function
+    worker_group::Union{Nothing,Function}
+    demand::Union{Nothing,DemandFeed}
+    reclaim::Union{Nothing,Function}
 end
 
 function SchedulerOptions(;
@@ -975,7 +1294,7 @@ function SchedulerOptions(;
         maxreduceworkers = typemax(Int),
         nworkers = ()->Distributed.nprocs()-1,
         usemaster = false,
-        quantum = ()->32,
+        quantum = nothing,
         addprocs = Distributed.addprocs,
         init = epmap_default_init,
         preempt_channel_future = epmap_default_preempt_channel_future,
@@ -997,7 +1316,11 @@ function SchedulerOptions(;
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
-        gethostname = gethostname)
+        gethostname = gethostname,
+        worker_group = nothing,
+        demand = nothing,
+        reclaim = nothing)
+    quantum === nothing || @warn "SchedulerOptions: `quantum` is deprecated and ignored; the elastic loop asks for its whole shortfall, up to `maxworkers`, and the cluster manager paces provisioning" maxlog=1
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1033,7 +1356,10 @@ function SchedulerOptions(;
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction,
-        gethostname)
+        gethostname,
+        worker_group,
+        demand,
+        reclaim)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -1072,7 +1398,10 @@ function Base.copy(options::SchedulerOptions)
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction,
-        options.gethostname)
+        options.gethostname,
+        options.worker_group,
+        options.demand,
+        options.reclaim)
 end
 
 """
@@ -1096,7 +1425,7 @@ and `pmap_kwargs` are as follows.
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[1]
-* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `quantum` deprecated and ignored: the loop asks for its whole shortfall, up to `maxworkers`
 * `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[2].
@@ -1105,6 +1434,9 @@ and `pmap_kwargs` are as follows.
 * `reporttasks=true` log task assignment
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
+* `worker_group=nothing` optional `pid->key` mapping; pids with the same key (for example, processes on one VM) are retired together, only once all are idle. Return `nothing` while a pid's group is unknown.
+* `demand=nothing` optional [`DemandFeed`](@ref): publish the loop's demand to a resource manager, which admits growth, instead of calling `addprocs`
+* `reclaim=nothing` optional method returning the pids the resource manager wants back; they get no new work and are removed once idle (with `worker_group`, their whole group)
 # GXTODO: add doc
 ## Notes
 [1] The number of machines provisioned may be greater than the number of workers in the cluster since with
@@ -1117,7 +1449,9 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
 
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
-    loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    with_demand(eloop, () -> istaskfailed(tsk_map)) do
+        loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    end
     fetch(tsk_map)
 end
 
@@ -1156,7 +1490,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 end
 
                 @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
-                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted || retiring(eloop, pid)
                     @debug "putting $pid onto map_remove channel"
                     put!(eloop.pid_channel_map_remove, (pid,false))
                     break
@@ -1247,7 +1581,7 @@ and `epmap_kwargs` are as follows.
 * `maxreduceworkers=typemax(Int)` maximum number of workers that can be used for the reduction step[3]
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=nworkers` the number of machines currently provisioned for work[4]
-* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `quantum` deprecated and ignored: the loop asks for its whole shortfall, up to `maxworkers`
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
@@ -1261,6 +1595,9 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
+* `worker_group=nothing` optional `pid->key` mapping; pids with the same key are retired together, only once all are idle
+* `demand=nothing` optional [`DemandFeed`](@ref): publish the loop's demand to a resource manager, which admits growth, instead of calling `addprocs`
+* `reclaim=nothing` optional method returning the pids the resource manager wants back; they get no new work and are removed once idle (with `worker_group`, their whole group)
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
@@ -1342,7 +1679,9 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
         tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
         @debug "waiting for tsk_loop"
-        loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        with_demand(epmap_eloop, () -> istaskfailed(tsk_map) || istaskfailed(tsk_reduce)) do
+            loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        end
         @debug "fetching from tsk_reduce"
         result = fetch(tsk_reduce)
         @debug "finished fetching from tsk_reduce"
@@ -1431,7 +1770,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
                 @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed) || retiring(epmap_eloop, pid)
                     if epmap_eloop.checkpoints[pid] !== nothing
                         push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                     end
@@ -1642,7 +1981,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
 
                 @debug "reduce, pid=$pid, at exit condition, n_checkpoints=$n_checkpoints"
-                if n_checkpoints < 2
+                if n_checkpoints < 2 || retiring(epmap_eloop, pid)
                     unlock(l)
                     @debug "reduce, popping pid=$pid from dirty list"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
@@ -1882,5 +2221,6 @@ default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
+export DemandFeed, DemandObservation, request_evaluation
 
 end
