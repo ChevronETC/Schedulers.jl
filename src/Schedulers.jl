@@ -284,7 +284,7 @@ function _detach!(feed::DemandFeed, obs::DemandObservation; flush_timeout::Real=
     nothing
 end
 
-mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
+mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FMaxReduceWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
     epmap_use_master::Bool
     initialized_pids::Set{Int}
     used_pids_map::Set{Int}
@@ -301,6 +301,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     epmap_save_partial_reduction::FSave
     epmap_minworkers::FMinWorkers
     epmap_maxworkers::FMaxWorkers
+    epmap_maxreduceworkers::FMaxReduceWorkers
     epmap_quantum::FQuantum
     epmap_nworkers::FNWorkers
     tsk_pool_todo::Vector{T}
@@ -351,6 +352,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.save_partial_reduction,
         options.minworkers,
         options.maxworkers,
+        options.maxreduceworkers,
         options.quantum,
         options.nworkers,
         _tsk_pool_todo,
@@ -1056,12 +1058,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             break
         end
 
-        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers
+        local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers
         evaluated_at = time_ns()
         try
-            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers()
+            _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_maxreduceworkers()
         catch e
-            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers"
+            @warn "problem in Schedulers.jl elastic loop when getting nworkers,minworkers,maxworkers,maxreduceworkers"
             logerror(e, Logging.Debug)
             continue
         end
@@ -1133,7 +1135,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif is_more_checkpoints && !is_waiting_on_flush && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
+            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
                 push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -1342,6 +1344,7 @@ mutable struct SchedulerOptions{C}
     cancel_timeout::Float64
     minworkers::Function
     maxworkers::Function
+    maxreduceworkers::Function
     nworkers::Function
     usemaster::Bool
     quantum::Function
@@ -1384,6 +1387,7 @@ function SchedulerOptions(;
         cancel_timeout = 0,
         minworkers = Distributed.nworkers,
         maxworkers = Distributed.nworkers,
+        maxreduceworkers = typemax(Int),
         nworkers = ()->Distributed.nprocs()-1,
         usemaster = false,
         quantum = nothing,
@@ -1425,6 +1429,7 @@ function SchedulerOptions(;
         Float64(cancel_timeout),
         isa(minworkers, Function) ? minworkers : ()->minworkers,
         isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
+        isa(maxreduceworkers, Function) ? maxreduceworkers : ()->maxreduceworkers,
         nworkers,
         usemaster,
         isa(quantum, Function) ? quantum : ()->quantum,
@@ -1467,6 +1472,7 @@ function Base.copy(options::SchedulerOptions)
         options.cancel_timeout,
         options.minworkers,
         options.maxworkers,
+        options.maxreduceworkers,
         options.nworkers,
         options.usemaster,
         options.quantum,
@@ -1679,15 +1685,16 @@ and `epmap_kwargs` are as follows.
 * `cancel_timeout=0` seconds a task still running when the grace period ends may take to stop once cancelled (see [`iscancelled`](@ref)); if it stops, its process takes other work, otherwise the process is removed. Tasks not started when the grace period ends are skipped.
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
+* `maxreduceworkers=typemax(Int)` maximum number of workers that can be used for the reduction step[3]
 * `usemaster=false` assign tasks to the master process?
-* `nworkers=nworkers` the number of machines currently provisioned for work[3]
+* `nworkers=nworkers` the number of machines currently provisioned for work[4]
 * `quantum` deprecated and ignored: the loop asks for its whole shortfall, up to `maxworkers`
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
 * `checkpont_task=tsk->nothing` method that will be run if a preemption event is communicated.
 * `restart_task=tsk->nothing` method that will be run at the start of a task, and can be used for partially completed tasks that have checkpoint information.
-* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[4]
+* `scratch=["/scratch"]` storage location accessible to all cluster machines (e.g NFS, Azure blobstore,...)[5]
 * `reporttasks=true` log task assignment
 * `journalfile=""` write a journal showing what was computed where to a json file
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
@@ -1703,10 +1710,11 @@ and `epmap_kwargs` are as follows.
 written to, and `x` is the data that will be written.
 [2] The signature is `my_load_checkpoint(checkpoint_file)` where `checkpoint_file` is the file that
 data will be loaded from.
-[3] The number of machines provisioined may be greater than the number of workers in the cluster since with
+[3] This works as a client side throttle for the reduction step and is useful when there are both a large number of workers and a large amount of data.
+[4] The number of machines provisioined may be greater than the number of workers in the cluster since with
 some cluster managers, there may be a delay between the provisioining of a machine, and when it is added to the
 Julia cluster.
-[4] If more than one scratch location is selected, then check-point files will be distributed across those locations.
+[5] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
 
 # Examples
