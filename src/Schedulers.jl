@@ -94,8 +94,12 @@ function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage,
         journal[stage][tsk]["trials"][end]["status"] = fault ? "failed" : "succeeded"
         journal[stage][tsk]["trials"][end]["stop"] = now_formatted()
     elseif stage == "reduced"
-        journal["tasks"][tsk]["trials"][end]["reduced"] = true
-        journal["tasks"][tsk]["trials"][end]["reducedat"] = now_formatted()
+        trials = journal["tasks"][tsk]["trials"]
+        # a task skipped when the grace period ended may never have started
+        if !isempty(trials)
+            trials[end]["reduced"] = true
+            trials[end]["reducedat"] = now_formatted()
+        end
     elseif stage ∈ ("restart", "reduce")
         journal["pids"][pid][stage]["elapsed"] += time() - journal["pids"][pid]["tic"]
         if fault
@@ -189,6 +193,9 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
+    skip_tasks_that_timeout::Bool
+    grace_closed::Bool
+    tsk_times::Vector{Float64}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -230,6 +237,9 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
+        options.skip_tasks_that_timeout,
+        false,
+        Float64[],
     )
 
     if !isreduce
@@ -244,6 +254,52 @@ struct TimeoutException <: Exception
     pid::Int
     elapsed::Float64
 end
+
+# A task still running when the grace period ended, which stopped once cancelled.
+struct TaskCancelledException <: Exception
+    pid::Int
+    elapsed::Float64
+end
+
+# Tokens of the cancelled calls running on this process.
+const _cancelled_tokens = Set{UInt64}()
+const _cancelled_tokens_lock = ReentrantLock()
+const _last_cancel_token = Threads.Atomic{UInt64}(0)
+
+@static if isdefined(Base, :ScopedValues)
+    const _cancel_token = Base.ScopedValues.ScopedValue{UInt64}(UInt64(0))
+    _with_cancel_token(f, token) = Base.ScopedValues.with(f, _cancel_token => token)
+    _current_cancel_token() = _cancel_token[]
+else
+    _with_cancel_token(f, token) = task_local_storage(f, :schedulers_cancel_token, token)
+    _current_cancel_token() = get(task_local_storage(), :schedulers_cancel_token, UInt64(0))
+end
+
+"""
+    iscancelled() -> Bool
+
+`true` once the scheduler has cancelled the map task the caller is running. With
+`cancel_timeout > 0`, a task still running when the grace period ends is cancelled. Poll
+this from the map function and return (or throw) once it is `true`: the task is skipped,
+what it accumulated is discarded, and its process takes other work. On Julia 1.10 and
+older, call it from the task that runs the map function, not from tasks it spawns.
+"""
+function iscancelled()
+    token = _current_cancel_token()
+    token == 0 && return false
+    lock(() -> token ∈ _cancelled_tokens, _cancelled_tokens_lock)
+end
+
+# Run the map function on a worker, where `iscancelled` answers for `token`.
+function cancellable_call(token::UInt64, f, args...; kwargs...)
+    try
+        _with_cancel_token(() -> f(args...; kwargs...), token)
+    finally
+        lock(() -> delete!(_cancelled_tokens, token), _cancelled_tokens_lock)
+    end
+end
+
+cancel_call!(token::UInt64) = (lock(() -> push!(_cancelled_tokens, token), _cancelled_tokens_lock); nothing)
 
 maximum_task_time(tsk_times, tsk_count, timeout_multiplier) = length(tsk_times) > max(0, floor(Int, 0.3*tsk_count)) ? median(tsk_times)*timeout_multiplier : Inf
 
@@ -341,11 +397,44 @@ function check_timeout_status(tic, tsk_times, tsk_count, timeout_function_multip
         is_timeout_grace = true
     end
     report && @debug "checking timeout status, tsk=$tsk, toc-tic=$(toc - tic), average_task_time=$average_task_time, timeout_function_multiplier=$timeout_function_multiplier, grace_period_start_time=$(isinf(grace_period_start_time) ? "Inf" : unix2datetime(grace_period_start_time)), grace_period_ratio=$grace_period_ratio, is_timeout_function=$is_timeout_function, is_timeout_grace=$is_timeout_grace"
-    return is_timeout_function || is_timeout_grace
+    is_timeout_function ? :function : is_timeout_grace ? :grace : nothing
+end
+
+function grace_window_closed(eloop::ElasticLoop)
+    (eloop.skip_tasks_that_timeout && isfinite(eloop.grace_period_start_time)) || return false
+    average_task_time = robust_average(eloop.tsk_times, eloop.null_tsk_runtime_threshold, eloop.tsk_count, nothing, false)
+    time() - eloop.grace_period_start_time > eloop.grace_period_ratio * average_task_time
+end
+
+# Once the grace period has ended, no task starts: skip those not started yet. Safe to call
+# repeatedly: the elastic loop calls it on every pass after the window closes, so tasks that
+# return to the pool later (a failed task or checkpoint save is requeued) are skipped as well.
+function close_grace_window!(eloop::ElasticLoop)
+    eloop.grace_closed || @debug "grace period over"
+    eloop.grace_closed = true
+    isempty(eloop.tsk_pool_todo) && return nothing
+    @warn "skipping $(length(eloop.tsk_pool_todo)) tasks that had not started when the grace period ended"
+    append!(eloop.tsk_pool_done, eloop.tsk_pool_todo)
+    append!(eloop.tsk_pool_timed_out, eloop.tsk_pool_todo)
+    empty!(eloop.tsk_pool_todo)
+    nothing
+end
+
+# Ask the call `t` on `pid` to stop (see `iscancelled`): true when it ends within `cancel_timeout` seconds and `pid` is alive.
+function cancel_remote_call(t, pid, token, cancel_timeout)
+    cancel_timeout > 0 || return false
+    try
+        remote_do(cancel_call!, pid, token)
+    catch e
+        logerror(e, Logging.Debug)
+        return false
+    end
+    timedwait(() -> istaskdone(t), cancel_timeout; pollint=0.1) === :ok && pid ∈ procs()
 end
 
 function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
-    t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
+    token = Threads.atomic_add!(_last_cancel_token, UInt64(1)) + UInt64(1)
+    t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, cancellable_call, token, f, args...; kwargs...)
     tic = time()
     tic_report = time()
     while !istaskdone(t)
@@ -354,9 +443,15 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
             report = true
             tic_report = time()
         end
-        if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio, tsk, report)
-            throw(TimeoutException(pid, time() - tic))
+        timeout = check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio, tsk, report)
+        if timeout === :grace && options.skip_tasks_that_timeout
+            # A running task can see the grace period end before the elastic loop's own check;
+            # closing the window here records that in eloop.grace_closed for the loop.
+            close_grace_window!(eloop)
+            cancel_remote_call(t, pid, token, options.cancel_timeout) && throw(TaskCancelledException(pid, time() - tic))
         end
+        # without skipping, a task cut by the grace period would only run again
+        (timeout === :function || (timeout === :grace && options.skip_tasks_that_timeout)) && throw(TimeoutException(pid, time() - tic))
         sleep(1)
     end
     isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
@@ -626,6 +721,14 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             eloop.grace_period_start_time = time()
             @debug "entering grace period, setting eloop.grace_period_start_time=$(isinf(eloop.grace_period_start_time) ? "Inf" : unix2datetime(eloop.grace_period_start_time))"
             is_grace_period = true
+        end
+        # Once closed, the window stays closed, and close_grace_window! runs on every later pass:
+        #   * grace_closed may have been set by a running task (remotecall_func_wait_timeout), and
+        #     grace_window_closed can turn false again as the average task time grows;
+        #   * a task that fails after the window closed is put back in tsk_pool_todo, and since no
+        #     task starts once the window is closed, it is skipped here or the map would never finish.
+        if is_grace_period && (eloop.grace_closed || grace_window_closed(eloop))
+            close_grace_window!(eloop)
         end
         is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
         is_more_tasks = length(eloop.tsk_pool_todo) > 0
@@ -931,6 +1034,7 @@ mutable struct SchedulerOptions{C}
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
     skip_tasks_that_timeout::Bool
+    cancel_timeout::Float64
     minworkers::Function
     maxworkers::Function
     maxreduceworkers::Function
@@ -970,6 +1074,7 @@ function SchedulerOptions(;
         skip_tsk_tol_ratio = 0,
         grace_period_ratio = 0,
         skip_tasks_that_timeout = false,
+        cancel_timeout = 0,
         minworkers = Distributed.nworkers,
         maxworkers = Distributed.nworkers,
         maxreduceworkers = typemax(Int),
@@ -1007,6 +1112,7 @@ function SchedulerOptions(;
         Float64(skip_tsk_tol_ratio),
         Float64(grace_period_ratio),
         skip_tasks_that_timeout,
+        Float64(cancel_timeout),
         isa(minworkers, Function) ? minworkers : ()->minworkers,
         isa(maxworkers, Function) ? maxworkers : ()->maxworkers,
         isa(maxreduceworkers, Function) ? maxreduceworkers : ()->maxreduceworkers,
@@ -1046,6 +1152,7 @@ function Base.copy(options::SchedulerOptions)
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
         options.skip_tasks_that_timeout,
+        options.cancel_timeout,
         options.minworkers,
         options.maxworkers,
         options.maxreduceworkers,
@@ -1092,6 +1199,7 @@ and `pmap_kwargs` are as follows.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
 * `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) median task time
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
+* `cancel_timeout=0` seconds a task still running when the grace period ends may take to stop once cancelled (see [`iscancelled`](@ref)); if it stops, its process takes other work, otherwise the process is removed. Tasks not started when the grace period ends are skipped.
 * `minworkers=Distributed.nworkers` method (or value) giving the minimum number of workers to elastically shrink to
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
@@ -1122,7 +1230,7 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
 end
 
 function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::ElasticLoop, journal, args...; kwargs...)
-    tsk_times = Float64[]
+    tsk_times = eloop.tsk_times
 
     # work loop
     @sync while true
@@ -1156,7 +1264,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 end
 
                 @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
-                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+                if length(eloop.tsk_pool_todo) == 0 || eloop.grace_closed || eloop.interrupted
                     @debug "putting $pid onto map_remove channel"
                     put!(eloop.pid_channel_map_remove, (pid,false))
                     break
@@ -1184,6 +1292,13 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                     @debug "...pid=$pid,tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(eloop.tsk_pool_todo), tsk_pool_done=$(eloop.tsk_pool_done) -!"
                     yield()
                 catch e
+                    if isa(e, TaskCancelledException)
+                        @warn "skipping task '$tsk' that was still running when the grace period ended; process $pid ($hostname) stopped it"
+                        journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
+                        push!(eloop.tsk_pool_done, tsk)
+                        push!(eloop.tsk_pool_timed_out, tsk)
+                        continue
+                    end
                     @warn "caught an exception, there have been $(eloop.pid_failures[pid]) failure(s) on process $pid ($hostname)..."
                     journal_stop!(journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
                     if isa(e, TimeoutException) && options.skip_tasks_that_timeout
@@ -1242,6 +1357,7 @@ and `epmap_kwargs` are as follows.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
 * `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) median task time
 * `skip_tasks_that_timeout=false` skip task that exceed the timeout, or retry them on a different machine
+* `cancel_timeout=0` seconds a task still running when the grace period ends may take to stop once cancelled (see [`iscancelled`](@ref)); if it stops, its process takes other work, otherwise the process is removed. Tasks not started when the grace period ends are skipped.
 * `minworkers=nworkers` method giving the minimum number of workers to elastically shrink to
 * `maxworkers=nworkers` method giving the maximum number of workers to elastically expand to
 * `maxreduceworkers=typemax(Int)` maximum number of workers that can be used for the reduction step[3]
@@ -1370,7 +1486,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
     checkpoint_orphans = Any[]
 
-    tsk_times = Float64[]
+    tsk_times = epmap_eloop.tsk_times
     checkpoint_times = Float64[]
     rm_times = Float64[]
 
@@ -1431,7 +1547,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
                 @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.grace_closed || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
                     if epmap_eloop.checkpoints[pid] !== nothing
                         push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                     end
@@ -1463,6 +1579,14 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=false)
                     @debug "...pid=$pid ($hostname),tsk=$tsk,nworkers()=$(nworkers()),options.nworkers()=$(options.nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo), tsk_pool_done=$(epmap_eloop.tsk_pool_done) -!"
                 catch e
+                    if isa(e, TaskCancelledException)
+                        # the loop ends next, dropping the local result; the last checkpoint excludes this task
+                        @warn "skipping task '$tsk' that was still running when the grace period ended, compute/reduce step; process $pid ($hostname) stopped it"
+                        journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
+                        push!(epmap_eloop.tsk_pool_done, tsk)
+                        push!(epmap_eloop.tsk_pool_timed_out, tsk)
+                        continue
+                    end
                     @warn "pid=$pid ($hostname), task loop, caught exception during f eval"
                     journal_stop!(epmap_journal, options.journal_task_callback; stage="tasks", tsk, pid, fault=true)
                     if isa(e, TimeoutException) && options.skip_tasks_that_timeout
@@ -1881,6 +2005,6 @@ default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
-export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
+export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks, iscancelled
 
 end
