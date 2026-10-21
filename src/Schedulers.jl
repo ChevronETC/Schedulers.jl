@@ -548,7 +548,9 @@ function grace_window_closed(eloop::ElasticLoop)
     time() - eloop.grace_period_start_time > eloop.grace_period_ratio * average_task_time
 end
 
-# Once the grace period has ended, no task starts: skip those not started yet.
+# Once the grace period has ended, no task starts: skip those not started yet. Safe to call
+# repeatedly: the elastic loop calls it on every pass after the window closes, so tasks that
+# return to the pool later (a failed task or checkpoint save is requeued) are skipped as well.
 function close_grace_window!(eloop::ElasticLoop)
     eloop.grace_closed || @debug "grace period over"
     eloop.grace_closed = true
@@ -585,6 +587,8 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
         end
         timeout = check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio, tsk, report)
         if timeout === :grace && options.skip_tasks_that_timeout
+            # A running task can see the grace period end before the elastic loop's own check;
+            # closing the window here records that in eloop.grace_closed for the loop.
             close_grace_window!(eloop)
             cancel_remote_call(t, pid, token, options.cancel_timeout) && throw(TaskCancelledException(pid, time() - tic))
         end
@@ -985,6 +989,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             @debug "entering grace period, setting eloop.grace_period_start_time=$(isinf(eloop.grace_period_start_time) ? "Inf" : unix2datetime(eloop.grace_period_start_time))"
             is_grace_period = true
         end
+        # Once closed, the window stays closed, and close_grace_window! runs on every later pass:
+        #   * grace_closed may have been set by a running task (remotecall_func_wait_timeout), and
+        #     grace_window_closed can turn false again as the average task time grows;
+        #   * a task that fails after the window closed is put back in tsk_pool_todo, and since no
+        #     task starts once the window is closed, it is skipped here or the map would never finish.
         if is_grace_period && (eloop.grace_closed || grace_window_closed(eloop))
             close_grace_window!(eloop)
         end
