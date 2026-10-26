@@ -972,6 +972,121 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "streaming reduction, chunks" begin
+    layout = Schedulers.checkpoint_layout((; a=zeros(Float32, 10), b=zeros(Float64, 7), c=zeros(Int8, 3)))
+    @test layout == [(Float32, 40), (Float64, 56), (Int8, 3)]
+    for chunkbytes in (1, 3, 8, 20, 1000)
+        chunks = Schedulers.checkpoint_chunks(layout, chunkbytes)
+        nbytes = [chunk.nbytes for chunk in chunks]
+        @test sum(nbytes) == 99
+        @test [chunk.offset for chunk in chunks] == cumsum([0; nbytes[1:end-1]])
+        for chunk in chunks
+            @test chunk.T == layout[chunk.array][1]
+            @test chunk.nbytes % sizeof(chunk.T) == 0
+            @test chunk.arrayoffset + chunk.nbytes <= layout[chunk.array][2]
+        end
+    end
+    @test_throws ErrorException Schedulers.checkpoint_arrays(Dict(1=>2))
+    @test_throws ErrorException Schedulers.checkpoint_arrays([[1.0]])
+end
+
+@testset "streaming reduction, local files" begin
+    tmpdir = mktempdir()
+    zeros_xyz() = (; x=zeros(Float32, 100), y=zeros(Float64, 3, 5), z=zeros(Int32, 7))
+    T = typeof(zeros_xyz())
+    layout = Schedulers.checkpoint_layout(zeros_xyz())
+
+    inputs = [joinpath(tmpdir, "input-$i") for i in 1:3]
+    for (i, input) in enumerate(inputs)
+        x = zeros_xyz()
+        foreach(a->a .= i, Schedulers.checkpoint_arrays(x))
+        Schedulers.save_checkpoint_streaming(identity, input, x, T, 24, 2)
+        @test filesize(input) == sum(last, layout)
+    end
+
+    output = joinpath(tmpdir, "output")
+    Schedulers.reduce_streaming(Schedulers.default_reducer_chunk!, inputs, output, layout, 24, 2)
+    @test !isfile(Schedulers.partial_checkpoint(output))
+    r = Schedulers.load_checkpoint_streaming(zeros_xyz, output, T, 24, 2)
+    @test all(a->all(==(6), a), Schedulers.checkpoint_arrays(r))
+
+    # a retried reduction into memory skips the chunks that are already reduced
+    s = zeros_xyz()
+    done = fill(false, length(Schedulers.checkpoint_chunks(layout, 24)))
+    done[1] = true
+    Schedulers.reduce_into!(Schedulers.default_reducer_chunk!, s, [output], 24, 2; done)
+    @test all(done)
+    @test all(==(0), s.x[1:6]) && all(==(6), s.x[7:end]) && all(==(6), s.y) && all(==(6), s.z)
+
+    # inputs that are not streaming checkpoints of the expected size are rejected, and nothing is written
+    bad, output2 = joinpath(tmpdir, "bad"), joinpath(tmpdir, "output2")
+    write(bad, rand(UInt8, 10))
+    @test_throws ErrorException Schedulers.reduce_streaming(Schedulers.default_reducer_chunk!, [bad, inputs[1]], output2, layout, 24, 2)
+    @test !isfile(output2) && !isfile(Schedulers.partial_checkpoint(output2))
+
+    rm(tmpdir; recursive=true)
+end
+
+@testset "pmapreduce, streaming reduction, reduce_fanin=$fanin" for fanin in (2, 3, 4)
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers
+    @everywhere function foo_streaming(r, tsk)
+        r.x .+= tsk
+        r.y .+= 2tsk
+        r.z .+= 3tsk
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    zeros_xyz() = (; x=zeros(Float32, 100), y=zeros(Float64, 3, 5), z=zeros(Int32, 7))
+    options = SchedulerOptions(;scratch=tmpdir, zeros=zeros_xyz, reduce_streaming=true, reduce_fanin=fanin, reduce_chunkbytes=100, reduce_depth=3)
+    r,tsks = epmapreduce!(zeros_xyz(), options, foo_streaming, 1:40)
+    rmprocs(workers())
+
+    s = sum(1:40)
+    @test all(==(s), r.x)
+    @test all(==(2s), r.y)
+    @test all(==(3s), r.z)
+    @test isempty(readdir(tmpdir)) # no committed or partial checkpoints are left behind
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, partial reduction, streaming" begin
+    using Distributed, Schedulers
+
+    function foo16s(r, i)
+        r .+= i
+        sleep(2)
+        nothing
+    end
+
+    function my_reduce_trigger_s(eloop, ntasks)
+        if length(complete_tasks(eloop)) - ntasks[] > 30
+            trigger_reduction!(eloop)
+            ntasks[] = length(complete_tasks(eloop))
+        end
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    tmpfile = tempname()
+
+    ntasks = Ref(0)
+    options = SchedulerOptions(;maxworkers=10, scratch=tmpdir, reduce_trigger=eloop->my_reduce_trigger_s(eloop, ntasks), save_partial_reduction=input->write(tmpfile, input),
+        reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=16)
+    r,tsks = epmapreduce!(zeros(10), options, foo16s, 1:60)
+
+    @test r ≈ sum([1:60;]) * ones(10)
+
+    x = read!(tmpfile, zeros(10))
+    @test x[1] >= sum([1:30;])
+    for i in eachindex(x)
+        @test x[i] ≈ x[1]
+    end
+
+    rm(tmpfile)
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "copy SchedulerOptions" begin
     options = SchedulerOptions()
     _options = copy(options)

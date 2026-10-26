@@ -189,6 +189,8 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
+    reduce_fanin::Int
+    load_partial_reduction::Function
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -230,6 +232,8 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
+        options.reduce_streaming ? options.reduce_fanin : 2,
+        deserialize,
     )
 
     if !isreduce
@@ -431,12 +435,28 @@ function reduce_checkpoints_is_dirty(eloop::ElasticLoop)
     false
 end
 
+#=
+Number of merges that reducers can start now: whole groups of `fanin` checkpoints, or, once no more checkpoints
+are expected and no reducer is running, the remaining checkpoints (at least two), so that the reduction can not
+stall on a partial group.  With `fanin=2`, this is the number of pairs.
+=#
+function reduce_groups(ncheckpoints, fanin, nreducers, more_expected)
+    ngroups = div(ncheckpoints, fanin)
+    if ngroups == 0 && ncheckpoints >= 2 && nreducers == 0 && !more_expected
+        ngroups = 1
+    end
+    ngroups
+end
+
+# are map workers still producing checkpoints?
+is_more_map_checkpoints(eloop::ElasticLoop) = !isempty(eloop.tsk_pool_todo) || !isempty(eloop.checkpoints)
+
 function save_partial_reduction(eloop)
     if isempty(eloop.reduce_checkpoints)
         @warn "reduction is empty, nothing to save."
     else
         try
-            x = deserialize(eloop.reduce_checkpoints_snapshot[1])
+            x = eloop.load_partial_reduction(eloop.reduce_checkpoints_snapshot[1])
             empty!(eloop.reduce_checkpoints_snapshot)
             eloop.epmap_save_partial_reduction(x)
         catch e
@@ -767,12 +787,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
             push!(loop_log_cache, "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))")
 
-            wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
+            wait_for_reduced_trigger = eloop.is_reduce_triggered && reduce_groups(length(eloop.reduce_checkpoints_snapshot), eloop.reduce_fanin, length(eloop.used_pids_reduce), false) > length(eloop.used_pids_reduce)
             if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
                 push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
+            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && reduce_groups(length(eloop.reduce_checkpoints), eloop.reduce_fanin, length(eloop.used_pids_reduce), is_more_map_checkpoints(eloop)) > length(eloop.used_pids_reduce)
                 push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -782,7 +802,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         # check to see if we need to add or remove machines
         δ,n_remaining_tasks = 0,0
         try
-            n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + max(length(eloop.reduce_checkpoints) - 1, 0)
+            n_remaining_tasks = eloop.tsk_count - length(eloop.tsk_pool_done) + cld(max(length(eloop.reduce_checkpoints) - 1, 0), eloop.reduce_fanin - 1)
             δ = min(n_remaining_tasks - _epmap_nworkers, _epmap_maxworkers - _epmap_nworkers, _epmap_quantum)
             # note that 1. we will only remove a machine if it is not in the 'eloop.used_pids' vector.
             # and 2. we will only remove machines if we are left with at least epmap_minworkers.
@@ -959,6 +979,12 @@ mutable struct SchedulerOptions{C}
     reduce_trigger::Function
     save_partial_reduction::Function
     gethostname::Function
+    # streaming reduction:
+    reduce_streaming::Bool
+    reduce_fanin::Int
+    reduce_chunkbytes::Int
+    reduce_depth::Int
+    reducer_chunk!::Function
 end
 
 function SchedulerOptions(;
@@ -997,7 +1023,16 @@ function SchedulerOptions(;
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
-        gethostname = gethostname)
+        gethostname = gethostname,
+        # streaming reduction
+        reduce_streaming = false,
+        reduce_fanin = 2,
+        reduce_chunkbytes = 64*2^20,
+        reduce_depth = 4,
+        reducer_chunk! = default_reducer_chunk!)
+    reduce_fanin >= 2 || throw(ArgumentError("reduce_fanin must be at least 2, got $reduce_fanin"))
+    reduce_chunkbytes >= 1 || throw(ArgumentError("reduce_chunkbytes must be positive, got $reduce_chunkbytes"))
+    reduce_depth >= 1 || throw(ArgumentError("reduce_depth must be positive, got $reduce_depth"))
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1033,7 +1068,12 @@ function SchedulerOptions(;
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction,
-        gethostname)
+        gethostname,
+        reduce_streaming,
+        reduce_fanin,
+        reduce_chunkbytes,
+        reduce_depth,
+        reducer_chunk!)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -1072,7 +1112,12 @@ function Base.copy(options::SchedulerOptions)
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction,
-        options.gethostname)
+        options.gethostname,
+        options.reduce_streaming,
+        options.reduce_fanin,
+        options.reduce_chunkbytes,
+        options.reduce_depth,
+        options.reducer_chunk!)
 end
 
 """
@@ -1261,6 +1306,11 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
+* `reduce_streaming=false` stream the reduction: merge up to `reduce_fanin` checkpoints at a time, reading them concurrently, chunk by chunk, and writing each merged chunk as soon as it is ready[6]
+* `reduce_fanin=2` maximum number of checkpoints merged at a time when `reduce_streaming=true`
+* `reduce_chunkbytes=64*2^20` chunk size in bytes when `reduce_streaming=true`
+* `reduce_depth=4` number of chunks in flight in each merge when `reduce_streaming=true`
+* `reducer_chunk! = (x,y)->(x .+= y)` the element-wise reduction applied to chunks when `reduce_streaming=true`[7]
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
@@ -1272,6 +1322,13 @@ some cluster managers, there may be a delay between the provisioining of a machi
 Julia cluster.
 [5] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
+[6] A streaming checkpoint holds the raw bytes of the arrays of the result (see `Schedulers.checkpoint_arrays`), so
+`save_checkpoint` and `load_checkpoint` are not used.  A merge holds about `reduce_fanin*reduce_depth*reduce_chunkbytes`
+bytes, and its reads and writes run concurrently on the threads of the worker, so start the workers with at least
+`reduce_fanin*reduce_depth` threads.  The scratch storage must implement the streaming interface (see
+`Schedulers.checkpoint_read!`): local paths do, and so do Azure blobs when AzStorage (2.14 or later) is loaded.
+[7] `reducer_chunk!(x, y)` reduces `y` into `x`, two vectors holding the same elements of one of the arrays of
+the result.  It must be element-wise, and consistent with `reducer!`.
 
 # Examples
 ## Example 1
@@ -1333,9 +1390,15 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
             options.zeros = ()->zeros(_et, _sz)::T
         end
 
+        # fail before mapping if the result can not be stored as a streaming checkpoint
+        options.reduce_streaming && checkpoint_layout(result)
+
         epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
 
         epmap_eloop = ElasticLoop(typeof(next_checkpoint(options.id, options.scratch)), tasks, options; isreduce=true)
+        if options.reduce_streaming
+            epmap_eloop.load_partial_reduction = checkpoint->load_checkpoint_streaming(options.zeros, checkpoint, T, options.reduce_chunkbytes, options.reduce_depth)
+        end
 
         tsk_map = @async epmapreduce_map(f, result, epmap_eloop, epmap_journal, options, args...; kwargs...)
 
@@ -1492,7 +1555,11 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 try
                     @debug "running checkpoint for task $tsk on process $pid; $(nworkers()) workers total; $(length(epmap_eloop.tsk_pool_todo)) tasks left in task-pool."
                     journal_start!(epmap_journal; stage="checkpoints", tsk, pid, hostname)
-                    remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                    if options.reduce_streaming
+                        remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint_streaming, pid, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T, options.reduce_chunkbytes, options.reduce_depth)
+                    else
+                        remotecall_wait_timeout(checkpoint_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, save_checkpoint, pid, options.save_checkpoint, options.epmapreduce_fetch, _next_checkpoint, localresults[pid], T)
+                    end
                     journal_stop!(epmap_journal; stage="checkpoints", tsk, pid, fault=false)
                     @debug "... checkpoint, pid=$pid,tsk=$tsk,nworkers()=$(nworkers()), tsk_pool_todo=$(epmap_eloop.tsk_pool_todo) -!"
                     push!(epmap_eloop.tsk_pool_done, tsk)
@@ -1516,6 +1583,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     # note that `options.rm_checkpoint` should check if the file exists before attempting removal
                     try
                         options.rm_checkpoint(_next_checkpoint)
+                        options.reduce_streaming && checkpoint_abort(_next_checkpoint)
                     catch e
                         @warn "unable to delete $(_next_checkpoint), manual clean-up may be required"
                         logerror(e, Logging.Debug)
@@ -1541,7 +1609,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                         localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
                     else
                         @debug "re-setting localresult to the previously saved checkpoint"
-                        localresults[pid] = remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
+                        localresults[pid] = options.reduce_streaming ?
+                            remotecall_default_threadpool(load_checkpoint_streaming, pid, options.zeros, epmap_eloop.checkpoints[pid], T, options.reduce_chunkbytes, options.reduce_depth) :
+                            remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
                     end
 
                     continue # there is no new checkpoint, and we need to keep the old checkpoint
@@ -1603,6 +1673,10 @@ end
 function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) where {T}
     @debug "entered the reduce method"
     orphans_remove = Set{Any}()
+    partial_outputs = Any[] # streaming checkpoints from failed reductions that were not committed
+
+    layout = options.reduce_streaming ? checkpoint_layout(result) : nothing
+    fanin = options.reduce_streaming ? options.reduce_fanin : 2
 
     l = ReentrantLock()
 
@@ -1652,87 +1726,56 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     break
                 end
 
-                # reduce two checkpoints into a third checkpoint
-                if n_checkpoints > 1
-                    @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) julia workers, $(options.nworkers()) provisioned workers, $(length(epmap_eloop.used_pids_reduce)) reduce workers)."
-                    local checkpoint1
-                    try
-                        @debug "reduce, popping first checkpoint, pid=$pid"
+                # reduce up to `fanin` checkpoints into a new checkpoint
+                @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) julia workers, $(options.nworkers()) provisioned workers, $(length(epmap_eloop.used_pids_reduce)) reduce workers)."
+                inputs = similar(epmap_eloop.reduce_checkpoints, 0)
+                local checkpoint3
+                try
+                    for i in 1:min(fanin, n_checkpoints)
+                        @debug "reduce, popping checkpoint $i, pid=$pid"
                         if epmap_eloop.is_reduce_triggered
-                            checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
-                            icheckpoint1 = findfirst(checkpoint->checkpoint == checkpoint1, epmap_eloop.reduce_checkpoints)
-                            icheckpoint1 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint1)
+                            checkpoint = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
+                            icheckpoint = findfirst(==(checkpoint), epmap_eloop.reduce_checkpoints)
+                            icheckpoint === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint)
                         else
-                            checkpoint1 = popfirst!(epmap_eloop.reduce_checkpoints)
+                            checkpoint = popfirst!(epmap_eloop.reduce_checkpoints)
                         end
-                        @debug "reduce, popped first checkpoint, pid=$pid" checkpoint1
-                    catch e
-                        @warn "reduce, unable to pop checkpoint 1"
-                        logerror(e, Logging.Debug)
-                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                        unlock(l)
-                        @debug "reduce, released lock on pid=$pid"
-                        continue
+                        push!(inputs, checkpoint)
+                        @debug "reduce, popped checkpoint $i, pid=$pid" checkpoint
                     end
-
-                    local checkpoint2
-                    try
-                        @debug "reduce, popping second checkpoint, pid=$pid"
-                        if epmap_eloop.is_reduce_triggered
-                            checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
-                            icheckpoint2 = findfirst(checkpoint->checkpoint == checkpoint2, epmap_eloop.reduce_checkpoints)
-                            icheckpoint2 === nothing || deleteat!(epmap_eloop.reduce_checkpoints, icheckpoint2)
-                        else
-                            checkpoint2 = popfirst!(epmap_eloop.reduce_checkpoints)
-                        end
-                        @debug "reduce, popped second checkpoint, pid=$pid" checkpoint2
-                    catch e
-                        @warn "reduce, unable to pop checkpoint 2"
-                        logerror(e, Logging.Debug)
-                        push!(epmap_eloop.reduce_checkpoints, checkpoint1)
-                        epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1)
-                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                        unlock(l)
-                        @debug "reduce, released lock on pid=$pid"
-                        continue
-                    end
-
-                    local checkpoint3
-                    try
-                        @debug "reduce, make third checkpoint, pid=$pid"
-                        checkpoint3 = next_checkpoint(options.id, options.scratch)
-                        @debug "reduce, made third checkpoint, pid=$pid" checkpoint3
-                    catch e
-                        @warn "reduce, unable to create checkpoint 3"
-                        logerror(e, Logging.Debug)
-                        push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
-                        epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
-                        epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                        unlock(l)
-                        @debug "reduce, released lock on pid=$pid"
-                        continue
-                    end
-                else
+                    @debug "reduce, make third checkpoint, pid=$pid"
+                    checkpoint3 = next_checkpoint(options.id, options.scratch)
+                    @debug "reduce, made third checkpoint, pid=$pid" checkpoint3
+                catch e
+                    @warn "reduce, unable to pop the checkpoints to reduce, or to create the reduced checkpoint"
+                    logerror(e, Logging.Debug)
+                    push!(epmap_eloop.reduce_checkpoints, inputs...)
+                    epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, inputs...)
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                     unlock(l)
-                    @debug "reduce, no checkpoints to reduce, released lock on pid=$pid"
+                    @debug "reduce, released lock on pid=$pid"
                     continue
                 end
                 unlock(l)
                 @debug "reduce, released lock on pid=$pid"
 
                 try
-                    @debug "reducing into checkpoint3, pid=$pid" checkpoint3
+                    @debug "reducing into checkpoint3, pid=$pid, from $(length(inputs)) checkpoints" checkpoint3
                     journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                     # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, checkpoint1, checkpoint2, checkpoint3, T)
+                    if options.reduce_streaming
+                        remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce_streaming, pid, options.reducer_chunk!, inputs, checkpoint3, layout, options.reduce_chunkbytes, options.reduce_depth)
+                    else
+                        remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, inputs[1], inputs[2], checkpoint3, T)
+                    end
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
                     @debug "pushed reduced checkpoint3, pid=$pid, reduce_times_length=$(length(reduce_times)), reduce_times_extrema=$(length(reduce_times) > 0 ? extrema(reduce_times) : (0.0,0.0))" checkpoint3
                 catch e
-                    push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
-                    epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
+                    push!(epmap_eloop.reduce_checkpoints, inputs...)
+                    epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, inputs...)
+                    options.reduce_streaming && push!(partial_outputs, checkpoint3)
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
@@ -1748,48 +1791,36 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     continue
                 end
 
-                # remove checkpoint 1
-                try
-                    options.keepcheckpoints || @debug "removing checkpoint 1, pid=$pid" checkpoint1
-                    journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                    # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing,  0, options.rm_checkpoint, pid, checkpoint1)
-                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                    options.keepcheckpoints || @debug "removed checkpoint 1, pid=$pid, rm_times_length=$(length(rm_times)), rm_times_extrema=$(length(rm_times) > 0 ? extrema(rm_times) : (0.0,0.0))" checkpoint1
-                catch e
-                    @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 1"
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
-                    push!(orphans_remove, checkpoint1, checkpoint2)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
-                        pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
-                        break
+                # remove the checkpoints that were reduced, concurrently
+                if !options.keepcheckpoints
+                    rm_errors = Vector{Any}(nothing, length(inputs))
+                    @sync for (i, checkpoint) in enumerate(inputs)
+                        @async try
+                            @debug "removing checkpoint $i, pid=$pid" checkpoint
+                            journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+                            # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+                            remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint)
+                            journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+                            @debug "removed checkpoint $i, pid=$pid, rm_times_length=$(length(rm_times)), rm_times_extrema=$(length(rm_times) > 0 ? extrema(rm_times) : (0.0,0.0))" checkpoint
+                        catch e
+                            rm_errors[i] = e
+                        end
                     end
-                    epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
-                    continue
-                end
-
-                # remove checkpoint 2
-                try
-                    options.keepcheckpoints || @debug "removing checkpoint 2, pid=$pid" checkpoint2
-                    journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-                    # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    options.keepcheckpoints || remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint2)
-                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-                    options.keepcheckpoints || @debug "removed checkpoint 2, pid=$pid, rm_times_length=$(length(rm_times)), rm_times_extrema=$(length(rm_times) > 0 ? extrema(rm_times) : (0.0,0.0))" checkpoint2
-                catch e
-                    @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint 2"
-                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
-                    journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
-                    push!(orphans_remove, checkpoint2)
-                    epmap_eloop.interrupted = r.do_interrupt
-                    epmap_eloop.errored = r.do_error
-                    if r.do_break || r.do_interrupt
+                    do_break, bad_pid = false, false
+                    for (i, e) in enumerate(rm_errors)
+                        e === nothing && continue
+                        @warn "pid=$pid ($hostname), reduce loop, caught exception during remove checkpoint $i"
+                        r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                        journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+                        push!(orphans_remove, inputs[i])
+                        epmap_eloop.interrupted = r.do_interrupt
+                        epmap_eloop.errored = r.do_error
+                        do_break |= r.do_break || r.do_interrupt
+                        bad_pid |= r.bad_pid
+                    end
+                    if do_break
                         pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,r.bad_pid))
+                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,bad_pid))
                         break
                     end
                 end
@@ -1808,10 +1839,16 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     length(epmap_eloop.reduce_checkpoints) == 0 && @warn "there are no checkpoints to reduce indicating that no tasks were run"
 
+    # chunks that were reduced into `result` (streaming), so that a retry does not reduce them twice
+    done = options.reduce_streaming ? fill(false, length(checkpoint_chunks(layout, options.reduce_chunkbytes))) : nothing
     for i in 1:10
         try
             if length(epmap_eloop.reduce_checkpoints) > 0
-                options.reducer!(result, load_checkpoint(options.load_checkpoint, epmap_eloop.reduce_checkpoints[1], T))
+                if options.reduce_streaming
+                    reduce_into!(options.reducer_chunk!, result, epmap_eloop.reduce_checkpoints[1:1], options.reduce_chunkbytes, options.reduce_depth; done)
+                else
+                    options.reducer!(result, load_checkpoint(options.load_checkpoint, epmap_eloop.reduce_checkpoints[1], T))
+                end
             end
             break
         catch e
@@ -1843,6 +1880,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             end
         end
     end
+    foreach(abort_checkpoint, partial_outputs)
     @debug "reduce, finished final clean-up on master"
 
     result
@@ -1880,6 +1918,262 @@ default_save_checkpoint(checkpoint, localresult) = serialize(checkpoint, localre
 default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
+
+#
+# Streaming reductions (`reduce_streaming=true`)
+#
+# A streaming checkpoint stores the raw bytes of the result's arrays, back to back. A merge reads the same chunk
+# of all of its input checkpoints at once, reduces those pieces, and writes the reduced chunk to the output
+# checkpoint right away, with a bounded number of chunks in flight. The output checkpoint only becomes visible
+# when it is committed, after all of its chunks are written.
+#
+
+default_reducer_chunk!(x, y) = (x .+= y; nothing)
+
+"""
+    arrays = Schedulers.checkpoint_arrays(x)
+
+Return the arrays that make up the reduction result `x`, in a fixed order.  A streaming reduction
+(`reduce_streaming=true`) stores a checkpoint as the raw bytes of these arrays, back to back.  Methods are
+provided for dense arrays of isbits elements, and for tuples and named tuples of them.  Add a method for
+other result types.
+"""
+checkpoint_arrays(x::DenseArray) = isbitstype(eltype(x)) ? (x,) : error("Schedulers: a streaming reduction needs arrays of isbits elements, got $(typeof(x))")
+checkpoint_arrays(x::Union{Tuple,NamedTuple}) = mapreduce(checkpoint_arrays, (a, b)->(a..., b...), values(x); init=())
+checkpoint_arrays(x) = error("Schedulers: a streaming reduction does not know how to store a $(typeof(x)); add a method to `Schedulers.checkpoint_arrays`")
+
+# element type and size in bytes of each array of a streaming checkpoint
+checkpoint_layout(x) = Tuple{DataType,Int}[(eltype(a), sizeof(a)) for a in checkpoint_arrays(x)]
+
+struct CheckpointChunk
+    array::Int       # index into `checkpoint_arrays`
+    T::DataType      # element type of that array
+    offset::Int      # byte offset in the checkpoint
+    arrayoffset::Int # byte offset in the array
+    nbytes::Int
+end
+
+# a chunk never spans two arrays, and it holds whole elements
+function checkpoint_chunks(layout, chunkbytes)
+    chunks = CheckpointChunk[]
+    offset = 0
+    for (iarray, (T, nbytes)) in enumerate(layout)
+        step = max(sizeof(T), chunkbytes - chunkbytes % sizeof(T))
+        for arrayoffset in 0:step:nbytes-1
+            push!(chunks, CheckpointChunk(iarray, T, offset + arrayoffset, arrayoffset, min(step, nbytes - arrayoffset)))
+        end
+        offset += nbytes
+    end
+    chunks
+end
+
+# run `f(ichunk, chunk)` for every chunk, each on its own task, with at most `depth` chunks in flight
+function foreach_chunk(f, chunks, depth)
+    failed = Threads.Atomic{Bool}(false)
+    firsterror = Ref{Any}(nothing)
+    inflight = Base.Semaphore(depth)
+    @sync for (ichunk, chunk) in enumerate(chunks)
+        Base.acquire(inflight)
+        if failed[]
+            Base.release(inflight)
+            break
+        end
+        Threads.@spawn try
+            f(ichunk, chunk)
+        catch e
+            Threads.atomic_xchg!(failed, true) || (firsterror[] = CapturedException(e, catch_backtrace()))
+        finally
+            Base.release(inflight)
+        end
+    end
+    failed[] && throw(firsterror[])
+    nothing
+end
+
+function buffer_pool(nbuffers, nbytes)
+    pool = Channel{Vector{UInt8}}(nbuffers)
+    for _ in 1:nbuffers
+        put!(pool, Vector{UInt8}(undef, nbytes))
+    end
+    pool
+end
+
+# view the first `nbytes` bytes at `ptr` as a vector of `T`; the caller must keep the memory alive
+wrap_bytes(::Type{T}, ptr, nbytes) where {T} = unsafe_wrap(Array, convert(Ptr{T}, ptr), div(nbytes, sizeof(T)))
+
+# read the same chunk of all inputs at once
+function read_chunk!(buffers, inputs, chunk)
+    @sync for (input, buffer) in zip(inputs, buffers)
+        Threads.@spawn checkpoint_read!(input, view(buffer, 1:chunk.nbytes), chunk.offset)
+    end
+end
+
+function abort_checkpoint(checkpoint)
+    try
+        checkpoint_abort(checkpoint)
+    catch e
+        @warn "unable to clean up the partially written checkpoint $checkpoint"
+        logerror(e, Logging.Debug)
+    end
+end
+
+"""
+    Schedulers.reduce_streaming(reducer_chunk!, inputs, output, layout, chunkbytes, depth)
+
+Reduce the streaming checkpoints `inputs` into the new streaming checkpoint `output`, chunk by chunk.  For
+each chunk, all inputs are read at once and reduced with `reducer_chunk!`, and the reduced chunk is written to
+`output` right away.  At most `depth` chunks are in flight, so memory use is bounded by
+`length(inputs)*depth*chunkbytes`.  `output` becomes visible only when all of its chunks are written.
+"""
+function reduce_streaming(reducer_chunk!, inputs, output, layout, chunkbytes, depth)
+    chunks = checkpoint_chunks(layout, chunkbytes)
+    nbytes = sum(last, layout; init=0)
+    for input in inputs
+        n = filesize(input)
+        n == nbytes || error("Schedulers: checkpoint $input has $n bytes, expected $nbytes for a streaming checkpoint")
+    end
+    pool = buffer_pool(length(inputs)*depth, maximum(chunk->chunk.nbytes, chunks; init=0))
+    @debug "reduce_streaming, reducing $(length(inputs)) checkpoints of $nbytes bytes in $(length(chunks)) chunks"
+    tic = time()
+    try
+        foreach_chunk(chunks, depth) do ichunk, chunk
+            buffers = [take!(pool) for _ in inputs]
+            try
+                read_chunk!(buffers, inputs, chunk)
+                GC.@preserve buffers begin
+                    x = wrap_bytes(chunk.T, pointer(buffers[1]), chunk.nbytes)
+                    for buffer in buffers[2:end]
+                        reducer_chunk!(x, wrap_bytes(chunk.T, pointer(buffer), chunk.nbytes))
+                    end
+                end
+                checkpoint_write_chunk(output, ichunk, length(chunks), view(buffers[1], 1:chunk.nbytes), chunk.offset)
+            finally
+                foreach(buffer->put!(pool, buffer), buffers)
+            end
+        end
+        checkpoint_commit(output, length(chunks))
+    catch
+        abort_checkpoint(output)
+        rethrow()
+    end
+    elapsed = time() - tic
+    @debug "reduce_streaming, done in $(round(elapsed; digits=1)) seconds, reading at $(round(length(inputs)*nbytes/elapsed/1e9; digits=2)) GB/s and writing at $(round(nbytes/elapsed/1e9; digits=2)) GB/s"
+    nothing
+end
+
+# write the local result of a map worker as a streaming checkpoint, straight from the memory of its arrays
+function save_checkpoint_streaming(fetch_method, checkpoint, _localresult, ::Type{T}, chunkbytes, depth) where {T}
+    x = fetch_method(_localresult)::T
+    arrays = checkpoint_arrays(x)
+    chunks = checkpoint_chunks(checkpoint_layout(x), chunkbytes)
+    tic = time()
+    try
+        foreach_chunk(chunks, depth) do ichunk, chunk
+            a = arrays[chunk.array]
+            GC.@preserve a checkpoint_write_chunk(checkpoint, ichunk, length(chunks), wrap_bytes(UInt8, pointer(a) + chunk.arrayoffset, chunk.nbytes), chunk.offset)
+        end
+        checkpoint_commit(checkpoint, length(chunks))
+    catch
+        abort_checkpoint(checkpoint)
+        rethrow()
+    end
+    elapsed = time() - tic
+    @debug "save_checkpoint_streaming, wrote $(sum(sizeof, arrays; init=0)) bytes in $(round(elapsed; digits=1)) seconds, $(round(sum(sizeof, arrays; init=0)/elapsed/1e9; digits=2)) GB/s"
+    nothing
+end
+
+#=
+Reduce the streaming checkpoints `inputs` into the arrays of `x`, in place.  If `done` is given, chunks marked
+in it are skipped, and chunks are marked once reduced, so that a failed call can be retried without reducing
+any chunk twice.
+=#
+function reduce_into!(reducer_chunk!, x, inputs, chunkbytes, depth; done=nothing)
+    arrays = checkpoint_arrays(x)
+    chunks = checkpoint_chunks(checkpoint_layout(x), chunkbytes)
+    pool = buffer_pool(length(inputs)*depth, maximum(chunk->chunk.nbytes, chunks; init=0))
+    foreach_chunk(chunks, depth) do ichunk, chunk
+        done !== nothing && done[ichunk] && return
+        buffers = [take!(pool) for _ in inputs]
+        try
+            read_chunk!(buffers, inputs, chunk)
+            a = arrays[chunk.array]
+            GC.@preserve a buffers begin
+                y = wrap_bytes(chunk.T, pointer(a) + chunk.arrayoffset, chunk.nbytes)
+                for buffer in buffers
+                    reducer_chunk!(y, wrap_bytes(chunk.T, pointer(buffer), chunk.nbytes))
+                end
+            end
+            done !== nothing && (done[ichunk] = true)
+        finally
+            foreach(buffer->put!(pool, buffer), buffers)
+        end
+    end
+    x
+end
+
+load_checkpoint_streaming(zeros, checkpoint, ::Type{T}, chunkbytes, depth) where {T} = reduce_into!(copyto!, zeros()::T, [checkpoint], chunkbytes, depth)
+
+"""
+    Schedulers.checkpoint_read!(checkpoint, buffer, offset)
+
+Read `length(buffer)` bytes of the streaming checkpoint `checkpoint` into `buffer`, starting `offset` bytes
+into the checkpoint.
+
+Together with `checkpoint_write_chunk`, `checkpoint_commit` and `checkpoint_abort`, this is the storage
+interface of streaming reductions (`reduce_streaming=true`).  Methods are provided for local paths (for
+example on a shared file system), and for Azure blobs when AzStorage is loaded.  Add methods for other
+storage.
+"""
+function checkpoint_read!(checkpoint::AbstractString, buffer, offset)
+    open(checkpoint) do io
+        seek(io, offset)
+        GC.@preserve buffer unsafe_read(io, pointer(buffer), length(buffer))
+    end
+    nothing
+end
+checkpoint_read!(checkpoint, buffer, offset) = streaming_unsupported(checkpoint)
+
+"""
+    Schedulers.checkpoint_write_chunk(checkpoint, ichunk, nchunks, buffer, offset)
+
+Write `buffer`, chunk `ichunk` of `nchunks`, to the streaming checkpoint `checkpoint`, at byte `offset`.
+Chunks are written concurrently and in any order, and must not be visible until `checkpoint_commit` is
+called.
+"""
+function checkpoint_write_chunk(checkpoint::AbstractString, ichunk, nchunks, buffer, offset)
+    open(partial_checkpoint(checkpoint); write=true, create=true, truncate=false) do io
+        seek(io, offset)
+        GC.@preserve buffer unsafe_write(io, pointer(buffer), length(buffer))
+    end
+    nothing
+end
+checkpoint_write_chunk(checkpoint, ichunk, nchunks, buffer, offset) = streaming_unsupported(checkpoint)
+
+"""
+    Schedulers.checkpoint_commit(checkpoint, nchunks)
+
+Make the `nchunks` chunks written with `checkpoint_write_chunk` visible as the streaming checkpoint
+`checkpoint`, in a single step.
+"""
+function checkpoint_commit(checkpoint::AbstractString, nchunks)
+    partial = partial_checkpoint(checkpoint)
+    isfile(partial) || touch(partial) # a result without any data
+    mv(partial, checkpoint; force=true)
+    nothing
+end
+checkpoint_commit(checkpoint, nchunks) = streaming_unsupported(checkpoint)
+
+"""
+    Schedulers.checkpoint_abort(checkpoint)
+
+Discard the chunks of a streaming checkpoint that was not committed.
+"""
+checkpoint_abort(checkpoint::AbstractString) = (rm(partial_checkpoint(checkpoint); force=true); nothing)
+checkpoint_abort(checkpoint) = streaming_unsupported(checkpoint)
+
+partial_checkpoint(checkpoint::AbstractString) = checkpoint * ".partial"
+
+streaming_unsupported(checkpoint) = error("Schedulers: streaming reductions do not support checkpoints of type $(typeof(checkpoint)); add methods to `Schedulers.checkpoint_read!`, `checkpoint_write_chunk`, `checkpoint_commit` and `checkpoint_abort`")
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
 
