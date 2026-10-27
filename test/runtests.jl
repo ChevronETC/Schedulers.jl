@@ -1027,6 +1027,44 @@ end
     rm(tmpdir; recursive=true)
 end
 
+# a streaming checkpoint in memory, with hooks that run before each chunk is read or written
+mutable struct MemoryCheckpoint
+    data::Vector{UInt8}
+    onread::Function
+    onwrite::Function
+    committed::Bool
+    aborted::Bool
+end
+MemoryCheckpoint(data; onread=offset->nothing, onwrite=offset->nothing) = MemoryCheckpoint(data, onread, onwrite, false, false)
+Base.filesize(c::MemoryCheckpoint) = length(c.data)
+Schedulers.checkpoint_read!(c::MemoryCheckpoint, buffer, offset) = (c.onread(offset); copyto!(buffer, 1, c.data, offset + 1, length(buffer)); nothing)
+Schedulers.checkpoint_write_chunk(c::MemoryCheckpoint, ichunk, nchunks, buffer, offset) = (c.onwrite(offset); copyto!(c.data, offset + 1, buffer, 1, length(buffer)); nothing)
+Schedulers.checkpoint_commit(c::MemoryCheckpoint, nchunks) = (c.committed = true; nothing)
+Schedulers.checkpoint_abort(c::MemoryCheckpoint) = (c.aborted = true; nothing)
+
+@testset "streaming reduction, later chunks are read while earlier chunks are written" begin
+    depth, chunkbytes, nchunks = 2, 8, 8
+    # every write waits until a chunk past the first `depth` is read, which only happens if reading goes on while chunks are written
+    later_chunk_read = Threads.Atomic{Bool}(false)
+    inputs = [MemoryCheckpoint(fill(UInt8(i), nchunks*chunkbytes); onread=offset->(offset >= depth*chunkbytes && (later_chunk_read[] = true))) for i in 1:3]
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes); onwrite=offset->(timedwait(()->later_chunk_read[], 30) === :ok || error("no chunk was read while chunks were written")))
+    Schedulers.reduce_streaming(Schedulers.default_reducer_chunk!, inputs, output, [(UInt8, nchunks*chunkbytes)], chunkbytes, depth)
+    @test later_chunk_read[]
+    @test output.committed && !output.aborted
+    @test all(==(UInt8(6)), output.data)
+end
+
+@testset "streaming reduction, a failed $stage aborts the output" for stage in ("read", "write")
+    depth, chunkbytes, nchunks = 2, 8, 8
+    inject(offset) = offset == 4*chunkbytes && error("injected $stage failure")
+    inputs = [MemoryCheckpoint(fill(UInt8(i), nchunks*chunkbytes); onread = stage == "read" ? inject : offset->nothing) for i in 1:3]
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes); onwrite = stage == "write" ? inject : offset->nothing)
+    t = Threads.@spawn Schedulers.reduce_streaming(Schedulers.default_reducer_chunk!, inputs, output, [(UInt8, nchunks*chunkbytes)], chunkbytes, depth)
+    @test timedwait(()->istaskdone(t), 30) === :ok # no deadlock
+    @test occursin("injected $stage failure", try fetch(t); "" catch e; sprint(showerror, e) end)
+    @test output.aborted && !output.committed
+end
+
 @testset "pmapreduce, streaming reduction, reduce_fanin=$fanin" for fanin in (2, 3, 4)
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers

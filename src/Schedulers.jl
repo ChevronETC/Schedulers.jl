@@ -1309,7 +1309,7 @@ and `epmap_kwargs` are as follows.
 * `reduce_streaming=false` stream the reduction: merge up to `reduce_fanin` checkpoints at a time, reading them concurrently, chunk by chunk, and writing each merged chunk as soon as it is ready[6]
 * `reduce_fanin=2` maximum number of checkpoints merged at a time when `reduce_streaming=true`
 * `reduce_chunkbytes=64*2^20` chunk size in bytes when `reduce_streaming=true`
-* `reduce_depth=4` number of chunks in flight in each merge when `reduce_streaming=true`
+* `reduce_depth=4` number of chunks read at once, and of merged chunks written at once, in each merge when `reduce_streaming=true`
 * `reducer_chunk! = (x,y)->(x .+= y)` the element-wise reduction applied to chunks when `reduce_streaming=true`[7]
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
@@ -1323,10 +1323,10 @@ Julia cluster.
 [5] If more than one scratch location is selected, then check-point files will be distributed across those locations.
 This can be useful if you are, for example, constrained by cloud storage through-put limits.
 [6] A streaming checkpoint holds the raw bytes of the arrays of the result (see `Schedulers.checkpoint_arrays`), so
-`save_checkpoint` and `load_checkpoint` are not used.  A merge holds about `reduce_fanin*reduce_depth*reduce_chunkbytes`
-bytes, and its reads and writes run concurrently on the threads of the worker, so start the workers with at least
-`reduce_fanin*reduce_depth` threads.  The scratch storage must implement the streaming interface (see
-`Schedulers.checkpoint_read!`): local paths do, and so do Azure blobs when AzStorage (2.14 or later) is loaded.
+`save_checkpoint` and `load_checkpoint` are not used.  A merge holds about `(reduce_fanin+1)*reduce_depth*reduce_chunkbytes`
+bytes, and runs up to `(reduce_fanin+1)*reduce_depth` reads and writes at once on the threads of the worker, so start
+the workers with at least that many threads.  The scratch storage must implement the streaming interface (see
+`Schedulers.checkpoint_read!`): local paths do, and so do Azure blobs when AzStorage (2.10 or later) is loaded.
 [7] `reducer_chunk!(x, y)` reduces `y` into `x`, two vectors holding the same elements of one of the arrays of
 the result.  It must be element-wise, and consistent with `reducer!`.
 
@@ -2022,8 +2022,10 @@ end
 
 Reduce the streaming checkpoints `inputs` into the new streaming checkpoint `output`, chunk by chunk.  For
 each chunk, all inputs are read at once and reduced with `reducer_chunk!`, and the reduced chunk is written to
-`output` right away.  At most `depth` chunks are in flight, so memory use is bounded by
-`length(inputs)*depth*chunkbytes`.  `output` becomes visible only when all of its chunks are written.
+`output` right away.  Reading and writing are separate stages: up to `depth` chunks are read at once, and up to
+`depth` reduced chunks are written at once, so later chunks are read while earlier ones are written.  Memory use
+is bounded by `(length(inputs)+1)*depth*chunkbytes`.  `output` becomes visible only when all of its chunks are
+written.
 """
 function reduce_streaming(reducer_chunk!, inputs, output, layout, chunkbytes, depth)
     chunks = checkpoint_chunks(layout, chunkbytes)
@@ -2032,25 +2034,55 @@ function reduce_streaming(reducer_chunk!, inputs, output, layout, chunkbytes, de
         n = filesize(input)
         n == nbytes || error("Schedulers: checkpoint $input has $n bytes, expected $nbytes for a streaming checkpoint")
     end
-    pool = buffer_pool(length(inputs)*depth, maximum(chunk->chunk.nbytes, chunks; init=0))
+    # a chunk being read holds a buffer per input, and a chunk being written holds one
+    pool = buffer_pool((length(inputs) + 1)*depth, maximum(chunk->chunk.nbytes, chunks; init=0))
+    reading, writing = Base.Semaphore(depth), Base.Semaphore(depth)
+    failed = Threads.Atomic{Bool}(false)
+    firsterror = Ref{Any}(nothing)
     @debug "reduce_streaming, reducing $(length(inputs)) checkpoints of $nbytes bytes in $(length(chunks)) chunks"
     tic = time()
     try
-        foreach_chunk(chunks, depth) do ichunk, chunk
-            buffers = [take!(pool) for _ in inputs]
-            try
-                read_chunk!(buffers, inputs, chunk)
-                GC.@preserve buffers begin
-                    x = wrap_bytes(chunk.T, pointer(buffers[1]), chunk.nbytes)
-                    for buffer in buffers[2:end]
-                        reducer_chunk!(x, wrap_bytes(chunk.T, pointer(buffer), chunk.nbytes))
+        @sync for (ichunk, chunk) in enumerate(chunks)
+            Base.acquire(reading)
+            if failed[]
+                Base.release(reading)
+                break
+            end
+            Threads.@spawn begin
+                buffers = Vector{UInt8}[]
+                isreading, iswriting = true, false
+                try
+                    for _ in inputs
+                        push!(buffers, take!(pool))
                     end
+                    read_chunk!(buffers, inputs, chunk)
+                    GC.@preserve buffers begin
+                        x = wrap_bytes(chunk.T, pointer(buffers[1]), chunk.nbytes)
+                        for buffer in buffers[2:end]
+                            reducer_chunk!(x, wrap_bytes(chunk.T, pointer(buffer), chunk.nbytes))
+                        end
+                    end
+                    # move to the write stage, keeping only the reduced chunk, so that the next chunk can be read
+                    while length(buffers) > 1
+                        put!(pool, pop!(buffers))
+                    end
+                    Base.acquire(writing)
+                    iswriting = true
+                    Base.release(reading)
+                    isreading = false
+                    failed[] && return
+                    checkpoint_write_chunk(output, ichunk, length(chunks), view(buffers[1], 1:chunk.nbytes), chunk.offset)
+                catch e
+                    Threads.atomic_xchg!(failed, true) || (firsterror[] = CapturedException(e, catch_backtrace()))
+                finally
+                    # buffers go back before slots, so a chunk that gets a slot always finds its buffers in the pool
+                    foreach(buffer->put!(pool, buffer), buffers)
+                    iswriting && Base.release(writing)
+                    isreading && Base.release(reading)
                 end
-                checkpoint_write_chunk(output, ichunk, length(chunks), view(buffers[1], 1:chunk.nbytes), chunk.offset)
-            finally
-                foreach(buffer->put!(pool, buffer), buffers)
             end
         end
+        failed[] && throw(firsterror[])
         checkpoint_commit(output, length(chunks))
     catch
         abort_checkpoint(output)
