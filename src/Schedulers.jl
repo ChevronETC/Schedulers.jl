@@ -331,6 +331,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     demand::Union{Nothing,DemandFeed}
     reclaim::Union{Nothing,Function}
     reclaimed_pids::Set{Int}
+    reducing_pids::Set{Int}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -381,6 +382,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         Set{Int}(),
         options.demand,
         options.reclaim,
+        Set{Int}(),
         Set{Int}(),
     )
 
@@ -899,6 +901,10 @@ end
 
 retiring(eloop::ElasticLoop, pid) = pid ∈ eloop.retiring_pids || pid ∈ eloop.reclaimed_pids
 
+# Reduce workers that have not yet taken a pair of checkpoints off `reduce_checkpoints`. Those
+# reducing a pair already removed it from the queue, so they leave the remaining pairs to new workers.
+waiting_reducers(eloop::ElasticLoop) = count(pid -> pid ∉ eloop.reducing_pids, eloop.used_pids_reduce)
+
 """
 Pids of whole groups to remove after a run: every retiring group, then other
 groups (smallest first) while at least `minworkers` workers remain.
@@ -1139,12 +1145,12 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
             push!(loop_log_cache, "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))")
 
-            wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > length(eloop.used_pids_reduce)
+            wait_for_reduced_trigger = eloop.is_reduce_triggered && div(length(eloop.reduce_checkpoints_snapshot), 2) > waiting_reducers(eloop)
             if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
                 push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && div(length(eloop.reduce_checkpoints), 2) > length(eloop.used_pids_reduce)
+            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && div(length(eloop.reduce_checkpoints), 2) > waiting_reducers(eloop)
                 push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -2181,6 +2187,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     @debug "reduce, no checkpoints to reduce, released lock on pid=$pid"
                     continue
                 end
+                push!(epmap_eloop.reducing_pids, pid)
                 unlock(l)
                 @debug "reduce, released lock on pid=$pid"
 
@@ -2192,10 +2199,12 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
+                    delete!(epmap_eloop.reducing_pids, pid)
                     @debug "pushed reduced checkpoint3, pid=$pid, reduce_times_length=$(length(reduce_times)), reduce_times_extrema=$(length(reduce_times) > 0 ? extrema(reduce_times) : (0.0,0.0))" checkpoint3
                 catch e
                     push!(epmap_eloop.reduce_checkpoints, checkpoint1, checkpoint2)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint1, checkpoint2)
+                    delete!(epmap_eloop.reducing_pids, pid)
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
@@ -2260,6 +2269,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
             end
         catch e
+            delete!(epmap_eloop.reducing_pids, pid)
             @warn "reduce, uncaught exception in worker loop for pid=$pid"
             logerror(e, Logging.Debug)
             @debug "reduce, putting $pid onto remove channel"

@@ -545,6 +545,39 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "pmapreduce, checkpoints arriving while reducers are busy get new reducers" begin
+    safe_addprocs(8)
+    @everywhere using Distributed, Schedulers
+    @everywhere function busy_reducers_task(x, tsk)
+        sleep(tsk <= 4 ? 1 : 4)
+        x .+= tsk
+        nothing
+    end
+    @everywhere busy_reducers_dir = $(mktempdir())
+    @everywhere function busy_reducers_reducer!(x, y)
+        t0 = time()
+        sleep(6)
+        myid() == 1 || write(joinpath(busy_reducers_dir, "reduce-$(myid())-$(time_ns())"), "$t0 $(time())")
+        x .+= y
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;minworkers=8, maxworkers=8, scratch=tmpdir, reducer! = busy_reducers_reducer!, reporttasks=false)
+    x,tsks = epmapreduce!(zeros(Float32,10), options, busy_reducers_task, 1:8)
+    rmprocs(workers())
+
+    @test x ≈ sum(1:8) * ones(10)
+    # Tasks 1-4 finish first and their checkpoints are reduced on two workers; tasks 5-8 finish while
+    # those reductions run, and their two pairs go to two more workers instead of waiting for them.
+    intervals = [parse.(Float64, split(read(joinpath(busy_reducers_dir, f), String))) for f in readdir(busy_reducers_dir)]
+    max_concurrent = maximum(t -> count(iv -> iv[1] <= t < iv[2], intervals), first.(intervals))
+    @test length(intervals) == 7
+    @test max_concurrent == 4
+    rm(tmpdir; recursive=true, force=true)
+    rm(busy_reducers_dir; recursive=true, force=true)
+end
+
 @testset "pmapreduce, cluster with RemoteException during tasks" begin
     safe_addprocs(5)
     @everywhere using Distributed, Schedulers, Random
