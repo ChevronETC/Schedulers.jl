@@ -984,7 +984,7 @@ mutable struct SchedulerOptions{C}
     reduce_fanin::Int
     reduce_chunkbytes::Int
     reduce_depth::Int
-    reducer_chunk!::Function
+    reducer_chunk!::Union{Function,Nothing}
 end
 
 function SchedulerOptions(;
@@ -1029,7 +1029,7 @@ function SchedulerOptions(;
         reduce_fanin = 2,
         reduce_chunkbytes = 64*2^20,
         reduce_depth = 4,
-        reducer_chunk! = default_reducer_chunk!)
+        reducer_chunk! = nothing)
     reduce_fanin >= 2 || throw(ArgumentError("reduce_fanin must be at least 2, got $reduce_fanin"))
     reduce_chunkbytes >= 1 || throw(ArgumentError("reduce_chunkbytes must be positive, got $reduce_chunkbytes"))
     reduce_depth >= 1 || throw(ArgumentError("reduce_depth must be positive, got $reduce_depth"))
@@ -1275,7 +1275,7 @@ by `options::SchedulerOptions` and can be built using `options=SchedulerOptions(
 and `epmap_kwargs` are as follows.
 
 ## epmap_kwargs
-* `reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`
+* `reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`.  Not used when `reduce_streaming=true`[7]
 * `save_checkpoint = default_save_checkpoint` the method used to save checkpoints[1]
 * `load_checkpoint = default_load_checkpoint` the method used to load a checkpoint[2]
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initialize partial reductions
@@ -1328,7 +1328,9 @@ bytes, and runs up to `(reduce_fanin+1)*reduce_depth` reads and writes at once o
 the workers with at least that many threads.  The scratch storage must implement the streaming interface (see
 `Schedulers.checkpoint_read!`): local paths do, and so do Azure blobs when AzStorage (2.10 or later) is loaded.
 [7] `reducer_chunk!(x, y)` reduces `y` into `x`, two vectors holding the same elements of one of the arrays of
-the result.  It must be element-wise, and consistent with `reducer!`.
+the result.  It must be element-wise, and consistent with `reducer!`.  A streaming reduction calls `reducer_chunk!`
+instead of `reducer!`, so when a custom `reducer!` is given, `reducer_chunk!` must be given too, or `epmapreduce!`
+throws an `ArgumentError`.  It is called from several threads at once, so it must not modify shared state.
 
 # Examples
 ## Example 1
@@ -1390,8 +1392,12 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
             options.zeros = ()->zeros(_et, _sz)::T
         end
 
-        # fail before mapping if the result can not be stored as a streaming checkpoint
+        # fail before mapping if the result can not be stored as a streaming checkpoint, or if a custom reducer! would be ignored
         options.reduce_streaming && checkpoint_layout(result)
+        check_streaming_reducer(options)
+        if options.reducer_chunk! === nothing
+            options.reducer_chunk! = default_reducer_chunk!
+        end
 
         epmap_journal = journal_init(tasks, options.journal_init_callback; reduce=true)
 
@@ -1929,6 +1935,14 @@ default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 #
 
 default_reducer_chunk!(x, y) = (x .+= y; nothing)
+
+# a streaming reduction never calls reducer!, so a custom reducer! needs a reducer_chunk! that matches it
+function check_streaming_reducer(options)
+    if options.reduce_streaming && options.reducer! !== default_reducer! && options.reducer_chunk! === nothing
+        throw(ArgumentError("a streaming reduction (reduce_streaming=true) never calls `reducer!`: it reduces chunks of the arrays of the result with `reducer_chunk!`.  Since a custom `reducer!` is given, also give the `reducer_chunk!` that matches it, element by element (for example `reducer_chunk! = (x,y)->(x .+= y)` when `reducer!` adds), or set reduce_streaming=false."))
+    end
+    nothing
+end
 
 """
     arrays = Schedulers.checkpoint_arrays(x)

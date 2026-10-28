@@ -1125,6 +1125,52 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "streaming reduction, a custom reducer! needs a reducer_chunk!" begin
+    myreducer!(x, y) = (x .+= y; nothing)
+    mychunk!(x, y) = (x .+= y; nothing)
+    check(; kwargs...) = Schedulers.check_streaming_reducer(SchedulerOptions(; kwargs...))
+    @test_throws ArgumentError check(; reduce_streaming=true, reducer! = myreducer!)
+    @test check(; reduce_streaming=true, reducer! = myreducer!, reducer_chunk! = mychunk!) === nothing
+    @test check(; reduce_streaming=true, reducer! = myreducer!, reducer_chunk! = Schedulers.default_reducer_chunk!) === nothing
+    @test check(; reduce_streaming=true) === nothing
+    @test check(; reduce_streaming=false, reducer! = myreducer!) === nothing
+
+    # epmapreduce! fails before running anything, and leaves the options as they were
+    tmpdir = mktempdir()
+    options = SchedulerOptions(; scratch=tmpdir, reduce_streaming=true, reducer! = myreducer!)
+    e = try
+        epmapreduce!(zeros(10), options, (r, tsk)->nothing, 1:4)
+        nothing
+    catch e
+        e
+    end
+    @test e isa ArgumentError && occursin("reducer_chunk!", e.msg)
+    @test options.reducer_chunk! === nothing
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, streaming reduction, custom reducer_chunk!" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers
+    @everywhere begin
+        foo_summax(r, tsk) = (r.s .+= tsk; r.m .= max.(r.m, tsk); nothing)
+        # the summed array holds Float32 and the maximum Int32, so reducer_chunk! can tell their chunks apart
+        chunk_summax!(x::AbstractVector{Float32}, y) = (x .+= y; nothing)
+        chunk_summax!(x::AbstractVector{Int32}, y) = (x .= max.(x, y); nothing)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    zeros_summax() = (; s=zeros(Float32, 100), m=zeros(Int32, 100))
+    options = SchedulerOptions(;scratch=tmpdir, zeros=zeros_summax, reducer! = (x, y)->(x.s .+= y.s; x.m .= max.(x.m, y.m); nothing),
+        reducer_chunk! = chunk_summax!, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64)
+    r,tsks = epmapreduce!(zeros_summax(), options, foo_summax, 1:30)
+    rmprocs(workers())
+
+    @test all(==(sum(1:30)), r.s)
+    @test all(==(30), r.m)
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "copy SchedulerOptions" begin
     options = SchedulerOptions()
     _options = copy(options)
