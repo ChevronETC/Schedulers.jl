@@ -1125,6 +1125,41 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "pmapreduce, partial reduction, streaming, snapshot smaller than reduce_fanin" begin
+    using Distributed, Schedulers
+
+    function foo_small_snapshot(r, i)
+        r .+= i
+        sleep(0.5)
+        nothing
+    end
+
+    function trigger_small_snapshot(eloop, ntasks)
+        if length(complete_tasks(eloop)) - ntasks[] >= 4
+            trigger_reduction!(eloop)
+            ntasks[] = length(complete_tasks(eloop))
+        end
+    end
+
+    # with 2 workers, the first snapshot holds 2 checkpoints, fewer than reduce_fanin, and no reducer is running yet
+    tmpdir = mktempdir(;cleanup=false)
+    tmpfile = tempname()
+
+    ntasks = Ref(0)
+    options = SchedulerOptions(;maxworkers=2, scratch=tmpdir, reduce_trigger=eloop->trigger_small_snapshot(eloop, ntasks), save_partial_reduction=input->write(tmpfile, input),
+        reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=16)
+    t = @async epmapreduce!(zeros(10), options, foo_small_snapshot, 1:20)
+    @test timedwait(()->istaskdone(t), 300.0; pollint=1.0) == :ok # it used to hang
+
+    if istaskdone(t)
+        r,tsks = fetch(t)
+        @test r ≈ sum([1:20;]) * ones(10)
+        @test isfile(tmpfile)
+        rm(tmpfile; force=true)
+    end
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "streaming reduction, a custom reducer! needs a reducer_chunk!" begin
     myreducer!(x, y) = (x .+= y; nothing)
     mychunk!(x, y) = (x .+= y; nothing)
@@ -1168,6 +1203,67 @@ end
 
     @test all(==(sum(1:30)), r.s)
     @test all(==(30), r.m)
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "remote calls return as soon as they finish" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    pid = workers()[1]
+    call_wait(f, times=Float64[]) = Schedulers.remotecall_wait_timeout(times, 1, 5.0, nothing, tsk->nothing, tsk->nothing, 0, f, pid)
+    call_fetch() = Schedulers.remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, gethostname, pid)
+    call_wait(()->nothing); call_fetch() # compile
+    # the fastest of a few calls, so that an occasional pause (e.g. garbage collection) does not count; waiting with
+    # sleep(1) made every call take at least a second
+    fastest(f) = minimum(_->@elapsed(f()), 1:3)
+
+    @test fastest(()->call_wait(()->nothing)) < 0.5
+    @test fastest(call_fetch) < 0.5
+    # failures are reported right away too
+    @test fastest(()->try call_wait(()->error("expected error")) catch end) < 0.5
+    # and timeouts still apply: the limit here is 5 times the median of the earlier times, 1 second
+    t = @elapsed @test_throws Schedulers.TimeoutException call_wait(()->sleep(5), [0.2, 0.2])
+    @test 1 <= t < 3
+    # fast calls are timed as taking a second, as when calls were polled once a second, so that timeouts based on them
+    # stay at several seconds
+    times = Float64[]
+    call_wait(()->nothing, times)
+    @test times == [1.0]
+    rmprocs(workers())
+end
+
+@testset "streaming reduction, group sizes" begin
+    # a full group, or the remaining checkpoints once no more can arrive
+    @test Schedulers.reduce_group_size(7, 5, true) == 5
+    @test Schedulers.reduce_group_size(5, 5, false) == 5
+    @test Schedulers.reduce_group_size(4, 5, true) == 0
+    @test Schedulers.reduce_group_size(4, 5, false) == 4
+    @test Schedulers.reduce_group_size(1, 5, false) == 0
+    # with a fan-in of 2, any two checkpoints are a full group, as before
+    @test Schedulers.reduce_group_size(2, 2, true) == 2
+end
+
+@testset "pmapreduce, streaming reduction, merges take full groups" begin
+    safe_addprocs(10)
+    @everywhere using Distributed, Schedulers
+    @everywhere foo_groups(r, tsk) = (r .+= tsk; nothing)
+
+    tmpdir = mktempdir(;cleanup=false)
+    fanin = 3
+    options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=fanin, reduce_chunkbytes=64)
+    # catch_exceptions=true, as with the default loggers, so that a failure to build a debug message can not change the run
+    logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 100), options, foo_groups, 1:40)
+    end
+    rmprocs(workers())
+
+    ninputs = [parse(Int, m.captures[1]) for m in (match(r"^reducing into checkpoint3, pid=\d+, from (\d+) checkpoints", string(l.message)) for l in logger.logs) if m !== nothing]
+    ncheckpoints = 1 + sum(k->k - 1, ninputs; init=0)
+    @test all(==(sum(1:40)), r)
+    @test !isempty(ninputs)
+    @test length(ninputs) == cld(ncheckpoints - 1, fanin - 1) # as few merges as possible
+    @test all(==(fanin), ninputs[1:end-1])                    # only the last merge may take fewer checkpoints
     rm(tmpdir; recursive=true, force=true)
 end
 
@@ -1269,7 +1365,9 @@ end
 
     @test 1 ∈ tsks
     @test 12 ∈ tsks
-    @test length(tsks) > 2
+    # besides the slow tasks, only short tasks still running at the end of the grace period can be skipped, those that are
+    # checked before they finish, which depends on timing
+    @test all(tsk->tsk ∈ (1, 12) || tsk > 12, tsks)
     @test g == ones(size(g)) .* (sum([1 : 22;]) - sum(tsks)) * 2
 end
 

@@ -191,6 +191,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     grace_period_ratio::Float64
     reduce_fanin::Int
     load_partial_reduction::Function
+    reduce_merges_in_flight::Int
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -234,6 +235,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.grace_period_ratio,
         options.reduce_streaming ? options.reduce_fanin : 2,
         deserialize,
+        0,
     )
 
     if !isreduce
@@ -290,16 +292,48 @@ function default_threadpool_checkpoint_call(preempt_channel_future, checkpoint_t
     fetch(t)
 end
 
+#=
+Wait for the task `t`, waking up as soon as it is done.  `check()` is called first, and then at least once a second
+while `t` runs, for example to throw on a timeout.  Waiting with `sleep(1)` instead added up to a second to every
+remote call.
+=#
+function wait_for(check, t::Task)
+    done = Threads.Event(true)
+    @async begin
+        try
+            wait(t)
+        catch
+        end
+        notify(done)
+    end
+    while !istaskdone(t)
+        check()
+        timer = Timer(_->notify(done), 1)
+        try
+            wait(done)
+        finally
+            close(timer)
+        end
+    end
+    nothing
+end
+
+#=
+Timeouts are multiples of the median time of earlier calls (see `maximum_task_time` and `robust_average`).  When calls
+were polled once a second, no call was timed at less than a second.  Keep that floor, so that the timeouts of fast
+calls (for example, removing a checkpoint) stay at several seconds instead of shrinking to a fraction of a second.
+=#
+record_time!(tsk_times, tic) = isa(tsk_times, AbstractArray) && push!(tsk_times, max(time() - tic, 1.0))
+
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
     t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
-    while !istaskdone(t)
+    wait_for(t) do
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
-        sleep(1)
     end
-    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    record_time!(tsk_times, tic)
     if istaskfailed(t)
         fetch(t)
     end
@@ -309,13 +343,12 @@ end
 function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
     t = @async remotecall_fetch(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
-    while !istaskdone(t)
+    wait_for(t) do
         if time() - tic > maximum_task_time(tsk_times, tsk_count, timeout_multiplier)
             throw(TimeoutException(pid, time() - tic))
         end
-        sleep(1)
     end
-    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    record_time!(tsk_times, tic)
     fetch(t)
 end
 
@@ -352,7 +385,7 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
     t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
     tic_report = time()
-    while !istaskdone(t)
+    wait_for(t) do
         report = false
         if time() - tic_report > 600
             report = true
@@ -361,9 +394,8 @@ function remotecall_func_wait_timeout(tsk_times, eloop, options, preempt_channel
         if check_timeout_status(tic, tsk_times, eloop.tsk_count, options.timeout_function_multiplier, eloop.grace_period_start_time, options.null_tsk_runtime_threshold, options.grace_period_ratio, tsk, report)
             throw(TimeoutException(pid, time() - tic))
         end
-        sleep(1)
     end
-    isa(tsk_times, AbstractArray) && push!(tsk_times, time() - tic)
+    record_time!(tsk_times, tic)
     if istaskfailed(t)
         fetch(t)
     end
@@ -437,8 +469,8 @@ end
 
 #=
 Number of merges that reducers can start now: whole groups of `fanin` checkpoints, or, once no more checkpoints
-are expected and no reducer is running, the remaining checkpoints (at least two), so that the reduction can not
-stall on a partial group.  With `fanin=2`, this is the number of pairs.
+can arrive and no reducer is free to take them, the remaining checkpoints (at least two), so that the reduction can
+not stall on a partial group.  With `fanin=2`, this is the number of pairs.
 =#
 function reduce_groups(ncheckpoints, fanin, nreducers, more_expected)
     ngroups = div(ncheckpoints, fanin)
@@ -448,8 +480,34 @@ function reduce_groups(ncheckpoints, fanin, nreducers, more_expected)
     ngroups
 end
 
+#=
+Number of checkpoints a reducer should merge now: a full group of `fanin`, or, once no more checkpoints can arrive,
+the remaining checkpoints (at least two); 0 means that it should not merge now.  Waiting for full groups keeps the
+reduction tree as shallow as possible.
+=#
+reduce_group_size(ncheckpoints, fanin, more_expected) = ncheckpoints >= fanin ? fanin : (ncheckpoints >= 2 && !more_expected ? ncheckpoints : 0)
+
 # are map workers still producing checkpoints?
 is_more_map_checkpoints(eloop::ElasticLoop) = !isempty(eloop.tsk_pool_todo) || !isempty(eloop.checkpoints)
+
+# can more checkpoints still join the queue, from map workers or from merges that are running?
+more_checkpoints_expected(eloop::ElasticLoop) = is_more_map_checkpoints(eloop) || eloop.reduce_merges_in_flight > 0
+
+# reducers that are not merging right now, and so can take a group of checkpoints
+free_reducers(eloop::ElasticLoop) = max(0, length(eloop.used_pids_reduce) - eloop.reduce_merges_in_flight)
+
+#=
+The number of checkpoints that reducers merge from, and whether more can still join them.  During a triggered
+(partial) reduction, reducers only merge the snapshot, which map checkpoints do not join.  Starting reducers and
+taking groups must both use this, otherwise a final partial group can be left without a reducer.
+=#
+function reduce_queue(eloop::ElasticLoop)
+    if eloop.is_reduce_triggered
+        length(eloop.reduce_checkpoints_snapshot), eloop.reduce_merges_in_flight > 0
+    else
+        length(eloop.reduce_checkpoints), more_checkpoints_expected(eloop)
+    end
+end
 
 function save_partial_reduction(eloop)
     if isempty(eloop.reduce_checkpoints)
@@ -787,12 +845,16 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
             push!(loop_log_cache, "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))")
 
-            wait_for_reduced_trigger = eloop.is_reduce_triggered && reduce_groups(length(eloop.reduce_checkpoints_snapshot), eloop.reduce_fanin, length(eloop.used_pids_reduce), false) > length(eloop.used_pids_reduce)
+            # start reducers while more groups wait than there are free reducers (those not merging) to take them
+            nfree = free_reducers(eloop)
+            nqueued, more_expected = reduce_queue(eloop)
+            ngroups = reduce_groups(nqueued, eloop.reduce_fanin, nfree, more_expected)
+            wait_for_reduced_trigger = eloop.is_reduce_triggered && ngroups > nfree
             if is_more_tasks && !is_waiting_on_flush && !wait_for_reduced_trigger
                 push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && reduce_groups(length(eloop.reduce_checkpoints), eloop.reduce_fanin, length(eloop.used_pids_reduce), is_more_map_checkpoints(eloop)) > length(eloop.used_pids_reduce)
+            elseif is_more_checkpoints && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && ngroups > nfree
                 push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -1307,7 +1369,7 @@ and `epmap_kwargs` are as follows.
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
 * `reduce_streaming=false` stream the reduction: merge up to `reduce_fanin` checkpoints at a time, reading them concurrently, chunk by chunk, and writing each merged chunk as soon as it is ready[6]
-* `reduce_fanin=2` maximum number of checkpoints merged at a time when `reduce_streaming=true`
+* `reduce_fanin=2` number of checkpoints merged at a time when `reduce_streaming=true`; only a last merge, once no more checkpoints can arrive, takes fewer
 * `reduce_chunkbytes=64*2^20` chunk size in bytes when `reduce_streaming=true`
 * `reduce_depth=4` number of chunks read at once, and of merged chunks written at once, in each merge when `reduce_streaming=true`
 * `reducer_chunk! = (x,y)->(x .+= y)` the element-wise reduction applied to chunks when `reduce_streaming=true`[7]
@@ -1698,17 +1760,18 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         @debug "reduce, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel when the reduction is done
 
-        hostname = ""
-        try
-            hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
-        catch e
-            @warn "unable to determine host name for pid=$pid"
-            logerror(e, Logging.Debug)
-            put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
-            continue
-        end
-
         @async try
+            # look up the hostname in the reducer's own task, so that reducers start in parallel
+            hostname = ""
+            try
+                hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+            catch e
+                @warn "unable to determine host name for pid=$pid"
+                logerror(e, Logging.Debug)
+                put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
+                return
+            end
+
             while true
                 @debug "reduce, pid=$pid, epmap_eloop.interrupted=$(epmap_eloop.interrupted)"
                 epmap_eloop.interrupted && break
@@ -1719,10 +1782,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 lock(l)
                 @debug "reduce, got lock on pid=$pid"
 
-                n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
+                n_checkpoints, more_expected = reduce_queue(epmap_eloop)
+                ninputs = reduce_group_size(n_checkpoints, fanin, more_expected)
 
-                @debug "reduce, pid=$pid, at exit condition, n_checkpoints=$n_checkpoints"
-                if n_checkpoints < 2
+                @debug "reduce, pid=$pid, at exit condition, n_checkpoints=$n_checkpoints, ninputs=$ninputs"
+                if ninputs == 0
                     unlock(l)
                     @debug "reduce, popping pid=$pid from dirty list"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
@@ -1732,12 +1796,12 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     break
                 end
 
-                # reduce up to `fanin` checkpoints into a new checkpoint
+                # reduce `ninputs` checkpoints into a new checkpoint
                 @info "reducing from $n_checkpoints $(epmap_eloop.is_reduce_triggered ? "snapshot " : "")checkpoints using process $pid ($(nworkers()) julia workers, $(options.nworkers()) provisioned workers, $(length(epmap_eloop.used_pids_reduce)) reduce workers)."
                 inputs = similar(epmap_eloop.reduce_checkpoints, 0)
                 local checkpoint3
                 try
-                    for i in 1:min(fanin, n_checkpoints)
+                    for i in 1:ninputs
                         @debug "reduce, popping checkpoint $i, pid=$pid"
                         if epmap_eloop.is_reduce_triggered
                             checkpoint = popfirst!(epmap_eloop.reduce_checkpoints_snapshot)
@@ -1762,6 +1826,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     @debug "reduce, released lock on pid=$pid"
                     continue
                 end
+                # counted until the merged checkpoint, or the inputs on failure, are back in the queue
+                epmap_eloop.reduce_merges_in_flight += 1
                 unlock(l)
                 @debug "reduce, released lock on pid=$pid"
 
@@ -1795,6 +1861,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     end
                     epmap_eloop.reduce_checkpoints_is_dirty[pid] = false
                     continue
+                finally
+                    epmap_eloop.reduce_merges_in_flight -= 1
                 end
 
                 # remove the checkpoints that were reduced, concurrently
