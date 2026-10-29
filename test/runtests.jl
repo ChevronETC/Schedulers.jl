@@ -1775,6 +1775,67 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "pmapreduce, a worker that does not answer its lookup does not hold up the end" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    slowpid = workers()[1]
+    @everywhere slowpid = $slowpid
+    @everywhere begin
+        lookups_slow = Ref(0)
+        # the first lookup of `slowpid`, as it starts to map, hangs, as for a worker that does not respond
+        gethostname_slow() = (myid() == slowpid && (lookups_slow[] += 1) == 1 && sleep(50); gethostname())
+        foo_lookup(r, tsk) = (r .+= tsk; sleep(1); nothing)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, gethostname=gethostname_slow, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64)
+    elapsed = @elapsed r,tsks = epmapreduce!(zeros(Float32, 100), options, foo_lookup, 1:12)
+
+    @test all(==(sum(1:12)), r)
+    @test elapsed < 40         # the lookup is given up once there are no tasks left, without waiting it out
+    @test slowpid ∈ workers()  # and the worker is not taken to be bad
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "removing a checkpoint does not time out in less than a minute" begin
+    # removing a checkpoint usually takes a fraction of a second, which is timed as a second
+    times = [300.0; fill(1.0, 20)]
+    @test Schedulers.maximum_task_time(times, 10, 5) == 5.0
+    @test Schedulers.maximum_task_time(Schedulers.TimesAtLeast(times, 60.0, 5.0), 10, 5) == 60.0
+    # longer usual times still give longer timeouts
+    @test Schedulers.maximum_task_time(Schedulers.TimesAtLeast([300.0; fill(20.0, 20)], 60.0, 5.0), 10, 5) == 100.0
+    # and times are recorded as they are
+    t = Schedulers.TimesAtLeast(Float64[], 60.0, 5.0)
+    push!(t, 2.0)
+    @test t.times == [2.0]
+
+    # a call that takes longer than a few seconds, but less than a minute, does not time out
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    @everywhere sleep_rm(seconds) = (sleep(seconds); nothing)
+    @test Schedulers.remotecall_wait_timeout(Schedulers.TimesAtLeast([300.0; fill(1.0, 20)], 60.0, 5.0), 10, 5.0, nothing, tsk->nothing, tsk->nothing, 0, sleep_rm, workers()[1], 7) === nothing
+    rmprocs(workers())
+end
+
+@testset "pmapreduce, assigning the result to a global at the top level of a script" begin
+    safe_addprocs(2)
+    @everywhere using Distributed, Schedulers
+    @everywhere foo_toplevel(r, tsk) = (r .+= tsk; nothing)
+
+    # since Julia 1.12, the global is declared, but not assigned, while epmapreduce! runs, and starting the workers copies the globals of Main to them
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir)
+    t = @async Core.eval(Main, :(schedulers_test_result = epmapreduce!(zeros(10), $options, foo_toplevel, 1:4)))
+    @test timedwait(()->istaskdone(t), 120.0; pollint=1.0) == :ok # the workers start, instead of failing to
+    if istaskdone(t)
+        @test !istaskfailed(t)
+        @test Main.schedulers_test_result[1] ≈ sum(1:4) * ones(10)
+    end
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "copy SchedulerOptions" begin
     options = SchedulerOptions()
     _options = copy(options)

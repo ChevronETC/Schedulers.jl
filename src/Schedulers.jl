@@ -108,8 +108,14 @@ function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage,
     end
 end
 
+#=
+The names of `Main` that have a value.  Since Julia 1.12, a global of `Main` is declared before it is assigned, for
+example while `x = epmapreduce!(...)` runs at the top level of a script, and evaluating it then throws.
+=#
+assigned_names_of_main() = filter(name->isdefined(Main, name), names(Main; imported=true))
+
 function load_modules_on_new_workers(pid)
-    _names = names(Main; imported=true)
+    _names = assigned_names_of_main()
     for _name in _names
         try
             if isa(Base.eval(Main, _name), Module) && _name ∉ (:Base, :Core, :InteractiveUtils, :VSCodeServer, :Main, :_vscodeserver)
@@ -125,7 +131,7 @@ end
 
 function load_functions_on_new_workers(pid)
     ignore = (Symbol("@enter"), Symbol("@run"), :ans, :eval, :include, :vscodedisplay)
-    _names = filter(name->name ∉ ignore && isa(Base.eval(Main, name), Function), names(Main; imported=true))
+    _names = filter(name->name ∉ ignore && isa(Base.eval(Main, name), Function), assigned_names_of_main())
 
     for _name in _names
         try
@@ -398,6 +404,24 @@ Base.size(t::PartTimes) = size(t.times)
 Base.getindex(t::PartTimes, i::Int) = t.times[i]
 Base.push!(t::PartTimes, time) = t
 
+#=
+The times of earlier calls, as seen by a call that must not time out in less than `timeout` seconds, with a timeout of
+`timeout_multiplier` times their median (see `maximum_task_time`).  Removing a checkpoint usually takes a fraction of a
+second, so it would time out after a few seconds, which it can take when the storage service throttles requests, as
+AzStorage then retries with a backoff; and a call that times out has its worker marked as bad, and removed.
+=#
+struct TimesAtLeast <: AbstractVector{Float64}
+    times::Vector{Float64}
+    floor::Float64
+end
+TimesAtLeast(times, timeout, timeout_multiplier) = TimesAtLeast(times, timeout/timeout_multiplier)
+Base.size(t::TimesAtLeast) = size(t.times)
+Base.getindex(t::TimesAtLeast, i::Int) = max(t.times[i], t.floor)
+Base.push!(t::TimesAtLeast, time) = (push!(t.times, time); t)
+
+# removing a checkpoint does not time out in less than a minute (see `TimesAtLeast`)
+const RM_CHECKPOINT_MIN_TIMEOUT = 60.0
+
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
     t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
     tic = time()
@@ -422,6 +446,29 @@ function remotecall_fetch_timeout(tsk_times, tsk_count, timeout_multiplier, pree
         end
     end
     record_time!(tsk_times, tic)
+    fetch(t)
+end
+
+struct HostnameNotNeeded <: Exception end
+
+#=
+Look up the hostname of a worker that is about to map, which also checks that it responds: the lookup times out after
+60 seconds.  It is given up, returning `nothing`, once `done()` is true, for example once there are no tasks left for
+the worker, so that a worker that does not respond does not hold up the end of the map, nor the reduction, which waits
+for the map workers: the last merge waits for them, since they could still produce checkpoints.
+=#
+function map_hostname(done, options, pid)
+    t = @async remotecall_fetch(default_threadpool_checkpoint_call, pid, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname)
+    tic = time()
+    try
+        wait_for(t) do
+            done() && throw(HostnameNotNeeded())
+            time() - tic > 60 && throw(TimeoutException(pid, time() - tic))
+        end
+    catch e
+        e isa HostnameNotNeeded && return nothing
+        rethrow()
+    end
     fetch(t)
 end
 
@@ -571,6 +618,9 @@ reduce_group_size(ncheckpoints, fanin, more_expected) = ncheckpoints >= fanin ? 
 
 # are map workers still producing checkpoints?
 is_more_map_checkpoints(eloop::ElasticLoop) = !isempty(eloop.tsk_pool_todo) || !isempty(eloop.checkpoints)
+
+# is there nothing left for a map worker to do: no tasks, or the map stops, or the checkpoints are flushed for a partial reduction?
+map_worker_done(eloop::ElasticLoop) = isempty(eloop.tsk_pool_todo) || eloop.interrupted || (eloop.is_reduce_triggered && !eloop.checkpoints_are_flushed)
 
 # can more checkpoints still join the queue, from map workers or from merges that are running?
 more_checkpoints_expected(eloop::ElasticLoop) = is_more_map_checkpoints(eloop) || eloop.reduce_merges_in_flight > 0
@@ -1418,22 +1468,27 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
 
         @async try
             while true
+                @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
+                # a worker with nothing left to do leaves before it is looked up
+                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+                    @debug "putting $pid onto map_remove channel"
+                    put!(eloop.pid_channel_map_remove, (pid,false))
+                    break
+                end
+
                 if hostname == ""
+                    local _hostname
                     try
-                        hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
+                        _hostname = map_hostname(()->isempty(eloop.tsk_pool_todo) || eloop.interrupted, options, pid)
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds"
                         logerror(e, Logging.Debug)
                         put!(eloop.pid_channel_map_remove, (pid, true))
                         break
                     end
-                end
-
-                @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
-                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
-                    @debug "putting $pid onto map_remove channel"
-                    put!(eloop.pid_channel_map_remove, (pid,false))
-                    break
+                    # the lookup stops once there is nothing left for the worker to do, and the tasks left can change while it runs
+                    _hostname === nothing || (hostname = _hostname)
+                    continue
                 end
                 isempty(eloop.tsk_pool_todo) && (yield(); continue)
 
@@ -1510,7 +1565,7 @@ and `epmap_kwargs` are as follows.
 * `zeros = ()->zeros(eltype(result), size(result))` the method used to initialize partial reductions
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
-* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the median (miscellaneous) task time, then abort that task
+* `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the median (miscellaneous) task time, then abort that task; removing a checkpoint is given at least a minute
 * `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) median (actual) task time, then abort that task
 * `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
@@ -1722,28 +1777,10 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
             @debug "map, done getting local result, pid=$pid"
 
             while true
-                if hostname == ""
-                    try
-                        @debug "fetching hostname for pid=$pid with a timeout of 60 seconds"
-                        hostname = remotecall_fetch_timeout(60, 1, 1, nothing, tsk->nothing, tsk->nothing, 0, options.gethostname, pid)
-                        @debug "fetched hostname for pid=$pid: $hostname"
-                    catch e
-                        @warn "unable to determine hostname for pid=$pid within 60 seconds."
-                        logerror(e, Logging.Debug)
-                        if epmap_eloop.checkpoints[pid] !== nothing
-                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                        end
-                        pop!(localresults, pid)
-                        pop!(epmap_eloop.checkpoints, pid)
-                        put!(epmap_eloop.pid_channel_reduce_remove, (pid,true))
-                        @debug "...finished cleanup for hostname failure for pid=$pid."
-                        break
-                    end
-                end
-
                 @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
                 @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+                # a worker with nothing left to do leaves before it is looked up
+                if map_worker_done(epmap_eloop)
                     if epmap_eloop.checkpoints[pid] !== nothing
                         push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                     end
@@ -1753,6 +1790,34 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     # once the last map worker is done, reducers can start on spare work right away
                     notify(epmap_eloop.wakeup)
                     break
+                end
+
+                if hostname == ""
+                    local _hostname
+                    try
+                        @debug "fetching hostname for pid=$pid with a timeout of 60 seconds"
+                        _hostname = map_hostname(()->map_worker_done(epmap_eloop), options, pid)
+                    catch e
+                        @warn "unable to determine hostname for pid=$pid within 60 seconds."
+                        logerror(e, Logging.Debug)
+                        if epmap_eloop.checkpoints[pid] !== nothing
+                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
+                        end
+                        pop!(localresults, pid)
+                        pop!(epmap_eloop.checkpoints, pid)
+                        put!(epmap_eloop.pid_channel_map_remove, (pid,true))
+                        notify(epmap_eloop.wakeup)
+                        @debug "...finished cleanup for hostname failure for pid=$pid."
+                        break
+                    end
+                    if _hostname === nothing
+                        @debug "stopped fetching the hostname for pid=$pid, since there is nothing left for it to do"
+                    else
+                        hostname = _hostname
+                        @debug "fetched hostname for pid=$pid: $hostname"
+                    end
+                    # the tasks left can change while the worker is looked up
+                    continue
                 end
 
                 @debug "map, getting next task for pid=$pid"
@@ -1873,8 +1938,9 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 try
                     if old_checkpoint !== nothing
                         journal_start!(epmap_journal; stage="rmcheckpoints", tsk, pid, hostname)
-                        @debug "deleting old checkpoint, pid=$pid, tsk=$tsk, tsk_count=$(epmap_eloop.tsk_count), length(rm_times)=$(length(rm_times)), options.timeout_multiplier=$(options.timeout_multiplier), maximum_task_time=$(maximum_task_time(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier))"
-                        options.keepcheckpoints || remotecall_wait_timeout(rm_times, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
+                        rm_times_atleast = TimesAtLeast(rm_times, RM_CHECKPOINT_MIN_TIMEOUT, options.timeout_multiplier)
+                        @debug "deleting old checkpoint, pid=$pid, tsk=$tsk, tsk_count=$(epmap_eloop.tsk_count), length(rm_times)=$(length(rm_times)), options.timeout_multiplier=$(options.timeout_multiplier), maximum_task_time=$(maximum_task_time(rm_times_atleast, epmap_eloop.tsk_count, options.timeout_multiplier))"
+                        options.keepcheckpoints || remotecall_wait_timeout(rm_times_atleast, epmap_eloop.tsk_count, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, old_checkpoint)
                         @debug "...done deleting old checkpoint, pid=$pid, tsk=$tsk"
                         journal_stop!(epmap_journal; stage="rmcheckpoint", tsk, pid, fault=false)
                     end
@@ -1968,7 +2034,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 @debug "removing checkpoint $i, pid=$pid" checkpoint
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                 # We don't have a good way for estimating the number of deletion tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                remotecall_wait_timeout(rm_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint)
+                remotecall_wait_timeout(TimesAtLeast(rm_times, RM_CHECKPOINT_MIN_TIMEOUT, options.timeout_multiplier), 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, options.rm_checkpoint, pid, checkpoint)
                 journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                 @debug "removed checkpoint $i, pid=$pid, rm_times_length=$(length(rm_times)), rm_times_extrema=$(length(rm_times) > 0 ? extrema(rm_times) : (0.0,0.0))" checkpoint
             catch e
