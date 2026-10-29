@@ -1034,12 +1034,14 @@ mutable struct MemoryCheckpoint
     onwrite::Function
     committed::Bool
     aborted::Bool
+    written::Vector{Int} # for each chunk, the copy that wrote it last (chunks are at least a byte, so there are no more chunks than bytes)
+    kept::Vector{Int}    # for each chunk, the copy that the commit kept
 end
-MemoryCheckpoint(data; onread=offset->nothing, onwrite=offset->nothing) = MemoryCheckpoint(data, onread, onwrite, false, false)
+MemoryCheckpoint(data; onread=offset->nothing, onwrite=offset->nothing) = MemoryCheckpoint(data, onread, onwrite, false, false, zeros(Int, length(data)), Int[])
 Base.filesize(c::MemoryCheckpoint) = length(c.data)
 Schedulers.checkpoint_read!(c::MemoryCheckpoint, buffer, offset) = (c.onread(offset); copyto!(buffer, 1, c.data, offset + 1, length(buffer)); nothing)
-Schedulers.checkpoint_write_chunk(c::MemoryCheckpoint, ichunk, nchunks, buffer, offset) = (c.onwrite(offset); copyto!(c.data, offset + 1, buffer, 1, length(buffer)); nothing)
-Schedulers.checkpoint_commit(c::MemoryCheckpoint, nchunks) = (c.committed = true; nothing)
+Schedulers.checkpoint_write_chunk(c::MemoryCheckpoint, ichunk, nchunks, buffer, offset, copy) = (c.onwrite(offset); copyto!(c.data, offset + 1, buffer, 1, length(buffer)); c.written[ichunk] = copy; nothing)
+Schedulers.checkpoint_commit(c::MemoryCheckpoint, copies) = (c.committed = true; c.kept = collect(copies); nothing)
 Schedulers.checkpoint_abort(c::MemoryCheckpoint) = (c.aborted = true; nothing)
 
 @testset "streaming reduction, later chunks are read while earlier chunks are written" begin
@@ -1327,7 +1329,7 @@ end
         Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, files, merged, layout, 24, 2, part, 3)
     end
     @test !isfile(merged)
-    Schedulers.checkpoint_commit(merged, length(Schedulers.checkpoint_chunks(layout, 24)))
+    Schedulers.checkpoint_commit(merged, fill(1, length(Schedulers.checkpoint_chunks(layout, 24))))
     r = Schedulers.load_checkpoint_streaming(zeros_xyz, merged, T, 24, 2)
     @test all(a->all(==(6), a), Schedulers.checkpoint_arrays(r))
     rm(tmpdir; recursive=true)
@@ -1356,7 +1358,7 @@ end
     eloop.reduce_busy = 1
     @test Schedulers.merge_parts(eloop, 10, 0) == 2 # a worker is busy reducing
     eloop.reduce_busy = 0
-    push!(eloop.reduce_parts, Schedulers.MergePart(Schedulers.SplitMerge(["a", "b"], "c", 2), 2))
+    push!(eloop.reduce_parts, Schedulers.MergeCopy(Schedulers.Merge(["a", "b"], "c"), 2))
     @test Schedulers.merge_parts(eloop, 10, 0) == 2 # a part of another merge waits for a worker
     empty!(eloop.reduce_parts)
     push!(eloop.used_pids_map, pids[1])
@@ -1475,6 +1477,259 @@ end
         @test all(≈(x[1]), x)
         rm(tmpfile; force=true)
     end
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "streaming reduction, copies of the chunks of a merge" begin
+    # block ids: of the same length for every chunk and copy, and valid base64 strings (letters and digits, a multiple of 4 long)
+    ids = [Schedulers.chunk_blockid(ichunk, copy) for ichunk in (1, 2, 50_000), copy in (1, 2, 999)]
+    @test allunique(ids)
+    @test all(id->occursin(r"^[A-Za-z0-9]{16}$", id), ids)
+    @test_throws ArgumentError Schedulers.chunk_blockid(0, 1)
+    @test_throws ArgumentError Schedulers.chunk_blockid(1, 0)
+
+    # a copy writes its chunks as that copy, and the commit keeps the copies it is told to
+    depth, chunkbytes, nchunks, nparts = 2, 8, 9, 3
+    layout = [(UInt8, nchunks*chunkbytes)]
+    chunks = Schedulers.checkpoint_chunks(layout, chunkbytes)
+    inputs = [MemoryCheckpoint(fill(UInt8(i), nchunks*chunkbytes)) for i in 1:3]
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes))
+    @test Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, inputs, output, layout, chunkbytes, depth, 2, nparts; copy=7) == :done
+    ichunks = Schedulers.part_chunks(chunks, 2, nparts)
+    @test all(==(7), output.written[ichunks])
+    @test all(==(0), output.written[setdiff(1:nchunks, ichunks)])
+
+    # a copy stops once it is cancelled, here while it reads its first chunk
+    id = Schedulers.next_copy_id()
+    inputs[1].onread = offset->Schedulers.cancel_copy(id)
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes))
+    @test Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, inputs, output, layout, chunkbytes, depth, 1, 1; copy=2, id) == :cancelled
+    @test count(!=(0), output.written) < nchunks
+    @test !haskey(Schedulers.COPIES, id) # the copy is forgotten once it returns
+
+    # a cancel can reach the worker before its copy starts: the copy then starts cancelled, and writes nothing
+    id = Schedulers.next_copy_id()
+    Schedulers.cancel_copy(id)
+    inputs[1].onread = offset->nothing
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes))
+    @test Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, inputs, output, layout, chunkbytes, depth, 1, 1; copy=3, id) == :cancelled
+    @test all(==(0), output.written)
+    @test !haskey(Schedulers.COPIES, id) && !haskey(Schedulers.CANCELLED_BEFORE_START, id) # and the cancel is used up
+    # cancels of copies that never start, or that already stopped, are forgotten after an hour
+    Schedulers.CANCELLED_BEFORE_START[id] = time() - 7200
+    late = Schedulers.next_copy_id()
+    Schedulers.cancel_copy(late)
+    @test !haskey(Schedulers.CANCELLED_BEFORE_START, id) && haskey(Schedulers.CANCELLED_BEFORE_START, late)
+    delete!(Schedulers.CANCELLED_BEFORE_START, late)
+
+    # local files: copies of a part write the same bytes to the same partial file, and chunks that a copy that lost writes
+    # after the commit are discarded
+    tmpdir = mktempdir()
+    zeros_xyz() = (; x=zeros(Float32, 100), y=zeros(Float64, 3, 5), z=zeros(Int32, 7))
+    T = typeof(zeros_xyz())
+    layout = Schedulers.checkpoint_layout(zeros_xyz())
+    files = [joinpath(tmpdir, "input-$i") for i in 1:3]
+    for (i, file) in enumerate(files)
+        x = zeros_xyz()
+        foreach(a->a .= i, Schedulers.checkpoint_arrays(x))
+        Schedulers.save_checkpoint_streaming(identity, file, x, T, 24, 2)
+    end
+    merged = joinpath(tmpdir, "merged")
+    @sync for part in 1:3, copy in 1:2
+        Threads.@spawn Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, files, merged, layout, 24, 2, part, 3; copy=2part + copy)
+    end
+    nchunks = length(Schedulers.checkpoint_chunks(layout, 24))
+    Schedulers.checkpoint_commit(merged, fill(3, nchunks))
+    r = Schedulers.load_checkpoint_streaming(zeros_xyz, merged, T, 24, 2)
+    @test all(a->all(==(6), a), Schedulers.checkpoint_arrays(r))
+    Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, files, merged, layout, 24, 2, 1, 3; copy=9)
+    @test isfile(Schedulers.partial_checkpoint(merged))
+    Schedulers.checkpoint_abort(merged)
+    @test !isfile(Schedulers.partial_checkpoint(merged)) && isfile(merged)
+    rm(tmpdir; recursive=true)
+end
+
+@testset "streaming reduction, a cancel that reaches the worker before its copy" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    pid = workers()[1]
+    tmpdir = mktempdir()
+    layout = [(Float32, 2^20)]
+    files = [joinpath(tmpdir, "input-$i") for i in 1:3]
+    for (i, file) in enumerate(files)
+        Schedulers.save_checkpoint_streaming(identity, file, fill(Float32(i), 2^18), Vector{Float32}, 2^16, 2)
+    end
+    # the master sends the cancel first, as when another copy of the part finishes while this one is being started
+    for copy in 1:5
+        id = Schedulers.next_copy_id()
+        remote_do(Schedulers.cancel_copy, pid, id)
+        output = joinpath(tmpdir, "output-$copy")
+        @test remotecall_fetch(Schedulers.reduce_streaming_part, pid, Schedulers.default_reducer_chunk!, files, output, layout, 2^16, 2, 1, 1; copy, id) == :cancelled
+        @test !isfile(Schedulers.partial_checkpoint(output)) # it wrote nothing
+    end
+    rmprocs(workers())
+    rm(tmpdir; recursive=true)
+end
+
+@testset "streaming reduction, spare work" begin
+    eloop = Schedulers.ElasticLoop(String, 1:1, SchedulerOptions(; reduce_streaming=true, reduce_resplit=true); isreduce=true)
+    eloop.reduce_maxparts = 4
+    merge = Schedulers.Merge(["a", "b"], "c")
+    push!(eloop.reduce_whole, merge)
+    push!(eloop.reduce_spares, Schedulers.MergeCopy(Schedulers.Merge(["d", "e"], "f"), 1))
+    # spare work waits for the map to be done
+    @test !Schedulers.spare_work_allowed(eloop)
+    @test Schedulers.reduce_spare_work(eloop) == 0
+    empty!(eloop.tsk_pool_todo)
+    @test Schedulers.spare_work_allowed(eloop)
+    # a merge that runs whole is worth splitting while what is left of it takes more than twice as long as a part
+    @test Schedulers.resplit_worthwhile(eloop, merge) # until a whole merge finished, it is
+    push!(eloop.reduce_times_whole, 30.0)
+    push!(eloop.reduce_times_part, 3.0)
+    merge.tic = time() - 10
+    @test Schedulers.resplit_worthwhile(eloop, merge)
+    @test Schedulers.reduce_spare_work(eloop) == 1 + 4 # the queued extra copy, and up to `reduce_maxparts` parts of the merge
+    merge.tic = time() - 25
+    @test !Schedulers.resplit_worthwhile(eloop, merge)
+    @test Schedulers.reduce_spare_work(eloop) == 1
+    eloop.reduce_resplit = false
+    merge.tic = time() - 10
+    @test Schedulers.reduce_spare_work(eloop) == 1
+end
+
+@testset "pmapreduce, streaming reduction, copies of parts" begin
+    safe_addprocs(8)
+    @everywhere using Distributed, Schedulers
+    slowpid = workers()[1]
+    @everywhere slowpid = $slowpid
+    @everywhere begin
+        foo_copies(r, tsk) = (r .+= tsk; sleep(2); nothing)
+        # the copies that run on `slowpid` are slow
+        chunk_slow!(x, y) = (myid() == slowpid && sleep(0.5); x .+= y; nothing)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64, reduce_partbytes=128, reduce_partcopies=2, reducer_chunk! = chunk_slow!)
+    logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 200), options, foo_copies, 1:8)
+    end
+    rmprocs(workers())
+    msgs = [string(l.message) for l in logger.logs]
+
+    nstarted = count(m->startswith(m, "splitting the merge") || startswith(m, "reducing into checkpoint3"), msgs)
+    ncommitted = count(m->startswith(m, "pushed merged checkpoint3") || startswith(m, "pushed reduced checkpoint3"), msgs)
+    @test all(==(sum(1:8)), r)
+    @test nstarted == ncommitted                                       # every merge that started was committed: none was done again
+    @test any(m->occursin(r"^copy \d+ of part \d+ of \d+ into checkpoint3 lost", m), msgs) # extra copies ran, and lost
+    @test !any(m->occursin("caught exception", m), msgs)
+    @test isempty(readdir(tmpdir))                                     # copies that lost left nothing behind
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, streaming reduction, a failed copy of a part" begin
+    safe_addprocs(6)
+    @everywhere using Distributed, Schedulers
+    failfile = tempname()
+    touch(failfile)
+    @everywhere failfile = $failfile
+    @everywhere begin
+        foo_failed_copy(r, tsk) = (r .+= tsk; sleep(2); nothing)
+        # the first chunk to be reduced fails, on whichever worker reduces it
+        function flaky_copy_chunk!(x, y)
+            isfile(failfile) && (try rm(failfile); true catch; false end) && error("injected failure")
+            x .+= y
+            nothing
+        end
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64, reduce_partbytes=128, reduce_partcopies=2, reducer_chunk! = flaky_copy_chunk!)
+    logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 100), options, foo_failed_copy, 1:6)
+    end
+    rmprocs(workers())
+    msgs = [string(l.message) for l in logger.logs]
+
+    nstarted = count(m->startswith(m, "splitting the merge") || startswith(m, "reducing into checkpoint3"), msgs)
+    ncommitted = count(m->startswith(m, "pushed merged checkpoint3") || startswith(m, "pushed reduced checkpoint3"), msgs)
+    # a copy of a part that fails, or that fails after another copy of its part finished (and so lost)
+    part_failed = any(m->occursin("caught exception during part", m) || occursin(r"^copy \d+ of part \d+ of \d+ into checkpoint3 lost, pid=\d+, failed", m), msgs)
+    @test !isfile(failfile)   # the failure was injected
+    @test all(==(sum(1:6)), r)
+    if part_failed
+        @test nstarted == ncommitted # another copy of the part did it, so no merge was done again
+    else
+        # the failure hit a merge that ran whole, as when no other worker was idle as it started: it is done again
+        @test any(m->occursin("caught exception during reduce", m), msgs) && nstarted == ncommitted + 1
+    end
+    @test isempty(readdir(tmpdir))
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, streaming reduction, splitting a merge that runs whole" begin
+    safe_addprocs(5)
+    @everywhere using Distributed, Schedulers
+    @everywhere begin
+        foo_resplit(r, tsk) = (r .+= tsk; sleep(tsk <= 2 ? 0.2 : 2); nothing)
+        # slow enough that the first merge, which runs whole, still runs once the map is done
+        chunk_resplit!(x, y) = (sleep(1); x .+= y; nothing)
+    end
+
+    # one reducer at a time while the map runs, so that the first merge runs whole, and more once it is done, so that the merge can be split
+    maxreduce = Ref(1)
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=2, reduce_chunkbytes=32, reduce_partbytes=200, reduce_resplit=true,
+        reducer_chunk! = chunk_resplit!, maxreduceworkers = ()->maxreduce[], reduce_trigger = eloop->(Schedulers.spare_work_allowed(eloop) && (maxreduce[] = 10)))
+    logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 200), options, foo_resplit, 1:3)
+    end
+    rmprocs(workers())
+    msgs = [string(l.message) for l in logger.logs]
+
+    @test all(==(sum(1:3)), r)
+    @test any(m->startswith(m, "also splitting the running merge"), msgs)
+    @test any(m->occursin(r"^copy \d+ of (the whole merge|part \d+ of \d+) into checkpoint3 lost", m), msgs) # the whole run, or the parts, lost
+    @test isempty(readdir(tmpdir))
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, partial reduction, streaming, copies of parts" begin
+    using Distributed, Schedulers
+
+    function foo_copies_trigger(r, i)
+        r .+= i
+        sleep(2)
+        nothing
+    end
+
+    function trigger_copies(eloop, ntasks)
+        if length(complete_tasks(eloop)) - ntasks[] >= 10
+            trigger_reduction!(eloop)
+            ntasks[] = length(complete_tasks(eloop))
+        end
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    tmpfile = tempname()
+
+    ntasks = Ref(0)
+    options = SchedulerOptions(;maxworkers=10, scratch=tmpdir, reduce_trigger=eloop->trigger_copies(eloop, ntasks), save_partial_reduction=input->write(tmpfile, input),
+        reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=16, reduce_partbytes=16, reduce_partcopies=2, reduce_resplit=true)
+    t = @async epmapreduce!(zeros(10), options, foo_copies_trigger, 1:20)
+    @test timedwait(()->istaskdone(t), 300.0; pollint=1.0) == :ok
+
+    if istaskdone(t)
+        r,tsks = fetch(t)
+        @test r ≈ sum([1:20;]) * ones(10)
+        x = read!(tmpfile, zeros(10))
+        @test x[1] >= sum([1:10;])
+        @test all(≈(x[1]), x)
+        rm(tmpfile; force=true)
+    end
+    @test isempty(readdir(tmpdir))
     rm(tmpdir; recursive=true, force=true)
 end
 

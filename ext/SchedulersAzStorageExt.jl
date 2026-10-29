@@ -21,8 +21,10 @@ else
 end
 
 Schedulers.checkpoint_read!(checkpoint::AzStorage.AzObject, buffer, offset) = (read!(checkpoint, buffer; offset); nothing)
-Schedulers.checkpoint_write_chunk(checkpoint::AzStorage.AzObject, ichunk, nchunks, buffer, offset) = putblock(checkpoint, AzStorage.blockids(nchunks)[ichunk], buffer)
-Schedulers.checkpoint_commit(checkpoint::AzStorage.AzObject, nchunks) = putblocklist(checkpoint, AzStorage.blockids(nchunks))
+# each copy of a chunk is a block of its own; the commit keeps the chosen copy of each chunk, and Azure discards the other blocks
+Schedulers.checkpoint_write_chunk(checkpoint::AzStorage.AzObject, ichunk, nchunks, buffer, offset, copy) = putblock(checkpoint, Schedulers.chunk_blockid(ichunk, copy), buffer)
+Schedulers.checkpoint_commit(checkpoint::AzStorage.AzObject, copies) = putblocklist(checkpoint, [Schedulers.chunk_blockid(ichunk, copy) for (ichunk, copy) in enumerate(copies)])
+# blocks that are not committed are discarded with the blob, or by Azure a week after the last one was written
 Schedulers.checkpoint_abort(checkpoint::AzStorage.AzObject) = nothing
 
 end

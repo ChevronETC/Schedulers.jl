@@ -153,22 +153,30 @@ end
 const _pid_up_timestamp = Dict{Int, Float64}()
 
 #=
-A merge that is split into parts, which run on several workers at once.  Parts that wait for a worker are in
-`ElasticLoop.reduce_parts`.  Once none of its parts is queued or running (`nleft == 0`), the master commits `output`,
-or, if any part failed, puts `inputs` back in the queue, so that the merge is done again.
+A streaming merge, which runs as copies on workers: a whole copy reduces all of the chunks, and a part copy the chunks
+of one part, once the merge is split into parts.  Several copies of a part can run at once; the master commits the
+merged checkpoint once every part has a copy that finished (a whole copy covers every part), keeping the chunks of
+those copies (`winners`), and cancels the other copies.  If a part is left without any copy, queued or running, and
+no whole copy runs, the merge fails, and is done again from its inputs.
 =#
-mutable struct SplitMerge{C}
+mutable struct Merge{C}
     inputs::Vector{C}
     output::C
-    nparts::Int
-    nleft::Int
-    failed::Bool
+    nparts::Int             # parts that the chunks are split into, 0 while the merge only runs whole
+    winners::Vector{Int}    # for each part, the copy of it that finished first, 0 until one does
+    pending::Vector{Int}    # for each part, its copies that are queued or running
+    whole::Int              # whole copies that run
+    ncopies::Int            # copies started so far, which numbers them
+    running::Int            # copies that run on workers, including those that lost
+    resolved::Bool          # committed, or given up on
+    remove_output::Bool     # the merged checkpoint was merged further, and is removed once no copy writes to it
     tic::Float64
 end
-SplitMerge(inputs::Vector{C}, output, nparts) where {C} = SplitMerge{C}(inputs, output, nparts, nparts, false, time())
+Merge(inputs::Vector{C}, output) where {C} = Merge{C}(inputs, output, 0, Int[], Int[], 0, 0, 0, false, false, time())
 
-struct MergePart{C}
-    merge::SplitMerge{C}
+# a copy of a merge: of part `part`, or of the whole merge if `part == 0`
+struct MergeCopy{C}
+    merge::Merge{C}
     part::Int
 end
 
@@ -212,8 +220,14 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     reduce_fanin::Int
     load_partial_reduction::Function
     reduce_merges_in_flight::Int
-    reduce_busy::Int                   # reducers running a merge, or a part of a split merge
-    reduce_parts::Vector{MergePart{C}} # parts of split merges that wait for a reducer
+    reduce_busy::Int                   # reducers running a copy of a merge
+    reduce_parts::Vector{MergeCopy{C}} # copies of parts that merges need, waiting for a reducer
+    reduce_spares::Vector{MergeCopy{C}} # extra copies, for reducers that would otherwise be idle once the map is done
+    reduce_whole::Vector{Merge{C}}     # streaming merges that run whole, which can be split once the map is done
+    reduce_maxparts::Int               # the largest number of parts that a merge can be split into
+    reduce_resplit::Bool               # split merges that run whole, once the map is done
+    reduce_times_whole::Vector{Float64} # how long whole copies took, and copies of parts
+    reduce_times_part::Vector{Float64}
     wakeup::Threads.Event              # wakes the elastic loop before its next poll, for example to start reducers for parts
     removed_pids::Set{Int}             # workers that are bad, or are being removed: they get no more work
 end
@@ -261,7 +275,13 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         deserialize,
         0,
         0,
-        MergePart{C}[],
+        MergeCopy{C}[],
+        MergeCopy{C}[],
+        Merge{C}[],
+        1,
+        options.reduce_resplit,
+        Float64[],
+        Float64[],
         Threads.Event(true),
         Set{Int}(),
     )
@@ -366,9 +386,10 @@ multiplier of 5, it times out after 10 s and not after 6 s, which the first task
 record_time!(tsk_times, tic) = isa(tsk_times, AbstractArray) && push!(tsk_times, max(ceil(time() - tic), 1.0))
 
 #=
-The times of whole merges, as seen by a part of a merge: a part times out like a whole merge, and its own time is not
-recorded with them.  Parts do not take a fixed share of the time of their merge: one that the storage slows down can
-take several times as long as the other parts of its merge.
+The times of whole merges, as seen by a copy of a merge: a copy times out like a whole merge, and its own time is not
+recorded with them, since copies of parts, and copies that are cancelled, take less time than a whole merge.  Parts do
+not take a fixed share of the time of their merge either: one that the storage slows down can take several times as
+long as the other parts of its merge.
 =#
 struct PartTimes <: AbstractVector{Float64}
     times::Vector{Float64}
@@ -570,17 +591,54 @@ function reduce_queue(eloop::ElasticLoop)
     end
 end
 
-# groups of checkpoints, and parts of split merges, that wait for a reducer
+# groups of checkpoints, copies of parts that merges need, and spare work, that wait for a reducer
 function reduce_work_waiting(eloop::ElasticLoop, nfree)
     nqueued, more_expected = reduce_queue(eloop)
-    reduce_groups(nqueued, eloop.reduce_fanin, nfree, more_expected) + length(eloop.reduce_parts)
+    reduce_groups(nqueued, eloop.reduce_fanin, nfree, more_expected) + length(eloop.reduce_parts) + reduce_spare_work(eloop)
+end
+
+# spare work (extra copies, and splitting merges that run whole) is only for workers that would otherwise be idle: once the map is done
+spare_work_allowed(eloop::ElasticLoop) = !is_more_map_checkpoints(eloop)
+
+#=
+Is it worth splitting `merge`, which runs whole, into parts that run alongside it?  When what is left of it is expected
+to take more than twice as long as a part, going by how long whole copies, and copies of parts, took so far.
+=#
+function resplit_worthwhile(eloop::ElasticLoop, merge)
+    whole = isempty(eloop.reduce_times_whole) ? Inf : median(eloop.reduce_times_whole)
+    part = isempty(eloop.reduce_times_part) ? 0.0 : median(eloop.reduce_times_part)
+    whole - (time() - merge.tic) > 2*part
+end
+
+# spare work that waits for reducers: extra copies, and the parts of merges that run whole and are worth splitting
+function reduce_spare_work(eloop::ElasticLoop)
+    spare_work_allowed(eloop) || return 0
+    n = length(eloop.reduce_spares)
+    if eloop.reduce_resplit && eloop.reduce_maxparts > 1
+        n += eloop.reduce_maxparts*count(merge->resplit_worthwhile(eloop, merge), eloop.reduce_whole)
+    end
+    n
+end
+
+let COPYID::Int = 0
+    global next_copy_id
+    next_copy_id() = (COPYID += 1)
+end
+
+# the exception that a task, or tasks wrapping it, failed with
+function unwrap_exception(e)
+    while e isa TaskFailedException
+        e = e.task.result
+    end
+    e
 end
 
 #=
 The number of parts to split a merge into, so that workers that would otherwise be idle run it together: one part
-per idle worker, after the work that already waits for workers (parts of split merges, and `nwaiting` other groups
-of checkpoints), and at most `maxparts`.  Map tasks come first, so a merge is not split while any are left.  At most
-`maxreduceworkers` workers reduce at once, which bounds the load on the scratch storage.
+per idle worker, after the work that already waits for workers (copies of parts that merges need, and `nwaiting`
+other groups of checkpoints; spare work does not count, since it only takes workers that nothing else needs), and at
+most `maxparts`.  Map tasks come first, so a merge is not split while any are left.  At most `maxreduceworkers`
+workers reduce at once, which bounds the load on the scratch storage.
 =#
 function merge_parts(eloop::ElasticLoop, maxparts, nwaiting)
     (maxparts == 1 || !isempty(eloop.tsk_pool_todo)) && return 1
@@ -796,7 +854,6 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         is_tasks_done = length(eloop.tsk_pool_done) == eloop.tsk_count
         is_more_tasks = length(eloop.tsk_pool_todo) > 0
         is_reduce_active = reduce_checkpoints_is_dirty(eloop) || length(eloop.reduce_checkpoints) > 1 || length(eloop.checkpoints) > 0 || is_partial_reduction_due(eloop)
-        is_more_checkpoints = length(eloop.reduce_checkpoints) > 1
 
         push!(loop_log_cache, "check for complete tasks when the number of completed tasks ($(length(eloop.tsk_pool_done))) equals the total number of tasks ($(eloop.tsk_count)))")
         yield()
@@ -939,8 +996,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             is_waiting_on_flush = eloop.is_reduce_triggered && !(eloop.checkpoints_are_flushed)
             push!(loop_log_cache, "is_reduce_triggered=$(eloop.is_reduce_triggered), checkpoints_are_flushed=$(eloop.checkpoints_are_flushed), is_waiting_on_flush=$is_waiting_on_flush, reduce_machine_count=$(length(eloop.used_pids_reduce))")
 
-            # start reducers while more work (groups of checkpoints, and parts of split merges) waits than there are free
-            # reducers (those not merging) to take it
+            # start reducers while more work (groups of checkpoints, copies of parts that merges need, and spare work once the
+            # map is done) waits than there are free reducers (those not merging) to take it
             nfree = free_reducers(eloop)
             nwaiting = reduce_work_waiting(eloop, nfree)
             wait_for_reduced_trigger = eloop.is_reduce_triggered && nwaiting > nfree
@@ -948,7 +1005,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 push!(loop_log_cache, "putting pid=$free_pid onto map channel")
                 push!(eloop.used_pids_map, free_pid)
                 put!(eloop.pid_channel_map_add, free_pid)
-            elseif (is_more_checkpoints || !isempty(eloop.reduce_parts)) && !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && nwaiting > nfree
+            elseif !is_waiting_on_flush && length(eloop.used_pids_reduce) < _epmap_maxreduceworkers && nwaiting > nfree
                 push!(loop_log_cache, "putting pid=$free_pid onto reduce channel")
                 push!(eloop.used_pids_reduce, free_pid)
                 put!(eloop.pid_channel_reduce_add, free_pid)
@@ -1144,6 +1201,8 @@ mutable struct SchedulerOptions{C}
     reduce_depth::Int
     reducer_chunk!::Union{Function,Nothing}
     reduce_partbytes::Int
+    reduce_partcopies::Int
+    reduce_resplit::Bool
 end
 
 function SchedulerOptions(;
@@ -1189,11 +1248,14 @@ function SchedulerOptions(;
         reduce_chunkbytes = 64*2^20,
         reduce_depth = 4,
         reducer_chunk! = nothing,
-        reduce_partbytes = typemax(Int))
+        reduce_partbytes = typemax(Int),
+        reduce_partcopies = 1,
+        reduce_resplit = false)
     reduce_fanin >= 2 || throw(ArgumentError("reduce_fanin must be at least 2, got $reduce_fanin"))
     reduce_chunkbytes >= 1 || throw(ArgumentError("reduce_chunkbytes must be positive, got $reduce_chunkbytes"))
     reduce_depth >= 1 || throw(ArgumentError("reduce_depth must be positive, got $reduce_depth"))
     reduce_partbytes >= 1 || throw(ArgumentError("reduce_partbytes must be positive, got $reduce_partbytes"))
+    reduce_partcopies >= 1 || throw(ArgumentError("reduce_partcopies must be positive, got $reduce_partcopies"))
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1235,7 +1297,9 @@ function SchedulerOptions(;
         reduce_chunkbytes,
         reduce_depth,
         reducer_chunk!,
-        reduce_partbytes)
+        reduce_partbytes,
+        reduce_partcopies,
+        reduce_resplit)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -1280,7 +1344,9 @@ function Base.copy(options::SchedulerOptions)
         options.reduce_chunkbytes,
         options.reduce_depth,
         options.reducer_chunk!,
-        options.reduce_partbytes)
+        options.reduce_partbytes,
+        options.reduce_partcopies,
+        options.reduce_resplit)
 end
 
 """
@@ -1475,6 +1541,8 @@ and `epmap_kwargs` are as follows.
 * `reduce_depth=4` number of chunks read at once, and of merged chunks written at once, in each merge when `reduce_streaming=true`
 * `reducer_chunk! = (x,y)->(x .+= y)` the element-wise reduction applied to chunks when `reduce_streaming=true`[7]
 * `reduce_partbytes=typemax(Int)` when `reduce_streaming=true`, the smallest part of a merge, in bytes of the merged checkpoint, that a worker runs: when workers are idle, for example at the end of the reduction, a merge is split into parts of at least this size, which idle workers run at once[8].  The default never splits a merge.
+* `reduce_partcopies=1` when merges are split (`reduce_partbytes`), the number of copies of each part that run, on different workers: the first copy of a part to finish is kept, and the other copies are stopped.  Copies past the first only run on workers that would otherwise be idle, once the map is done[9]
+* `reduce_resplit=false` when merges are split (`reduce_partbytes`), also split a merge that already runs whole, once the map is done and workers are idle, and run its parts alongside it: whichever finishes first is kept[9]
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
@@ -1498,8 +1566,14 @@ throws an `ArgumentError`.  It is called from several threads at once, so it mus
 [8] A merge is split into as many parts as there are idle workers, after the work that already waits for workers,
 and never while map tasks are left, so that merges are only split when workers would otherwise be idle.  Each part
 reduces a contiguous range of chunks, and writes them to the merged checkpoint, which the master commits once all
-parts are done; if any part fails, the merge is done again.  With split merges, up to `maxreduceworkers` workers
-read and write the scratch storage at once, so set `maxreduceworkers` to bound that load.
+parts are done; if a part fails, and no other copy of it is left, the merge is done again.  With split merges, up to
+`maxreduceworkers` workers read and write the scratch storage at once, so set `maxreduceworkers` to bound that load.
+[9] Copies of a part, and the parts of a merge that runs whole and its whole run, race each other: once every part has
+a copy that finished (a whole run covers every part), the master commits the chunks of those copies, and stops the
+other copies.  Copies only take workers that nothing else needs, within `maxreduceworkers`.  A merge that runs whole
+is split only if what is left of it is expected to take more than twice as long as a part.  Azure blobs keep the
+chunks of each copy apart until the commit; local paths keep one copy of each chunk, which copies overwrite with the
+same bytes, so `reducer_chunk!` must give the same bytes for the same inputs.
 
 # Examples
 ## Example 1
@@ -1676,6 +1750,8 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     pop!(localresults, pid)
                     pop!(epmap_eloop.checkpoints, pid)
                     put!(epmap_eloop.pid_channel_map_remove, (pid,false))
+                    # once the last map worker is done, reducers can start on spare work right away
+                    notify(epmap_eloop.wakeup)
                     break
                 end
 
@@ -1862,6 +1938,12 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     # when workers are idle, a streaming merge is split into up to `maxparts` parts that run at once (see `merge_parts`)
     chunks = options.reduce_streaming ? checkpoint_chunks(layout, options.reduce_chunkbytes) : CheckpointChunk[]
     maxparts = options.reduce_streaming ? max_merge_parts(chunks, options.reduce_partbytes) : 1
+    epmap_eloop.reduce_maxparts = maxparts
+
+    C = eltype(epmap_eloop.reduce_checkpoints)
+    merges = Set{Merge{C}}()                          # streaming merges that are not done
+    running = Dict{Int,Tuple{MergeCopy{C},Int,Int}}() # by reducer, the copy of a merge that it runs, its number, and its id
+    lingering = Dict{C,Merge{C}}()                    # merged checkpoints that copies that lost may still write to
 
     # give `pid` back to the elastic loop, and wake the loop up so that it can use the worker right away
     function stop_reducer(pid, bad_pid)
@@ -1877,6 +1959,11 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
     function remove_inputs(inputs, pid, hostname)
         rm_errors = Vector{Any}(nothing, length(inputs))
         @sync for (i, checkpoint) in enumerate(inputs)
+            # copies that lost may still write to a merged checkpoint: it is removed once they stop
+            if haskey(lingering, checkpoint)
+                lingering[checkpoint].remove_output = true
+                continue
+            end
             @async try
                 @debug "removing checkpoint $i, pid=$pid" checkpoint
                 journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
@@ -1903,72 +1990,253 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         do_break, bad_pid
     end
 
+    #
+    # Copies of streaming merges (see `Merge`).  The functions below run with the lock `l` held, unless noted.
+    #
+
+    # is the copy that `pid` runs one that lost: is its merge, or its part, done?
+    function is_loser(pid)
+        haskey(running, pid) || return false
+        c = running[pid][1]
+        c.merge.resolved || (c.part > 0 && c.merge.winners[c.part] != 0)
+    end
+
+    # the reducers, and copy ids, of the copies of `merge` that run: those of part `part`, or all of them if `part === nothing`
+    copies_running(merge, part=nothing) = [(pid, id) for (pid, (c, _, id)) in running if c.merge === merge && (part === nothing || c.part == part)]
+
+    # (without the lock) stop copies, which then return to their reducers
+    function cancel_copies(copies)
+        for (pid, id) in copies
+            try
+                remote_do(cancel_copy, pid, id)
+            catch e
+                @debug "unable to cancel copy $id on pid=$pid"
+                logerror(e, Logging.Debug)
+            end
+        end
+    end
+
+    # drop the queued copies of `merge`: those of part `part`, or all of them if `part == 0`
+    function drop_queued!(merge, part)
+        for queue in (epmap_eloop.reduce_parts, epmap_eloop.reduce_spares)
+            filter!(queue) do c
+                drop = c.merge === merge && (part == 0 || c.part == part)
+                drop && (merge.pending[c.part] -= 1)
+                !drop
+            end
+        end
+    end
+
+    # can `merge` still be done: by a whole copy that runs, or by the copies, queued or running, of each part not done yet?
+    completable(merge) = merge.whole > 0 || (merge.nparts > 0 && all(p->merge.winners[p] != 0 || merge.pending[p] > 0, 1:merge.nparts))
+
+    # a part that is not done, and that no copy runs, must not wait in the spare queue: queue a copy of it as needed
+    function promote_needed!(merge)
+        for p in 1:merge.nparts
+            merge.winners[p] == 0 || continue
+            any(((_, (c, _, _)),)->c.merge === merge && c.part == p, running) && continue
+            any(c->c.merge === merge && c.part == p, epmap_eloop.reduce_parts) && continue
+            i = findfirst(c->c.merge === merge && c.part == p, epmap_eloop.reduce_spares)
+            i === nothing || pushfirst!(epmap_eloop.reduce_parts, popat!(epmap_eloop.reduce_spares, i))
+        end
+    end
+
     #=
-    Run a part of a split merge on `pid`.  The reducer that finishes the last part of a merge commits the merged
-    checkpoint, here on the master, and puts it in the queue, or, if any part failed, puts the inputs back instead.
-    Returns the result of `handle_exception` if the part failed (`nothing` otherwise), and the inputs of the merge if
-    this part completed it, so that they can be removed.
+    Split `merge` into `nparts` parts.  The caller runs a copy of part 1; copies of parts 2 to `nparts` are queued in
+    `queue`, and `ncopies - 1` extra copies of every part in the spare queue.
     =#
-    function run_part!(part, pid, hostname)
-        merge = part.merge
-        r = nothing
+    function split!(merge, nparts, queue, ncopies)
+        merge.nparts = nparts
+        merge.winners = zeros(Int, nparts)
+        merge.pending = zeros(Int, nparts)
+        merge.pending[1] = 1
+        for p in 2:nparts
+            push!(queue, MergeCopy(merge, p))
+            merge.pending[p] += 1
+        end
+        for p in 1:nparts, _ in 2:ncopies
+            push!(epmap_eloop.reduce_spares, MergeCopy(merge, p))
+            merge.pending[p] += 1
+        end
+    end
+
+    # of the merges that run whole, the one most worth splitting: the one that started last, if splitting it is worthwhile
+    function resplit_candidate()
+        candidates = filter(merge->resplit_worthwhile(epmap_eloop, merge), epmap_eloop.reduce_whole)
+        isempty(candidates) ? nothing : argmax(merge->merge.tic, candidates)
+    end
+
+    # (without the lock) commit the merged checkpoint: the chunks of the whole copy `wholecopy`, or, if it is 0, those of the copies of each part that finished first
+    function commit_merge(merge, wholecopy)
+        copies = Vector{Int}(undef, length(chunks))
+        if wholecopy > 0
+            fill!(copies, wholecopy)
+        else
+            for p in 1:merge.nparts
+                copies[part_chunks(chunks, p, merge.nparts)] .= merge.winners[p]
+            end
+        end
         try
-            partbytes = sum(ichunk->chunks[ichunk].nbytes, part_chunks(chunks, part.part, merge.nparts); init=0)
-            @debug "reducing part $(part.part) of $(merge.nparts) into checkpoint3, pid=$pid, from $(length(merge.inputs)) checkpoints, $partbytes bytes ($(length(epmap_eloop.used_pids_reduce)) reduce workers)." checkpoint3=merge.output
-            journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-            # a part times out like a whole merge, and is not timed with them (see `PartTimes`)
-            remotecall_wait_timeout(PartTimes(reduce_times), 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce_streaming_part, pid, options.reducer_chunk!, merge.inputs, merge.output, layout, options.reduce_chunkbytes, options.reduce_depth, part.part, merge.nparts)
-            journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
-            @debug "reduced part $(part.part) of $(merge.nparts) into checkpoint3, pid=$pid" checkpoint3=merge.output
+            checkpoint_commit(merge.output, copies)
+            true
         catch e
-            @warn "pid=$pid ($hostname), reduce loop, caught exception during part $(part.part) of $(merge.nparts) of a reduce"
-            r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+            @warn "unable to commit checkpoint $(merge.output)"
+            logerror(e, Logging.Debug)
+            false
+        end
+    end
+
+    #=
+    (without the lock) Once no copy writes to the merged checkpoint of `merge` anymore: discard chunks that copies that
+    lost wrote after the commit, and remove the checkpoint if it was merged further in the meantime.
+    =#
+    function cleanup_output(merge)
+        abort_checkpoint(merge.output)
+        if merge.remove_output
+            try
+                options.rm_checkpoint(merge.output)
+            catch e
+                @warn "unable to remove checkpoint $(merge.output)"
+                logerror(e, Logging.Debug)
+                push!(orphans_remove, merge.output)
+            end
+        end
+    end
+
+    #=
+    Run copy `c` of a merge on `pid`, with the lock held, which it releases.  Returns the result of `handle_exception`
+    if the copy failed (`nothing` otherwise), and the inputs of the merge if this copy completed it, so that they can be
+    removed.
+    =#
+    function run_copy!(c, pid, hostname)
+        merge = c.merge
+        merge.ncopies += 1
+        copy = merge.ncopies
+        id = next_copy_id()
+        merge.running += 1
+        running[pid] = (c, copy, id)
+        epmap_eloop.reduce_busy += 1
+        unlock(l)
+
+        part, nparts = c.part == 0 ? (1, 1) : (c.part, merge.nparts)
+        if c.part == 0
+            @debug "reducing into checkpoint3, pid=$pid, from $(length(merge.inputs)) checkpoints, copy $copy" checkpoint3=merge.output
+        else
+            partbytes = sum(ichunk->chunks[ichunk].nbytes, part_chunks(chunks, part, nparts); init=0)
+            @debug "reducing part $part of $nparts into checkpoint3, pid=$pid, from $(length(merge.inputs)) checkpoints, $partbytes bytes, copy $copy ($(length(epmap_eloop.used_pids_reduce)) reduce workers)." checkpoint3=merge.output
+        end
+        status, err = :failed, nothing
+        tic = time()
+        try
+            journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
+            # a copy times out like a whole merge, and is not timed with them (see `PartTimes`)
+            # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
+            status = remotecall_fetch_timeout(PartTimes(reduce_times), 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce_streaming_part, pid, options.reducer_chunk!, merge.inputs, merge.output, layout, options.reduce_chunkbytes, options.reduce_depth, part, nparts; copy, id)
+            journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
+            # whole copies that are done time whole merges, for the timeouts
+            c.part == 0 && status === :done && record_time!(reduce_times, tic)
+        catch e
+            err = e
             journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
+        end
+        finish_copy!(c, copy, pid, hostname, status, err, time() - tic)
+    end
+
+    # (without the lock) after copy number `copy` of a merge returned on `pid`, done (`status`) or failed (`err`): see `run_copy!`
+    function finish_copy!(c, copy, pid, hostname, status, err, elapsed)
+        merge = c.merge
+        what = c.part == 0 ? "the whole merge" : "part $(c.part) of $(merge.nparts)"
+        r, tocancel, outcome = nothing, Tuple{Int,Int}[], 0 # outcome: 1 to commit the merge, -1 to give up on it
+
+        lock(l)
+        merge.running -= 1
+        delete!(running, pid)
+        epmap_eloop.reduce_busy -= 1
+        c.part == 0 ? (merge.whole -= 1) : (merge.pending[c.part] -= 1)
+        if merge.resolved || (c.part > 0 && merge.winners[c.part] != 0)
+            @debug "copy $copy of $what into checkpoint3 lost, pid=$pid, $(err === nothing ? status : :failed) after $(round(elapsed; digits=1)) seconds" checkpoint3=merge.output
+            # a copy that lost may fail, for example once the inputs of its merge are removed: that only matters if its worker is gone, or stuck
+            if err !== nothing && unwrap_exception(err) isa Union{ProcessExitedException,TimeoutException}
+                r = handle_exception(err, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+            end
+        elseif err === nothing && status === :done
+            if c.part == 0
+                push!(epmap_eloop.reduce_times_whole, elapsed)
+                outcome = 1
+            else
+                push!(epmap_eloop.reduce_times_part, elapsed)
+                @debug "reduced part $(c.part) of $(merge.nparts) into checkpoint3, pid=$pid, copy $copy" checkpoint3=merge.output
+                merge.winners[c.part] = copy
+                drop_queued!(merge, c.part)
+                append!(tocancel, copies_running(merge, c.part))
+                all(!=(0), merge.winners) && (outcome = 1)
+            end
+        else
+            @warn "pid=$pid ($hostname), reduce loop, caught exception during $(c.part == 0 ? "reduce" : "$what of a reduce")"
+            if err === nothing
+                @warn "copy $copy of $what into checkpoint3 stopped before it was done ($status), and before another copy was done" checkpoint3=merge.output
+            else
+                r = handle_exception(err, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+            end
+            completable(merge) ? promote_needed!(merge) : (outcome = -1)
+        end
+        if r !== nothing
             epmap_eloop.interrupted = r.do_interrupt
             epmap_eloop.errored = r.do_error
         end
-
-        lock(l)
-        epmap_eloop.reduce_busy -= 1
-        merge.nleft -= 1
-        if r !== nothing && !merge.failed
-            # the merge is done again from its inputs, so its parts that did not start yet are dropped
-            merge.failed = true
-            nqueued = length(epmap_eloop.reduce_parts)
-            filter!(queued->queued.merge !== merge, epmap_eloop.reduce_parts)
-            merge.nleft -= nqueued - length(epmap_eloop.reduce_parts)
-        end
-        isdone = merge.nleft == 0
-        unlock(l)
-        isdone || return r, nothing
-
-        ok = !merge.failed
-        if ok
-            try
-                checkpoint_commit(merge.output, length(chunks))
-            catch e
-                @warn "unable to commit checkpoint $(merge.output), merged from $(merge.nparts) parts"
-                logerror(e, Logging.Debug)
-                ok = false
+        if outcome != 0
+            merge.resolved = true
+            delete!(merges, merge)
+            drop_queued!(merge, 0)
+            filter!(m->m !== merge, epmap_eloop.reduce_whole)
+            losers = copies_running(merge)
+            append!(tocancel, losers)
+            # copies that lost do not hold up the end of the reduction
+            for (p, _) in losers
+                haskey(epmap_eloop.reduce_checkpoints_is_dirty, p) && (epmap_eloop.reduce_checkpoints_is_dirty[p] = false)
             end
         end
-        if ok
-            push!(epmap_eloop.reduce_checkpoints, merge.output)
-            epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, merge.output)
-            @debug "pushed merged checkpoint3 from $(merge.nparts) parts, pid=$pid, $(round(time() - merge.tic; digits=1)) seconds after the merge started" checkpoint3=merge.output
-        else
-            push!(epmap_eloop.reduce_checkpoints, merge.inputs...)
-            epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, merge.inputs...)
-            push!(partial_outputs, merge.output)
+        # the last copy that lost cleans up after them, once the merge is committed
+        cleanup = outcome == 0 && merge.resolved && merge.running == 0 && haskey(lingering, merge.output)
+        cleanup && delete!(lingering, merge.output)
+        unlock(l)
+
+        cancel_copies(tocancel)
+        cleanup && cleanup_output(merge)
+
+        inputs = nothing
+        if outcome != 0
+            ok = outcome == 1 && commit_merge(merge, c.part == 0 ? copy : 0)
+            lock(l)
+            if ok
+                push!(epmap_eloop.reduce_checkpoints, merge.output)
+                epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, merge.output)
+                # copies that lost and still run may write to the merged checkpoint: the last of them cleans up after them
+                stopped = merge.running == 0
+                stopped || (lingering[merge.output] = merge)
+                inputs = merge.inputs
+            else
+                push!(epmap_eloop.reduce_checkpoints, merge.inputs...)
+                epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, merge.inputs...)
+                push!(partial_outputs, merge.output)
+            end
+            epmap_eloop.reduce_merges_in_flight -= 1
+            unlock(l)
+            if ok
+                stopped && abort_checkpoint(merge.output)
+                if c.part == 0
+                    @debug "pushed reduced checkpoint3, pid=$pid, reduce_times_length=$(length(reduce_times)), reduce_times_extrema=$(length(reduce_times) > 0 ? extrema(reduce_times) : (0.0,0.0))" checkpoint3=merge.output
+                else
+                    @debug "pushed merged checkpoint3 from $(merge.nparts) parts, pid=$pid, $(round(time() - merge.tic; digits=1)) seconds after the merge started" checkpoint3=merge.output
+                end
+            end
+            notify(epmap_eloop.wakeup)
         end
-        epmap_eloop.reduce_merges_in_flight -= 1
-        notify(epmap_eloop.wakeup)
-        r, ok ? merge.inputs : nothing
+        r, inputs
     end
 
-    # after a part of a split merge ran on `pid`, stop the reducer if `pid` should not be used anymore, or else remove the
-    # inputs of the merge if the part completed it; returns whether the reducer stops
-    function finish_part(r, inputs, pid, hostname)
+    # after a copy ran on `pid`: stop the reducer if `pid` should not be used anymore, or else remove the inputs of the merge if the copy completed it; returns whether the reducer stops
+    function after_copy(r, inputs, pid, hostname)
         if r !== nothing && (r.do_break || r.do_interrupt)
             stop_reducer(pid, r.bad_pid)
             return true
@@ -1984,7 +2252,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         false
     end
 
-    @sync while true
+    reducers = Tuple{Int,Task}[]
+    while true
         @debug "reduce, interrupted=$(epmap_eloop.interrupted)"
         epmap_eloop.interrupted && break
         pid = take!(epmap_eloop.pid_channel_reduce_add)
@@ -1992,7 +2261,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         @debug "reduce, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel when the reduction is done
 
-        @async try
+        reducer = @async try
             # look up the hostname in the reducer's own task, so that reducers start in parallel
             hostname = ""
             try
@@ -2015,12 +2284,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 lock(l)
                 @debug "reduce, got lock on pid=$pid"
 
-                # parts of merges that already started come first, so that those merges finish sooner
+                # copies of parts that merges need come first, so that those merges finish sooner
                 if !isempty(epmap_eloop.reduce_parts)
-                    part = popfirst!(epmap_eloop.reduce_parts)
-                    epmap_eloop.reduce_busy += 1
-                    unlock(l)
-                    finish_part(run_part!(part, pid, hostname)..., pid, hostname) && break
+                    after_copy(run_copy!(popfirst!(epmap_eloop.reduce_parts), pid, hostname)..., pid, hostname) && break
                     continue
                 end
 
@@ -2029,6 +2295,24 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
                 @debug "reduce, pid=$pid, at exit condition, n_checkpoints=$n_checkpoints, ninputs=$ninputs"
                 if ninputs == 0
+                    # spare work, for workers that would otherwise be idle: extra copies, and splitting a merge that runs whole
+                    if options.reduce_streaming && spare_work_allowed(epmap_eloop)
+                        if !isempty(epmap_eloop.reduce_spares)
+                            after_copy(run_copy!(popfirst!(epmap_eloop.reduce_spares), pid, hostname)..., pid, hostname) && break
+                            continue
+                        end
+                        merge = epmap_eloop.reduce_resplit ? resplit_candidate() : nothing
+                        nparts = merge === nothing ? 1 : merge_parts(epmap_eloop, maxparts, 0)
+                        if nparts > 1
+                            filter!(m->m !== merge, epmap_eloop.reduce_whole)
+                            split!(merge, nparts, epmap_eloop.reduce_spares, 1)
+                            @debug "also splitting the running merge into checkpoint3, from $(length(merge.inputs)) checkpoints, after $(round(time() - merge.tic; digits=1)) seconds, into $nparts parts, pid=$pid" checkpoint3=merge.output
+                            # wake the elastic loop up to start reducers for the other parts
+                            notify(epmap_eloop.wakeup)
+                            after_copy(run_copy!(MergeCopy(merge, 1), pid, hostname)..., pid, hostname) && break
+                            continue
+                        end
+                    end
                     unlock(l)
                     stop_reducer(pid, false)
                     break
@@ -2064,20 +2348,28 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     @debug "reduce, released lock on pid=$pid"
                     continue
                 end
-                nparts = merge_parts(epmap_eloop, maxparts, div(n_checkpoints - ninputs, fanin))
                 # counted until the merged checkpoint, or the inputs on failure, are back in the queue
                 epmap_eloop.reduce_merges_in_flight += 1
-                epmap_eloop.reduce_busy += 1
-                if nparts > 1
-                    merge = SplitMerge(inputs, checkpoint3, nparts)
-                    append!(epmap_eloop.reduce_parts, [MergePart(merge, part) for part in 2:nparts])
-                    unlock(l)
-                    @debug "splitting the merge into checkpoint3, from $(length(inputs)) checkpoints, into $nparts parts, pid=$pid" checkpoint3
-                    # wake the elastic loop up to start reducers for the other parts
-                    notify(epmap_eloop.wakeup)
-                    finish_part(run_part!(MergePart(merge, 1), pid, hostname)..., pid, hostname) && break
+
+                if options.reduce_streaming
+                    merge = Merge(inputs, checkpoint3)
+                    push!(merges, merge)
+                    nparts = merge_parts(epmap_eloop, maxparts, div(n_checkpoints - ninputs, fanin))
+                    if nparts > 1
+                        split!(merge, nparts, epmap_eloop.reduce_parts, options.reduce_partcopies)
+                        @debug "splitting the merge into checkpoint3, from $(length(inputs)) checkpoints, into $nparts parts, pid=$pid" checkpoint3
+                        # wake the elastic loop up to start reducers for the other parts
+                        notify(epmap_eloop.wakeup)
+                        after_copy(run_copy!(MergeCopy(merge, 1), pid, hostname)..., pid, hostname) && break
+                    else
+                        merge.whole = 1
+                        push!(epmap_eloop.reduce_whole, merge)
+                        after_copy(run_copy!(MergeCopy(merge, 0), pid, hostname)..., pid, hostname) && break
+                    end
                     continue
                 end
+
+                epmap_eloop.reduce_busy += 1
                 unlock(l)
                 @debug "reduce, released lock on pid=$pid"
 
@@ -2085,11 +2377,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                     @debug "reducing into checkpoint3, pid=$pid, from $(length(inputs)) checkpoints" checkpoint3
                     journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
                     # We don't have a good way for estimating the number of reduction tasks (due to the dynamic nature of the resources), so we choose an arbibrary number (10).
-                    if options.reduce_streaming
-                        remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce_streaming, pid, options.reducer_chunk!, inputs, checkpoint3, layout, options.reduce_chunkbytes, options.reduce_depth)
-                    else
-                        remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, inputs[1], inputs[2], checkpoint3, T)
-                    end
+                    remotecall_wait_timeout(reduce_times, 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce, pid, options.reducer!, options.save_checkpoint, options.epmapreduce_fetch, options.load_checkpoint, inputs[1], inputs[2], checkpoint3, T)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
                     push!(epmap_eloop.reduce_checkpoints, checkpoint3)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, checkpoint3)
@@ -2097,7 +2385,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 catch e
                     push!(epmap_eloop.reduce_checkpoints, inputs...)
                     epmap_eloop.is_reduce_triggered && push!(epmap_eloop.reduce_checkpoints_snapshot, inputs...)
-                    options.reduce_streaming && push!(partial_outputs, checkpoint3)
                     @warn "pid=$pid ($hostname), reduce loop, caught exception during reduce"
                     r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
                     journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=true)
@@ -2136,16 +2423,30 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             notify(epmap_eloop.wakeup)
             @debug "reduce, done putting $pid onto remove channel"
         end
+        push!(reducers, (pid, reducer))
     end
     @debug "reduce, exited the reduce worker loop"
 
-    # after an interruption, parts that no reducer took can be left: put the inputs of their merges back
-    for merge in unique(part.merge for part in epmap_eloop.reduce_parts)
+    # wait for the reducers, except those that run copies that lost: the final reduction does not need them
+    while any(((pid, reducer),)->!istaskdone(reducer) && !is_loser(pid), reducers)
+        sleep(0.05)
+    end
+
+    # after an interruption, merges can be left that no copy runs anymore: give up on them, and put their inputs back
+    lock(l)
+    tocancel = Tuple{Int,Int}[]
+    for merge in merges
+        merge.resolved = true
+        drop_queued!(merge, 0)
+        append!(tocancel, copies_running(merge))
         push!(epmap_eloop.reduce_checkpoints, merge.inputs...)
         push!(partial_outputs, merge.output)
         epmap_eloop.reduce_merges_in_flight -= 1
     end
-    empty!(epmap_eloop.reduce_parts)
+    empty!(merges)
+    empty!(epmap_eloop.reduce_whole)
+    unlock(l)
+    cancel_copies(tocancel)
 
     length(epmap_eloop.reduce_checkpoints) == 0 && @warn "there are no checkpoints to reduce indicating that no tasks were run"
 
@@ -2172,6 +2473,9 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
         end
     end
     @debug "reduce, finished final reduction on master"
+
+    # copies that lost may still write to checkpoints: wait for them to stop before removing any
+    foreach(((_, reducer),)->wait(reducer), reducers)
 
     @debug "deleting orphaned checkpoints"
     if !(options.keepcheckpoints)
@@ -2337,9 +2641,12 @@ end
 
 #=
 Reduce the chunks `ichunks` of `chunks` (all the chunks of `layout`) of the streaming checkpoints `inputs` into
-`output`, without committing `output`.  See `reduce_streaming`.
+`output`, as copy `copy` of them, without committing `output`.  Once `cancelled[]` is set, no more chunks are read or
+written.  Returns `:done` if all of the chunks were written, and `:cancelled` otherwise.  See `reduce_streaming`.
 =#
-function reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks, depth)
+function reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks, depth; copy=1, cancelled=Threads.Atomic{Bool}(false))
+    # a copy that starts cancelled does not even look at its inputs
+    cancelled[] && return :cancelled
     nbytes = sum(last, layout; init=0)
     for (input, n) in zip(inputs, asyncmap(filesize, inputs))
         n == nbytes || error("Schedulers: checkpoint $input has $n bytes, expected $nbytes for a streaming checkpoint")
@@ -2347,13 +2654,14 @@ function reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks,
     # a chunk being read holds a buffer per input, and a chunk being written holds one
     pool = buffer_pool((length(inputs) + 1)*depth, maximum(ichunk->chunks[ichunk].nbytes, ichunks; init=0))
     reading, writing = Base.Semaphore(depth), Base.Semaphore(depth)
-    failed = Threads.Atomic{Bool}(false)
+    failed, stopped = Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false)
     firsterror = Ref{Any}(nothing)
     @sync for ichunk in ichunks
         chunk = chunks[ichunk]
         Base.acquire(reading)
-        if failed[]
+        if failed[] || cancelled[]
             Base.release(reading)
+            cancelled[] && (stopped[] = true)
             break
         end
         Threads.@spawn begin
@@ -2362,6 +2670,10 @@ function reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks,
             try
                 for _ in inputs
                     push!(buffers, take!(pool))
+                end
+                if cancelled[]
+                    stopped[] = true
+                    return
                 end
                 read_chunk!(buffers, inputs, chunk)
                 GC.@preserve buffers begin
@@ -2379,7 +2691,11 @@ function reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks,
                 Base.release(reading)
                 isreading = false
                 failed[] && return
-                checkpoint_write_chunk(output, ichunk, length(chunks), view(buffers[1], 1:chunk.nbytes), chunk.offset)
+                if cancelled[]
+                    stopped[] = true
+                    return
+                end
+                checkpoint_write_chunk(output, ichunk, length(chunks), view(buffers[1], 1:chunk.nbytes), chunk.offset, copy)
             catch e
                 Threads.atomic_xchg!(failed, true) || (firsterror[] = CapturedException(e, catch_backtrace()))
             finally
@@ -2391,7 +2707,7 @@ function reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks,
         end
     end
     failed[] && throw(firsterror[])
-    nothing
+    stopped[] ? :cancelled : :done
 end
 
 """
@@ -2411,7 +2727,7 @@ function reduce_streaming(reducer_chunk!, inputs, output, layout, chunkbytes, de
     tic = time()
     try
         reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, eachindex(chunks), depth)
-        checkpoint_commit(output, length(chunks))
+        checkpoint_commit(output, fill(1, length(chunks)))
     catch
         abort_checkpoint(output)
         rethrow()
@@ -2422,21 +2738,71 @@ function reduce_streaming(reducer_chunk!, inputs, output, layout, chunkbytes, de
 end
 
 """
-    Schedulers.reduce_streaming_part(reducer_chunk!, inputs, output, layout, chunkbytes, depth, part, nparts)
+    status = Schedulers.reduce_streaming_part(reducer_chunk!, inputs, output, layout, chunkbytes, depth, part, nparts; copy=1, id=0)
 
-Like `reduce_streaming`, but only reduce part `part` of `nparts` of the chunks (see `Schedulers.part_chunks`), and
-neither commit nor abort `output`.  The parts of a merge can run on several workers at once, each writing its own
-chunks of `output`, which is committed, with `checkpoint_commit`, once all parts are done.
+Like `reduce_streaming`, but only reduce part `part` of `nparts` of the chunks (see `Schedulers.part_chunks`), as
+copy `copy` of them, and neither commit nor abort `output`.  The parts of a merge, and copies of them, can run on
+several workers at once, each writing its own chunks of `output`, which is committed, with `checkpoint_commit`, once a
+copy of each part is done.  A copy with an `id` stops once `Schedulers.cancel_copy(id)` runs on its worker, even if that
+runs before the copy starts.  Returns `:done` if all of the chunks of the part were written, and `:cancelled` otherwise.
 """
-function reduce_streaming_part(reducer_chunk!, inputs, output, layout, chunkbytes, depth, part, nparts)
+function reduce_streaming_part(reducer_chunk!, inputs, output, layout, chunkbytes, depth, part, nparts; copy=1, id=0)
     chunks = checkpoint_chunks(layout, chunkbytes)
     ichunks = part_chunks(chunks, part, nparts)
     nbytes = sum(ichunk->chunks[ichunk].nbytes, ichunks; init=0)
-    @debug "reduce_streaming_part, reducing part $part of $nparts, chunks $ichunks of $(length(chunks)) ($nbytes bytes), of $(length(inputs)) checkpoints"
+    # a copy of a whole merge logs like `reduce_streaming`
+    what = nparts == 1 ? "reduce_streaming" : "reduce_streaming_part"
+    if nparts == 1
+        @debug "reduce_streaming, reducing $(length(inputs)) checkpoints of $nbytes bytes in $(length(chunks)) chunks, copy $copy"
+    else
+        @debug "reduce_streaming_part, reducing part $part of $nparts, chunks $ichunks of $(length(chunks)) ($nbytes bytes), of $(length(inputs)) checkpoints, copy $copy"
+    end
+    cancelled = Threads.Atomic{Bool}(false)
+    if id != 0
+        lock(COPIES_LOCK) do
+            # the cancel can reach the worker before the copy starts: the copy then starts cancelled
+            pop!(CANCELLED_BEFORE_START, id, nothing) === nothing || (cancelled[] = true)
+            COPIES[id] = cancelled
+        end
+    end
     tic = time()
-    reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks, depth)
+    status = try
+        reduce_chunks!(reducer_chunk!, inputs, output, layout, chunks, ichunks, depth; copy, cancelled)
+    finally
+        id == 0 || lock(()->delete!(COPIES, id), COPIES_LOCK)
+    end
     elapsed = time() - tic
-    @debug "reduce_streaming_part, done in $(round(elapsed; digits=1)) seconds, reading at $(round(length(inputs)*nbytes/elapsed/1e9; digits=2)) GB/s and writing at $(round(nbytes/elapsed/1e9; digits=2)) GB/s"
+    if status === :done
+        @debug "$what, done in $(round(elapsed; digits=1)) seconds, reading at $(round(length(inputs)*nbytes/elapsed/1e9; digits=2)) GB/s and writing at $(round(nbytes/elapsed/1e9; digits=2)) GB/s"
+    else
+        @debug "$what, cancelled after $(round(elapsed; digits=1)) seconds"
+    end
+    status
+end
+
+#=
+The copies of parts of merges that run on this worker, by id: a copy stops once it is cancelled, for example when
+another copy of the same part finished first (see `reduce_streaming_part`).  A cancel can reach the worker before its
+copy starts, since the master sends it as soon as it knows that the copy lost, and the copy starts on a thread of its
+own: it is kept in `CANCELLED_BEFORE_START` until the copy starts.  A cancel can also arrive after its copy stopped, and
+those are forgotten after an hour.
+=#
+const COPIES = Dict{Int,Threads.Atomic{Bool}}()
+const CANCELLED_BEFORE_START = Dict{Int,Float64}()
+const COPIES_LOCK = ReentrantLock()
+
+# stop the copy `id` that runs on this worker, or that starts on it next
+function cancel_copy(id)
+    lock(COPIES_LOCK) do
+        cancelled = get(COPIES, id, nothing)
+        if cancelled === nothing
+            now = time()
+            filter!(((_, t),)->now - t < 3600, CANCELLED_BEFORE_START)
+            CANCELLED_BEFORE_START[id] = now
+        else
+            cancelled[] = true
+        end
+    end
     nothing
 end
 
@@ -2482,9 +2848,9 @@ function save_checkpoint_streaming(fetch_method, checkpoint, _localresult, ::Typ
     try
         foreach_chunk(chunks, depth) do ichunk, chunk
             a = arrays[chunk.array]
-            GC.@preserve a checkpoint_write_chunk(checkpoint, ichunk, length(chunks), wrap_bytes(UInt8, pointer(a) + chunk.arrayoffset, chunk.nbytes), chunk.offset)
+            GC.@preserve a checkpoint_write_chunk(checkpoint, ichunk, length(chunks), wrap_bytes(UInt8, pointer(a) + chunk.arrayoffset, chunk.nbytes), chunk.offset, 1)
         end
-        checkpoint_commit(checkpoint, length(chunks))
+        checkpoint_commit(checkpoint, fill(1, length(chunks)))
     catch
         abort_checkpoint(checkpoint)
         rethrow()
@@ -2546,44 +2912,61 @@ end
 checkpoint_read!(checkpoint, buffer, offset) = streaming_unsupported(checkpoint)
 
 """
-    Schedulers.checkpoint_write_chunk(checkpoint, ichunk, nchunks, buffer, offset)
+    Schedulers.checkpoint_write_chunk(checkpoint, ichunk, nchunks, buffer, offset, copy)
 
-Write `buffer`, chunk `ichunk` of `nchunks`, to the streaming checkpoint `checkpoint`, at byte `offset`.
-Chunks are written concurrently and in any order, and must not be visible until `checkpoint_commit` is
-called.
+Write `buffer`, chunk `ichunk` of `nchunks`, to the streaming checkpoint `checkpoint`, at byte `offset`, as copy
+`copy` of the chunk.  Chunks are written concurrently and in any order, and must not be visible until
+`checkpoint_commit` is called.  Several copies of a chunk can be written at once, by different workers (see
+`reduce_partcopies`), and `checkpoint_commit` picks the copy of each chunk to keep.  Azure blobs keep each copy of a
+chunk as a block of its own (see `Schedulers.chunk_blockid`); local paths keep one copy of each chunk, which copies
+overwrite with the same bytes.
 """
-function checkpoint_write_chunk(checkpoint::AbstractString, ichunk, nchunks, buffer, offset)
+function checkpoint_write_chunk(checkpoint::AbstractString, ichunk, nchunks, buffer, offset, copy)
+    # copies of a chunk hold the same bytes, so they share the partial file
     open(partial_checkpoint(checkpoint); write=true, create=true, truncate=false) do io
         seek(io, offset)
         GC.@preserve buffer unsafe_write(io, pointer(buffer), length(buffer))
     end
     nothing
 end
-checkpoint_write_chunk(checkpoint, ichunk, nchunks, buffer, offset) = streaming_unsupported(checkpoint)
+checkpoint_write_chunk(checkpoint, ichunk, nchunks, buffer, offset, copy) = streaming_unsupported(checkpoint)
 
 """
-    Schedulers.checkpoint_commit(checkpoint, nchunks)
+    Schedulers.checkpoint_commit(checkpoint, copies)
 
-Make the `nchunks` chunks written with `checkpoint_write_chunk` visible as the streaming checkpoint
-`checkpoint`, in a single step.
+Make the chunks written with `checkpoint_write_chunk` visible as the streaming checkpoint `checkpoint`, in a single
+step, keeping copy `copies[i]` of chunk `i`.
 """
-function checkpoint_commit(checkpoint::AbstractString, nchunks)
+function checkpoint_commit(checkpoint::AbstractString, copies)
     partial = partial_checkpoint(checkpoint)
     isfile(partial) || touch(partial) # a result without any data
     mv(partial, checkpoint; force=true)
     nothing
 end
-checkpoint_commit(checkpoint, nchunks) = streaming_unsupported(checkpoint)
+checkpoint_commit(checkpoint, copies) = streaming_unsupported(checkpoint)
 
 """
     Schedulers.checkpoint_abort(checkpoint)
 
-Discard the chunks of a streaming checkpoint that was not committed.
+Discard the chunks of a streaming checkpoint that are not part of it: all of its chunks if it was not committed, and
+those that copies wrote after it was committed.
 """
 checkpoint_abort(checkpoint::AbstractString) = (rm(partial_checkpoint(checkpoint); force=true); nothing)
 checkpoint_abort(checkpoint) = streaming_unsupported(checkpoint)
 
 partial_checkpoint(checkpoint::AbstractString) = checkpoint * ".partial"
+
+"""
+    id = Schedulers.chunk_blockid(ichunk, copy)
+
+The id of copy `copy` of chunk `ichunk` of a streaming checkpoint, for storage that keeps copies of a chunk apart by
+id, as Azure blobs keep blocks: 16 letters and digits, so a valid base64 string, and of the same length for every
+chunk and copy, as Azure requires of the blocks of a blob.
+"""
+function chunk_blockid(ichunk, copy)
+    (1 <= ichunk <= 10^8 && 1 <= copy < 10^6) || throw(ArgumentError("no block id for copy $copy of chunk $ichunk"))
+    string("c", lpad(copy, 6, '0'), "k", lpad(ichunk - 1, 8, '0'))
+end
 
 streaming_unsupported(checkpoint) = error("Schedulers: streaming reductions do not support checkpoints of type $(typeof(checkpoint)); add methods to `Schedulers.checkpoint_read!`, `checkpoint_write_chunk`, `checkpoint_commit` and `checkpoint_abort`")
 
