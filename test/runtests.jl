@@ -1224,11 +1224,12 @@ end
     # and timeouts still apply: the limit here is 5 times the median of the earlier times, 1 second
     t = @elapsed @test_throws Schedulers.TimeoutException call_wait(()->sleep(5), [0.2, 0.2])
     @test 1 <= t < 3
-    # fast calls are timed as taking a second, as when calls were polled once a second, so that timeouts based on them
-    # stay at several seconds
+    # fast calls are timed as taking a second, and others are timed in whole seconds, rounded up, as when calls were
+    # polled once a second, so that timeouts based on them stay as they were
     times = Float64[]
     call_wait(()->nothing, times)
-    @test times == [1.0]
+    call_wait(()->sleep(1.2), times)
+    @test times == [1.0, 2.0]
     rmprocs(workers())
 end
 
@@ -1333,17 +1334,12 @@ end
 end
 
 @testset "streaming reduction, timeouts of parts of a merge" begin
-    # a part of a merge times out after its share of the time of a whole merge, but no sooner than a whole merge does
-    # when merges are timed at the floor of a second
-    times = [300.0; fill(1.0, 20)]
-    @test Schedulers.maximum_task_time(times, 10, 5) == 5.0
-    @test Schedulers.maximum_task_time(Schedulers.PartTimes(times, 1/8), 10, 5) == 5.0
-    times = [300.0; fill(80.0, 20)]
-    @test Schedulers.maximum_task_time(Schedulers.PartTimes(times, 1/8), 10, 5) == 50.0
-    # and it is recorded as the time of a whole merge
-    parttimes = Schedulers.PartTimes(Float64[], 1/4)
-    push!(parttimes, 2.0)
-    @test parttimes.times == [8.0]
+    # a part of a merge times out like a whole merge, however small its share of the merge
+    times = [300.0; fill(30.0, 20)]
+    @test Schedulers.maximum_task_time(Schedulers.PartTimes(times), 10, 5) == Schedulers.maximum_task_time(times, 10, 5) == 150.0
+    # and its time is not recorded with those of whole merges
+    push!(Schedulers.PartTimes(times), 3.0)
+    @test length(times) == 21
 end
 
 @testset "streaming reduction, number of parts of a merge" begin
@@ -1365,6 +1361,8 @@ end
     empty!(eloop.reduce_parts)
     push!(eloop.used_pids_map, pids[1])
     @test Schedulers.merge_parts(eloop, 10, 0) == 2 # a worker maps
+    push!(eloop.removed_pids, pids[2])
+    @test Schedulers.merge_parts(eloop, 10, 0) == 1 # a worker is being removed
     push!(eloop.tsk_pool_todo, 1)
     @test Schedulers.merge_parts(eloop, 10, 0) == 1 # map tasks come first
     # maxreduceworkers bounds the workers that reduce at once
@@ -1477,6 +1475,48 @@ end
         @test all(≈(x[1]), x)
         rm(tmpfile; force=true)
     end
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, a worker that is being removed gets no more work" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    badpid = workers()[1]
+    @everywhere function foo_removed(r, tsk, badpid)
+        if myid() == badpid
+            # hold up the removal of this worker, as while other workers join the cluster: rmprocs waits for this lock
+            remotecall_fetch(1) do
+                @async begin
+                    lock(Distributed.worker_lock)
+                    try
+                        sleep(5)
+                    finally
+                        unlock(Distributed.worker_lock)
+                    end
+                end
+                nothing
+            end
+            error("this worker is bad")
+        end
+        r .+= tsk
+        sleep(1)
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64, reduce_partbytes=128)
+    logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 100), options, foo_removed, 1:12, badpid)
+    end
+    msgs = [string(l.message) for l in logger.logs]
+
+    @test all(==(sum(1:12)), r)
+    # the bad worker mapped once, failed, and got no more tasks, merges or parts while it was removed
+    @test count(==("map, pid=$badpid"), msgs) == 1
+    @test count(==("reduce, pid=$badpid"), msgs) == 0
+    @test badpid ∉ workers()
+    rmprocs(workers())
     rm(tmpdir; recursive=true, force=true)
 end
 

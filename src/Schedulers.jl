@@ -215,6 +215,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     reduce_busy::Int                   # reducers running a merge, or a part of a split merge
     reduce_parts::Vector{MergePart{C}} # parts of split merges that wait for a reducer
     wakeup::Threads.Event              # wakes the elastic loop before its next poll, for example to start reducers for parts
+    removed_pids::Set{Int}             # workers that are bad, or are being removed: they get no more work
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -262,6 +263,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         0,
         MergePart{C}[],
         Threads.Event(true),
+        Set{Int}(),
     )
 
     if !isreduce
@@ -357,24 +359,23 @@ end
 
 #=
 Timeouts are multiples of the median time of earlier calls (see `maximum_task_time` and `robust_average`).  When calls
-were polled once a second, no call was timed at less than a second.  Keep that floor, so that the timeouts of fast
-calls (for example, removing a checkpoint) stay at several seconds instead of shrinking to a fraction of a second.
+were polled once a second, their times were rounded up to whole seconds, and were at least a second.  Keep recording
+them that way, so that timeouts stay as they were: a task that takes 1.2 s is timed at 2 s, so that, with the default
+multiplier of 5, it times out after 10 s and not after 6 s, which the first task on a new worker can take.
 =#
-record_time!(tsk_times, tic) = isa(tsk_times, AbstractArray) && push!(tsk_times, max(time() - tic, 1.0))
+record_time!(tsk_times, tic) = isa(tsk_times, AbstractArray) && push!(tsk_times, max(ceil(time() - tic), 1.0))
 
 #=
-The times of whole merges, as seen by a part of a merge that writes `fraction` of the merged checkpoint: the part
-times out after `fraction` of the usual time, but at least the floor of `record_time!`, since a part has costs that do
-not shrink with it, and its time is recorded as that of a whole merge, so that parts and whole merges share their
-statistics.
+The times of whole merges, as seen by a part of a merge: a part times out like a whole merge, and its own time is not
+recorded with them.  Parts do not take a fixed share of the time of their merge: one that the storage slows down can
+take several times as long as the other parts of its merge.
 =#
 struct PartTimes <: AbstractVector{Float64}
     times::Vector{Float64}
-    fraction::Float64
 end
 Base.size(t::PartTimes) = size(t.times)
-Base.getindex(t::PartTimes, i::Int) = max(t.fraction*t.times[i], 1.0)
-Base.push!(t::PartTimes, time) = (push!(t.times, time/t.fraction); t)
+Base.getindex(t::PartTimes, i::Int) = t.times[i]
+Base.push!(t::PartTimes, time) = t
 
 function remotecall_wait_timeout(tsk_times, tsk_count, timeout_multiplier, preempt_channel_future, checkpoint_task, restart_task, tsk, f, pid, args...; kwargs...)
     t = @async remotecall_wait(default_threadpool_checkpoint_call, pid, preempt_channel_future, checkpoint_task, restart_task, tsk, f, args...; kwargs...)
@@ -591,7 +592,7 @@ function merge_parts(eloop::ElasticLoop, maxparts, nwaiting)
         return 1
     end
     # workers that are up, and not mapping; `initialized_pids` still holds workers that were removed since
-    nworkers = min(maxreduceworkers, count(pid->pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map, workers()))
+    nworkers = min(maxreduceworkers, count(pid->pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.removed_pids, workers()))
     nidle = nworkers - eloop.reduce_busy - length(eloop.reduce_parts) - nwaiting - 1
     clamp(1 + nidle, 1, maxparts)
 end
@@ -876,7 +877,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             _epmap_minworkers = _epmap_maxworkers
         end
 
-        uninitialized_pids = filter(pid->(pid ∉ initializing_pids && pid ∉ eloop.initialized_pids), workers())
+        uninitialized_pids = filter(pid->(pid ∉ initializing_pids && pid ∉ eloop.initialized_pids && pid ∉ eloop.removed_pids), workers())
 
         for uninitialized_pid in uninitialized_pids
             if !haskey(Distributed.map_pid_wrkr, uninitialized_pid)
@@ -909,11 +910,17 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     uninitialized_pid ∈ initializing_pids && pop!(initializing_pids, uninitialized_pid)
                     haskey(eloop.pid_failures, uninitialized_pid) && pop!(eloop.pid_failures, uninitialized_pid)
                     push!(bad_pids, uninitialized_pid)
+                    push!(eloop.removed_pids, uninitialized_pid)
                 end
             end
         end
 
-        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
+        #=
+        A worker that is removed stays in `workers()` until rmprocs gets to it, which can take a while: rmprocs waits for
+        Distributed's lock, which is held while workers join.  So a worker that is removed, or will be, is not free,
+        even after it leaves `bad_pids`.
+        =#
+        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids && pid ∉ eloop.removed_pids), workers())
 
         push!(loop_log_cache, "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)")
         push!(loop_log_cache, "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)")
@@ -980,12 +987,13 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                     push!(rm_pids, pop!(bad_pids))
                 end
                 δ += length(rm_pids)
+                if δ < 0
+                    idle_pids = filter(pid->pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
+                    push!(rm_pids, idle_pids[1:min(-δ, length(idle_pids))]...)
+                end
+                union!(eloop.removed_pids, rm_pids)
                 tsk_addrmprocs_tic = time()
                 tsk_addrmprocs = @async begin
-                    if δ < 0
-                        free_pids = filter(pid->pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
-                        push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
-                    end
                     push!(loop_log_cache, "calling rmprocs on $rm_pids")
                     try
                         robust_rmprocs(rm_pids; waitfor=addrmprocs_timeout)
@@ -1020,7 +1028,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 pid,isbad = take!(eloop.pid_channel_map_remove)
                 push!(loop_log_cache, "map channel, received pid=$pid, making sure that it is initialized")
                 yield()
-                isbad && push!(bad_pids, pid)
+                isbad && (push!(bad_pids, pid); push!(eloop.removed_pids, pid))
                 push!(loop_log_cache, "map channel, $pid is initialized, removing from used_pids")
                 pid ∈ eloop.used_pids_map && pop!(eloop.used_pids_map, pid)
                 push!(loop_log_cache, "map channel, done removing $pid from used_pids_map, used_pids_map=$(eloop.used_pids_map)")
@@ -1037,7 +1045,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 pid,isbad = take!(eloop.pid_channel_reduce_remove)
                 push!(loop_log_cache, "reduce channel, received pid=$pid (isbad=$isbad), making sure that it is initialized")
                 yield()
-                isbad && push!(bad_pids, pid)
+                isbad && (push!(bad_pids, pid); push!(eloop.removed_pids, pid))
                 push!(loop_log_cache, "reduce_channel, $pid is initialized, removing from used_pids")
                 pid ∈ eloop.used_pids_reduce && pop!(eloop.used_pids_reduce, pid)
                 push!(loop_log_cache, "reduce channel, done removing $pid from used_pids, used_pids=$(eloop.used_pids_reduce)")
@@ -1853,7 +1861,6 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
 
     # when workers are idle, a streaming merge is split into up to `maxparts` parts that run at once (see `merge_parts`)
     chunks = options.reduce_streaming ? checkpoint_chunks(layout, options.reduce_chunkbytes) : CheckpointChunk[]
-    nbytes = options.reduce_streaming ? sum(last, layout; init=0) : 0
     maxparts = options.reduce_streaming ? max_merge_parts(chunks, options.reduce_partbytes) : 1
 
     # give `pid` back to the elastic loop, and wake the loop up so that it can use the worker right away
@@ -1909,8 +1916,8 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
             partbytes = sum(ichunk->chunks[ichunk].nbytes, part_chunks(chunks, part.part, merge.nparts); init=0)
             @debug "reducing part $(part.part) of $(merge.nparts) into checkpoint3, pid=$pid, from $(length(merge.inputs)) checkpoints, $partbytes bytes ($(length(epmap_eloop.used_pids_reduce)) reduce workers)." checkpoint3=merge.output
             journal_start!(epmap_journal; stage="reduce", tsk=0, pid, hostname)
-            # a part times out, and is timed, in proportion to its share of the merged checkpoint
-            remotecall_wait_timeout(PartTimes(reduce_times, partbytes/nbytes), 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce_streaming_part, pid, options.reducer_chunk!, merge.inputs, merge.output, layout, options.reduce_chunkbytes, options.reduce_depth, part.part, merge.nparts)
+            # a part times out like a whole merge, and is not timed with them (see `PartTimes`)
+            remotecall_wait_timeout(PartTimes(reduce_times), 10, options.timeout_multiplier, nothing, tsk->nothing, tsk->nothing, 0, reduce_streaming_part, pid, options.reducer_chunk!, merge.inputs, merge.output, layout, options.reduce_chunkbytes, options.reduce_depth, part.part, merge.nparts)
             journal_stop!(epmap_journal; stage="reduce", tsk=0, pid, fault=false)
             @debug "reduced part $(part.part) of $(merge.nparts) into checkpoint3, pid=$pid" checkpoint3=merge.output
         catch e
