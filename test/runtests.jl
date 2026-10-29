@@ -1246,7 +1246,8 @@ end
 @testset "pmapreduce, streaming reduction, merges take full groups" begin
     safe_addprocs(10)
     @everywhere using Distributed, Schedulers
-    @everywhere foo_groups(r, tsk) = (r .+= tsk; nothing)
+    # tasks that take a while, so that workers that start late get tasks too, and there are checkpoints to merge
+    @everywhere foo_groups(r, tsk) = (r .+= tsk; sleep(0.5); nothing)
 
     tmpdir = mktempdir(;cleanup=false)
     fanin = 3
@@ -1264,6 +1265,218 @@ end
     @test !isempty(ninputs)
     @test length(ninputs) == cld(ncheckpoints - 1, fanin - 1) # as few merges as possible
     @test all(==(fanin), ninputs[1:end-1])                    # only the last merge may take fewer checkpoints
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "streaming reduction, parts of a merge" begin
+    # parts are contiguous ranges of chunks, that together hold all of the chunks, none empty
+    for layout in ([(Float32, 400)], [(Int8, 3), (Float64, 800), (Float32, 4)]), chunkbytes in (8, 64)
+        chunks = Schedulers.checkpoint_chunks(layout, chunkbytes)
+        for nparts in 1:length(chunks)
+            ranges = Schedulers.part_ranges(chunks, nparts)
+            @test vcat(collect.(ranges)...) == collect(eachindex(chunks))
+            @test all(!isempty, ranges)
+            @test all(part->Schedulers.part_chunks(chunks, part, nparts) == ranges[part], 1:nparts)
+        end
+    end
+    # of about the same size
+    chunks = Schedulers.checkpoint_chunks([(Float32, 4000)], 64)
+    sizes = [sum(ichunk->chunks[ichunk].nbytes, ichunks) for ichunks in Schedulers.part_ranges(chunks, 7)]
+    @test maximum(sizes) - minimum(sizes) <= 64
+    @test_throws ArgumentError Schedulers.part_ranges(chunks, length(chunks) + 1)
+    @test_throws ArgumentError Schedulers.part_ranges(chunks, 0)
+
+    # the number of parts is bounded by the part size, and by the number of chunks
+    chunks = Schedulers.checkpoint_chunks([(Float32, 400)], 64)
+    @test Schedulers.max_merge_parts(chunks, typemax(Int)) == 1
+    @test Schedulers.max_merge_parts(chunks, 1000) == 1
+    @test Schedulers.max_merge_parts(chunks, 128) == 3
+    @test Schedulers.max_merge_parts(chunks, 1) == length(chunks)
+
+    # parts, run at once and in any order, write all of the merged checkpoint, and leave committing it to the caller
+    depth, chunkbytes, nchunks, nparts = 2, 8, 9, 4
+    layout = [(UInt8, nchunks*chunkbytes)]
+    inputs = [MemoryCheckpoint(fill(UInt8(i), nchunks*chunkbytes)) for i in 1:3]
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes))
+    @sync for part in nparts:-1:1
+        Threads.@spawn Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, inputs, output, layout, chunkbytes, depth, part, nparts)
+    end
+    @test all(==(UInt8(6)), output.data)
+    @test !output.committed && !output.aborted
+
+    # a failed part throws, and leaves aborting the output to the caller too, since other parts may still write to it
+    inputs[2].onread = offset->offset >= 4*chunkbytes && error("injected read failure")
+    output = MemoryCheckpoint(zeros(UInt8, nchunks*chunkbytes))
+    @test_throws Exception Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, inputs, output, layout, chunkbytes, depth, nparts, nparts)
+    @test !output.committed && !output.aborted
+
+    # local files: the merged checkpoint appears once it is committed
+    tmpdir = mktempdir()
+    zeros_xyz() = (; x=zeros(Float32, 100), y=zeros(Float64, 3, 5), z=zeros(Int32, 7))
+    T = typeof(zeros_xyz())
+    layout = Schedulers.checkpoint_layout(zeros_xyz())
+    files = [joinpath(tmpdir, "input-$i") for i in 1:3]
+    for (i, file) in enumerate(files)
+        x = zeros_xyz()
+        foreach(a->a .= i, Schedulers.checkpoint_arrays(x))
+        Schedulers.save_checkpoint_streaming(identity, file, x, T, 24, 2)
+    end
+    merged = joinpath(tmpdir, "merged")
+    for part in 3:-1:1
+        Schedulers.reduce_streaming_part(Schedulers.default_reducer_chunk!, files, merged, layout, 24, 2, part, 3)
+    end
+    @test !isfile(merged)
+    Schedulers.checkpoint_commit(merged, length(Schedulers.checkpoint_chunks(layout, 24)))
+    r = Schedulers.load_checkpoint_streaming(zeros_xyz, merged, T, 24, 2)
+    @test all(a->all(==(6), a), Schedulers.checkpoint_arrays(r))
+    rm(tmpdir; recursive=true)
+end
+
+@testset "streaming reduction, timeouts of parts of a merge" begin
+    # a part of a merge times out after its share of the time of a whole merge, but no sooner than a whole merge does
+    # when merges are timed at the floor of a second
+    times = [300.0; fill(1.0, 20)]
+    @test Schedulers.maximum_task_time(times, 10, 5) == 5.0
+    @test Schedulers.maximum_task_time(Schedulers.PartTimes(times, 1/8), 10, 5) == 5.0
+    times = [300.0; fill(80.0, 20)]
+    @test Schedulers.maximum_task_time(Schedulers.PartTimes(times, 1/8), 10, 5) == 50.0
+    # and it is recorded as the time of a whole merge
+    parttimes = Schedulers.PartTimes(Float64[], 1/4)
+    push!(parttimes, 2.0)
+    @test parttimes.times == [8.0]
+end
+
+@testset "streaming reduction, number of parts of a merge" begin
+    safe_addprocs(3)
+    # earlier tests can leave workers behind, so only these three count as initialized
+    pids = workers()[1:3]
+    eloop = Schedulers.ElasticLoop(String, 1:0, SchedulerOptions(; reduce_streaming=true, reduce_fanin=3); isreduce=true)
+    # the workers are up and idle, and 1000 and 1001 were removed since they were initialized
+    union!(eloop.initialized_pids, pids, [1000, 1001])
+    @test Schedulers.merge_parts(eloop, 10, 0) == 3 # one part for this merge's reducer, and one for each other idle worker
+    @test Schedulers.merge_parts(eloop, 2, 0) == 2  # at most maxparts
+    @test Schedulers.merge_parts(eloop, 1, 0) == 1
+    @test Schedulers.merge_parts(eloop, 10, 1) == 2 # a worker is left for another group of checkpoints that waits
+    eloop.reduce_busy = 1
+    @test Schedulers.merge_parts(eloop, 10, 0) == 2 # a worker is busy reducing
+    eloop.reduce_busy = 0
+    push!(eloop.reduce_parts, Schedulers.MergePart(Schedulers.SplitMerge(["a", "b"], "c", 2), 2))
+    @test Schedulers.merge_parts(eloop, 10, 0) == 2 # a part of another merge waits for a worker
+    empty!(eloop.reduce_parts)
+    push!(eloop.used_pids_map, pids[1])
+    @test Schedulers.merge_parts(eloop, 10, 0) == 2 # a worker maps
+    push!(eloop.tsk_pool_todo, 1)
+    @test Schedulers.merge_parts(eloop, 10, 0) == 1 # map tasks come first
+    # maxreduceworkers bounds the workers that reduce at once
+    eloop = Schedulers.ElasticLoop(String, 1:0, SchedulerOptions(; reduce_streaming=true, maxreduceworkers=2); isreduce=true)
+    union!(eloop.initialized_pids, pids)
+    @test Schedulers.merge_parts(eloop, 10, 0) == 2
+    rmprocs(workers())
+end
+
+@testset "pmapreduce, streaming reduction, merges split into parts" begin
+    safe_addprocs(8)
+    @everywhere using Distributed, Schedulers
+    # tasks that take a while, so that every worker runs one, and there are checkpoints to merge
+    @everywhere foo_parts(r, tsk) = (r .+= tsk; sleep(2); nothing)
+
+    tmpdir = mktempdir(;cleanup=false)
+    function run_parts(; kwargs...)
+        options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64, reduce_partbytes=128, kwargs...)
+        logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+        r,tsks = with_logger(logger) do
+            epmapreduce!(zeros(Float32, 100), options, foo_parts, 1:8)
+        end
+        r, [string(l.message) for l in logger.logs]
+    end
+
+    # with as many workers as tasks, workers are idle when merges start, so merges are split
+    r, msgs = run_parts()
+    nsplit = count(m->startswith(m, "splitting the merge"), msgs)
+    pids = unique(parse(Int, match(r"pid=(\d+)", m).captures[1]) for m in msgs if startswith(m, "reducing part"))
+    @test all(==(sum(1:8)), r)
+    @test count(m->startswith(m, "reducing from"), msgs) > 0                    # there were merges
+    @test nsplit > 0
+    @test count(m->startswith(m, "pushed merged checkpoint3 from"), msgs) == nsplit # every split merge was committed
+    @test length(pids) > 1                                                         # by several workers
+    @test isempty(readdir(tmpdir))
+
+    # merges are not split beyond maxreduceworkers
+    r, msgs = run_parts(; maxreduceworkers=1)
+    @test all(==(sum(1:8)), r)
+    @test !any(m->startswith(m, "splitting the merge"), msgs)
+    @test isempty(readdir(tmpdir))
+
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, streaming reduction, a failed part of a merge" begin
+    safe_addprocs(6)
+    @everywhere using Distributed, Schedulers
+    failfile = tempname()
+    touch(failfile)
+    @everywhere failfile = $failfile
+    @everywhere begin
+        foo_failed_part(r, tsk) = (r .+= tsk; sleep(2); nothing)
+        # the first chunk to be reduced fails, on whichever worker reduces it
+        function flaky_chunk!(x, y)
+            isfile(failfile) && (try rm(failfile); true catch; false end) && error("injected failure")
+            x .+= y
+            nothing
+        end
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=64, reduce_partbytes=128, reducer_chunk! = flaky_chunk!)
+    logger = Test.TestLogger(; min_level=Logging.Debug, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 100), options, foo_failed_part, 1:6)
+    end
+    rmprocs(workers())
+    msgs = [string(l.message) for l in logger.logs]
+
+    @test !isfile(failfile)                                                    # the failure was injected
+    @test any(m->occursin("caught exception during part", m), msgs)            # into a part of a split merge
+    @test all(==(sum(1:6)), r)                                                 # which was done again
+    @test isempty(readdir(tmpdir))                                             # and its partial output removed
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, partial reduction, streaming, merges split into parts" begin
+    using Distributed, Schedulers
+
+    function foo_split_trigger(r, i)
+        r .+= i
+        sleep(2)
+        nothing
+    end
+
+    function trigger_split(eloop, ntasks)
+        if length(complete_tasks(eloop)) - ntasks[] >= 10
+            trigger_reduction!(eloop)
+            ntasks[] = length(complete_tasks(eloop))
+        end
+    end
+
+    # by the first trigger, all tasks have started, so workers are idle, and the merges of the snapshot can be split
+    tmpdir = mktempdir(;cleanup=false)
+    tmpfile = tempname()
+
+    ntasks = Ref(0)
+    options = SchedulerOptions(;maxworkers=10, scratch=tmpdir, reduce_trigger=eloop->trigger_split(eloop, ntasks), save_partial_reduction=input->write(tmpfile, input),
+        reduce_streaming=true, reduce_fanin=3, reduce_chunkbytes=16, reduce_partbytes=16)
+    t = @async epmapreduce!(zeros(10), options, foo_split_trigger, 1:20)
+    @test timedwait(()->istaskdone(t), 300.0; pollint=1.0) == :ok
+
+    if istaskdone(t)
+        r,tsks = fetch(t)
+        @test r ≈ sum([1:20;]) * ones(10)
+        x = read!(tmpfile, zeros(10))
+        @test x[1] >= sum([1:10;])
+        @test all(≈(x[1]), x)
+        rm(tmpfile; force=true)
+    end
     rm(tmpdir; recursive=true, force=true)
 end
 
