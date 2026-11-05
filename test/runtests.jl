@@ -1074,6 +1074,151 @@ end
     @test g == ones(size(g)) .* (sum([1 : 22;]) - sum(tsks)) * 2
 end
 
+@testset "epmapreduce! grace period skips tasks not started" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    dir = mktempdir()
+
+    @everywhere function fg_grace!(g, tsk, dir)
+        touch(joinpath(dir, "start-$tsk"))
+        sleep(2)
+        g .+= tsk
+        nothing
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(; scratch=tmpdir, minworkers=4, maxworkers=4, skip_tsk_tol_ratio=0.5,
+        grace_period_ratio=0.1, skip_tasks_that_timeout=true)
+    g, tsks = epmapreduce!(zeros(Float32, 5), options, fg_grace!, 1:24, dir)
+    rmprocs(workers())
+
+    started = filter(tsk -> isfile(joinpath(dir, "start-$tsk")), 1:24)
+    @test !isempty(setdiff(tsks, started))
+    @test g == ones(Float32, 5) .* sum(setdiff(1:24, tsks))
+
+    rm(tmpdir; recursive=true, force=true)
+    rm(dir; recursive=true, force=true)
+end
+
+@testset "epmapreduce! grace period skips a task requeued after the window closed" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pids = workers()
+    dir = mktempdir()
+    @everywhere requeue_dir = $dir
+
+    @everywhere function fg_requeue!(g, tsk, dir)
+        touch(joinpath(dir, "start-$tsk"))
+        sleep(2)
+        g .+= tsk
+        touch(joinpath(dir, "done-$tsk"))
+        nothing
+    end
+
+    # The first checkpoint save after more than half of the tasks have run holds its worker until
+    # the grace window has closed, then fails, so its task returns to the pool after the window closed.
+    @everywhere function save_checkpoint_requeue(checkpoint, localresult)
+        if count(startswith("done-"), readdir(requeue_dir)) > 12
+            claimed = try
+                mkdir(joinpath(requeue_dir, "failed"))
+                true
+            catch
+                false
+            end
+            if claimed
+                sleep(8)
+                write(joinpath(requeue_dir, "failed", "at"), string(time()))
+                error("checkpoint save failed after the grace window closed")
+            end
+        end
+        Schedulers.default_save_checkpoint(checkpoint, localresult)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    # retries=1 keeps the worker after the failed save; timeout_multiplier=Inf lets the held save
+    # fail instead of timing out.
+    options = SchedulerOptions(; scratch=tmpdir, minworkers=4, maxworkers=4, addprocs=n -> nothing,
+        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1, skip_tasks_that_timeout=true,
+        save_checkpoint=save_checkpoint_requeue, retries=1, timeout_multiplier=Inf)
+    t = @async epmapreduce!(zeros(Float32, 5), options, fg_requeue!, 1:24, dir)
+    finished = timedwait(() -> istaskdone(t), 300) === :ok
+    @test finished
+
+    if finished
+        g, tsks = fetch(t)
+        started = filter(tsk -> isfile(joinpath(dir, "start-$tsk")), 1:24)
+        requeued = filter(tsk -> isfile(joinpath(dir, "done-$tsk")), tsks)
+        failed_at = parse(Float64, read(joinpath(dir, "failed", "at"), String))
+        @test length(requeued) == 1
+        @test all(tsk -> mtime(joinpath(dir, "start-$tsk")) < failed_at, started)
+        @test !isempty(setdiff(tsks, started))
+        @test g == ones(Float32, 5) .* sum(setdiff(1:24, tsks))
+        # tasks running when the window closed are timed out and their workers removed; none are added back
+        @test workers() ⊆ pids
+    end
+
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+    rm(dir; recursive=true, force=true)
+end
+
+@testset "epmap grace period times out running tasks" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    dir = mktempdir()
+
+    # task 1 is still running when the grace period ends, and is timed out rather than awaited
+    @everywhere function f_slow(tsk, dir)
+        touch(joinpath(dir, "start-$tsk"))
+        sleep(tsk == 1 ? 120 : 2)
+        touch(joinpath(dir, "done-$tsk"))
+        nothing
+    end
+
+    options = SchedulerOptions(; minworkers=4, maxworkers=4, skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1,
+        skip_tasks_that_timeout=true)
+    tic = time()
+    journal, tsks = epmap(options, f_slow, 1:24, dir)
+    elapsed = time() - tic
+
+    started = filter(tsk -> isfile(joinpath(dir, "start-$tsk")), 1:24)
+    done = filter(tsk -> isfile(joinpath(dir, "done-$tsk")), 1:24)
+    @test elapsed < 120
+    @test 1 ∈ tsks
+    @test 1 ∉ done
+    @test !isempty(setdiff(tsks, started))
+    @test setdiff(1:24, tsks) ⊆ done
+
+    rmprocs(workers())
+    rm(dir; recursive=true, force=true)
+end
+
+@testset "epmap grace period without skipping lets tasks finish" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pids = workers()
+    dir = mktempdir()
+
+    @everywhere function f_noskip(tsk, dir)
+        sleep(2)
+        touch(joinpath(dir, "done-$tsk"))
+        nothing
+    end
+
+    added = Ref(0)
+    options = SchedulerOptions(; minworkers=4, maxworkers=4, addprocs=n -> (added[] += n; nothing),
+        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1)
+    journal, tsks = epmap(options, f_noskip, 1:16, dir)
+
+    @test isempty(tsks)
+    @test all(tsk -> isfile(joinpath(dir, "done-$tsk")), 1:16)
+    @test added[] == 0
+    @test workers() == pids
+
+    rmprocs(workers())
+    rm(dir; recursive=true, force=true)
+end
+
 @testset "minworkers > maxworkers" begin
     options = SchedulerOptions(;minworkers=10, maxworkers=5)
 
