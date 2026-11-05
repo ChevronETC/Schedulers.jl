@@ -1137,3 +1137,51 @@ end
     end
     rmprocs(workers())
 end
+
+@testset "epmap with reclaimed workers" begin
+    @everywhere function reclaim_task(tsk, dir)
+        write(joinpath(dir, "task-$tsk"), string(myid()))
+        sleep(2)
+    end
+    succeeded_once(journal, tsks) = all(tsk -> length(journal["tasks"][tsk]["trials"]) == 1 &&
+        journal["tasks"][tsk]["trials"][1]["status"] == "succeeded", tsks)
+
+    # Without groups: the reclaimed worker finishes its task, then leaves.
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    dir = mktempdir()
+    victim = first(workers())
+    reclaim_at = Ref(Inf)
+    options = SchedulerOptions(; minworkers=3, maxworkers=4, reporttasks=false,
+        timeout_function_multiplier=100, addprocs=n -> nothing,
+        reclaim=() -> time() > reclaim_at[] ? [victim] : Int[])
+    run = @async epmap(options, reclaim_task, 1:16, dir)
+    sleep(4)
+    reclaim_at[] = time()
+    journal, _ = fetch(run)
+    @test succeeded_once(journal, 1:16)
+    @test victim ∉ workers()
+    ran = [parse(Int, read(joinpath(dir, "task-$tsk"), String)) for tsk in 1:16]
+    @test count(==(victim), ran) <= 3
+    rmprocs(workers())
+
+    # With groups: the whole group of a reclaimed worker retires once idle.
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    victim = first(workers())
+    siblings = [pid for pid in workers() if pairs[pid] == pairs[victim]]
+    reclaim_at[] = Inf
+    options = SchedulerOptions(; minworkers=2, maxworkers=4, reporttasks=false,
+        timeout_function_multiplier=100, addprocs=n -> nothing,
+        worker_group=pid -> get(pairs, pid, nothing),
+        reclaim=() -> time() > reclaim_at[] ? [victim] : Int[])
+    run = @async epmap(options, reclaim_task, 1:16, mktempdir())
+    sleep(4)
+    reclaim_at[] = time()
+    journal, _ = fetch(run)
+    @test succeeded_once(journal, 1:16)
+    @test isempty(intersect(siblings, workers()))
+    @test length(workers()) == 2
+    rmprocs(workers())
+end

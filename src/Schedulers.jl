@@ -193,6 +193,8 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     group_keys::Dict{Int,Any}
     retiring_groups::Set{Any}
     retiring_pids::Set{Int}
+    reclaim::Union{Nothing,Function}
+    reclaimed_pids::Set{Int}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -237,6 +239,8 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.worker_group,
         Dict{Int,Any}(),
         Set{Any}(),
+        Set{Int}(),
+        options.reclaim,
         Set{Int}(),
     )
 
@@ -626,7 +630,7 @@ end
 
 """
 Update the loop's retiring groups for one pass and return the pids to remove:
-idle retiring groups, plus failed pids whose group was never known.
+idle retiring groups, plus failed or idle reclaimed pids whose group was never known.
 """
 function retire_worker_groups!(eloop::ElasticLoop, bad_pids::Set{Int}, δ::Integer)
     live = workers()
@@ -642,13 +646,33 @@ function retire_worker_groups!(eloop::ElasticLoop, bad_pids::Set{Int}, δ::Integ
         end
     end
     empty!(bad_pids)
+    for pid in eloop.reclaimed_pids
+        key = get(eloop.group_keys, pid, nothing)
+        if key !== nothing
+            push!(eloop.retiring_groups, key)
+        elseif pid ∈ live && pid ∉ busy
+            push!(lone_bad, pid)
+        end
+    end
     eloop.retiring_groups, rm_pids = plan_group_retirement(
         groups, busy, eloop.retiring_groups, max(-δ, 0) - length(lone_bad))
     eloop.retiring_pids = Set{Int}(pid for key in eloop.retiring_groups for pid in groups[key])
     sort!(union(rm_pids, lone_bad))
 end
 
-retiring(eloop::ElasticLoop, pid) = pid ∈ eloop.retiring_pids
+# Pids the resource manager wants back this pass; they get no new work.
+function reclaimed_pids(eloop::ElasticLoop)
+    eloop.reclaim === nothing && return Set{Int}()
+    try
+        Set{Int}(eloop.reclaim())
+    catch e
+        @warn "reclaim callback failed"
+        logerror(e, Logging.Debug)
+        Set{Int}()
+    end
+end
+
+retiring(eloop::ElasticLoop, pid) = pid ∈ eloop.retiring_pids || pid ∈ eloop.reclaimed_pids
 
 """
 Pids of whole groups to remove after a run: every retiring group, then other
@@ -861,6 +885,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
+        eloop.reclaimed_pids = reclaimed_pids(eloop)
         free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids && !retiring(eloop, pid)), workers())
 
         push!(loop_log_cache, "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)")
@@ -919,6 +944,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
 
             group_rm_pids = eloop.worker_group === nothing ? nothing : retire_worker_groups!(eloop, bad_pids, δ)
+            idle_reclaimed = group_rm_pids !== nothing ? Int[] : [pid for pid in eloop.reclaimed_pids
+                if pid ∈ workers() && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce]
             if group_rm_pids !== nothing && !isempty(group_rm_pids)
                 push!(loop_log_cache, "retiring worker groups, calling rmprocs on $group_rm_pids")
                 tsk_addrmprocs_tic = time()
@@ -932,16 +959,17 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
                     end
                 end
-            elseif group_rm_pids === nothing && (δ < 0 || length(bad_pids) > 0)
+            elseif group_rm_pids === nothing && (δ < 0 || length(bad_pids) > 0 || !isempty(idle_reclaimed))
                 rm_pids = Int[]
                 while !isempty(bad_pids)
                     push!(rm_pids, pop!(bad_pids))
                 end
+                append!(rm_pids, setdiff(idle_reclaimed, rm_pids))
                 δ += length(rm_pids)
                 tsk_addrmprocs_tic = time()
                 tsk_addrmprocs = @async begin
                     if δ < 0
-                        free_pids = filter(pid->pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
+                        free_pids = filter(pid->pid ∉ rm_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce, workers())
                         push!(rm_pids, free_pids[1:min(-δ, length(free_pids))]...)
                     end
                     push!(loop_log_cache, "calling rmprocs on $rm_pids")
@@ -1096,6 +1124,7 @@ mutable struct SchedulerOptions{C}
     save_partial_reduction::Function
     gethostname::Function
     worker_group::Union{Nothing,Function}
+    reclaim::Union{Nothing,Function}
 end
 
 function SchedulerOptions(;
@@ -1135,7 +1164,8 @@ function SchedulerOptions(;
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
         gethostname = gethostname,
-        worker_group = nothing)
+        worker_group = nothing,
+        reclaim = nothing)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1172,7 +1202,8 @@ function SchedulerOptions(;
         reduce_trigger,
         save_partial_reduction,
         gethostname,
-        worker_group)
+        worker_group,
+        reclaim)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -1212,7 +1243,8 @@ function Base.copy(options::SchedulerOptions)
         options.reduce_trigger,
         options.save_partial_reduction,
         options.gethostname,
-        options.worker_group)
+        options.worker_group,
+        options.reclaim)
 end
 
 """
@@ -1246,6 +1278,7 @@ and `pmap_kwargs` are as follows.
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
 * `worker_group=nothing` optional `pid->key` mapping; pids with the same key (for example, processes on one VM) are retired together, only once all are idle. Return `nothing` while a pid's group is unknown.
+* `reclaim=nothing` optional method returning the pids the resource manager wants back; they get no new work and are removed once idle (with `worker_group`, their whole group)
 # GXTODO: add doc
 ## Notes
 [1] The number of machines provisioned may be greater than the number of workers in the cluster since with
@@ -1403,6 +1436,7 @@ and `epmap_kwargs` are as follows.
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
 * `worker_group=nothing` optional `pid->key` mapping; pids with the same key are retired together, only once all are idle
+* `reclaim=nothing` optional method returning the pids the resource manager wants back; they get no new work and are removed once idle (with `worker_group`, their whole group)
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
