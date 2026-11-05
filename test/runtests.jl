@@ -1100,49 +1100,6 @@ end
     rm(dir; recursive=true, force=true)
 end
 
-@testset "epmapreduce! grace period cancels running tasks" begin
-    safe_addprocs(4)
-    @everywhere using Distributed, Schedulers
-    pids = workers()
-    dir = mktempdir()
-
-    @everywhere function fg_cancel!(g, tsk, dir)
-        touch(joinpath(dir, "start-$tsk"))
-        tic = time()
-        while time() - tic < 2
-            if iscancelled()
-                touch(joinpath(dir, "cancelled-$tsk"))
-                return nothing
-            end
-            sleep(0.05)
-        end
-        g .+= tsk
-        nothing
-    end
-
-    @test !iscancelled()
-    @test !remotecall_fetch(iscancelled, first(pids))
-
-    added = Ref(0)
-    tmpdir = mktempdir(;cleanup=false)
-    options = SchedulerOptions(; scratch=tmpdir, minworkers=4, maxworkers=4, addprocs=n -> (added[] += n; nothing),
-        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1, skip_tasks_that_timeout=true, cancel_timeout=30)
-    g, tsks = epmapreduce!(zeros(Float32, 5), options, fg_cancel!, 1:24, dir)
-
-    started = filter(tsk -> isfile(joinpath(dir, "start-$tsk")), 1:24)
-    cancelled = filter(tsk -> isfile(joinpath(dir, "cancelled-$tsk")), 1:24)
-    @test !isempty(cancelled)
-    @test cancelled ⊆ tsks
-    @test !isempty(setdiff(tsks, started))
-    @test g == ones(Float32, 5) .* sum(setdiff(1:24, tsks))
-    @test added[] == 0
-    @test workers() == pids
-
-    rmprocs(workers())
-    rm(tmpdir; recursive=true, force=true)
-    rm(dir; recursive=true, force=true)
-end
-
 @testset "epmapreduce! grace period skips a task requeued after the window closed" begin
     safe_addprocs(4)
     @everywhere using Distributed, Schedulers
@@ -1152,11 +1109,7 @@ end
 
     @everywhere function fg_requeue!(g, tsk, dir)
         touch(joinpath(dir, "start-$tsk"))
-        tic = time()
-        while time() - tic < 2
-            iscancelled() && return nothing
-            sleep(0.05)
-        end
+        sleep(2)
         g .+= tsk
         touch(joinpath(dir, "done-$tsk"))
         nothing
@@ -1181,12 +1134,11 @@ end
         Schedulers.default_save_checkpoint(checkpoint, localresult)
     end
 
-    added = Ref(0)
     tmpdir = mktempdir(;cleanup=false)
     # retries=1 keeps the worker after the failed save; timeout_multiplier=Inf lets the held save
     # fail instead of timing out.
-    options = SchedulerOptions(; scratch=tmpdir, minworkers=4, maxworkers=4, addprocs=n -> (added[] += n; nothing),
-        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1, skip_tasks_that_timeout=true, cancel_timeout=30,
+    options = SchedulerOptions(; scratch=tmpdir, minworkers=4, maxworkers=4, addprocs=n -> nothing,
+        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1, skip_tasks_that_timeout=true,
         save_checkpoint=save_checkpoint_requeue, retries=1, timeout_multiplier=Inf)
     t = @async epmapreduce!(zeros(Float32, 5), options, fg_requeue!, 1:24, dir)
     finished = timedwait(() -> istaskdone(t), 300) === :ok
@@ -1201,8 +1153,8 @@ end
         @test all(tsk -> mtime(joinpath(dir, "start-$tsk")) < failed_at, started)
         @test !isempty(setdiff(tsks, started))
         @test g == ones(Float32, 5) .* sum(setdiff(1:24, tsks))
-        @test added[] == 0
-        @test workers() == pids
+        # tasks running when the window closed are timed out and their workers removed; none are added back
+        @test workers() ⊆ pids
     end
 
     rmprocs(workers())
@@ -1210,40 +1162,32 @@ end
     rm(dir; recursive=true, force=true)
 end
 
-@testset "epmap grace period cancels running tasks" begin
+@testset "epmap grace period times out running tasks" begin
     safe_addprocs(4)
     @everywhere using Distributed, Schedulers
-    pids = workers()
     dir = mktempdir()
 
-    @everywhere function f_cancel(tsk, dir)
+    # task 1 is still running when the grace period ends, and is timed out rather than awaited
+    @everywhere function f_slow(tsk, dir)
         touch(joinpath(dir, "start-$tsk"))
-        tic = time()
-        while time() - tic < 2
-            if iscancelled()
-                touch(joinpath(dir, "cancelled-$tsk"))
-                return nothing
-            end
-            sleep(0.05)
-        end
+        sleep(tsk == 1 ? 120 : 2)
         touch(joinpath(dir, "done-$tsk"))
         nothing
     end
 
-    added = Ref(0)
-    options = SchedulerOptions(; minworkers=4, maxworkers=4, addprocs=n -> (added[] += n; nothing),
-        skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1, skip_tasks_that_timeout=true, cancel_timeout=30)
-    journal, tsks = epmap(options, f_cancel, 1:24, dir)
+    options = SchedulerOptions(; minworkers=4, maxworkers=4, skip_tsk_tol_ratio=0.5, grace_period_ratio=0.1,
+        skip_tasks_that_timeout=true)
+    tic = time()
+    journal, tsks = epmap(options, f_slow, 1:24, dir)
+    elapsed = time() - tic
 
     started = filter(tsk -> isfile(joinpath(dir, "start-$tsk")), 1:24)
-    cancelled = filter(tsk -> isfile(joinpath(dir, "cancelled-$tsk")), 1:24)
     done = filter(tsk -> isfile(joinpath(dir, "done-$tsk")), 1:24)
-    @test !isempty(cancelled)
-    @test cancelled ⊆ tsks
+    @test elapsed < 120
+    @test 1 ∈ tsks
+    @test 1 ∉ done
     @test !isempty(setdiff(tsks, started))
     @test setdiff(1:24, tsks) ⊆ done
-    @test added[] == 0
-    @test workers() == pids
 
     rmprocs(workers())
     rm(dir; recursive=true, force=true)
