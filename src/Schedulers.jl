@@ -189,6 +189,10 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
+    worker_group::Union{Nothing,Function}
+    group_keys::Dict{Int,Any}
+    retiring_groups::Set{Any}
+    retiring_pids::Set{Int}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -230,6 +234,10 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
+        options.worker_group,
+        Dict{Int,Any}(),
+        Set{Any}(),
+        Set{Int}(),
     )
 
     if !isreduce
@@ -554,6 +562,111 @@ function robust_rmprocs(pids; waitfor)
     end
 end
 
+"""
+    worker_groups!(group_keys, worker_group, pids) -> (groups, unknown)
+
+Group the workers in `pids` (excluding the master) by `worker_group(pid)`,
+caching each pid's key in `group_keys` once known. Pids whose group is not
+known yet (`worker_group` returned `nothing` or failed) are returned in `unknown`.
+"""
+function worker_groups!(group_keys::Dict{Int,Any}, worker_group::Function, pids)
+    groups = Dict{Any,Vector{Int}}()
+    unknown = Int[]
+    for pid in pids
+        pid == 1 && continue
+        key = get(group_keys, pid, nothing)
+        if key === nothing
+            key = try
+                worker_group(pid)
+            catch e
+                @warn "worker_group failed for pid=$pid"
+                logerror(e, Logging.Debug)
+                nothing
+            end
+            if key === nothing
+                push!(unknown, pid)
+                continue
+            end
+            group_keys[pid] = key
+        end
+        push!(get!(Vector{Int}, groups, key), pid)
+    end
+    foreach(sort!, values(groups))
+    groups, unknown
+end
+
+"""
+    plan_group_retirement(groups, busy, retiring, excess) -> (retiring, rm_pids)
+
+One pass of group-aware retirement. `groups` maps keys to their live pids,
+`busy` holds pids running map or reduce work, `retiring` holds the keys of
+groups already retiring, and `excess` is the number of workers to shed.
+Retiring groups count toward `excess`; further groups retire, fewest busy
+workers first, only while whole groups fit in what remains. Retiring groups
+that are entirely idle are returned for removal. Groups stay retiring until
+no member is alive, so none of their workers receives new work.
+"""
+function plan_group_retirement(groups::AbstractDict, busy, retiring, excess::Integer)
+    retiring = Set{Any}(key for key in retiring if haskey(groups, key))
+    shed = excess - sum(key -> length(groups[key]), retiring; init=0)
+    candidates = sort!([key for key in keys(groups) if key ∉ retiring];
+        by=key -> (count(in(busy), groups[key]), length(groups[key]), first(groups[key])))
+    for key in candidates
+        n = length(groups[key])
+        n <= shed || continue
+        push!(retiring, key)
+        shed -= n
+    end
+    rm_pids = Int[]
+    for key in retiring
+        any(in(busy), groups[key]) || append!(rm_pids, groups[key])
+    end
+    retiring, sort!(rm_pids)
+end
+
+"""
+Update the loop's retiring groups for one pass and return the pids to remove:
+idle retiring groups, plus failed pids whose group was never known.
+"""
+function retire_worker_groups!(eloop::ElasticLoop, bad_pids::Set{Int}, δ::Integer)
+    live = workers()
+    groups, _ = worker_groups!(eloop.group_keys, eloop.worker_group, live)
+    busy = union(eloop.used_pids_map, eloop.used_pids_reduce)
+    lone_bad = Int[]
+    for pid in bad_pids
+        key = get(eloop.group_keys, pid, nothing)
+        if key !== nothing
+            push!(eloop.retiring_groups, key)
+        elseif pid ∈ live
+            push!(lone_bad, pid)
+        end
+    end
+    empty!(bad_pids)
+    eloop.retiring_groups, rm_pids = plan_group_retirement(
+        groups, busy, eloop.retiring_groups, max(-δ, 0) - length(lone_bad))
+    eloop.retiring_pids = Set{Int}(pid for key in eloop.retiring_groups for pid in groups[key])
+    sort!(union(rm_pids, lone_bad))
+end
+
+retiring(eloop::ElasticLoop, pid) = pid ∈ eloop.retiring_pids
+
+"""
+Pids of whole groups to remove after a run: every retiring group, then other
+groups (smallest first) while at least `minworkers` workers remain.
+"""
+function trim_worker_groups(groups::AbstractDict, minworkers::Integer, retiring=Set{Any}())
+    remaining = sum(length, values(groups); init=0)
+    rm_pids = Int[]
+    for key in sort!(collect(keys(groups));
+            by=key -> (key ∉ retiring, length(groups[key]), first(groups[key])))
+        n = length(groups[key])
+        (key ∈ retiring || remaining - n >= minworkers) || continue
+        append!(rm_pids, groups[key])
+        remaining -= n
+    end
+    sort!(rm_pids)
+end
+
 function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
@@ -748,7 +861,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             end
         end
 
-        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids), workers())
+        free_pids = filter(pid->(pid ∈ eloop.initialized_pids && pid ∉ eloop.used_pids_map && pid ∉ eloop.used_pids_reduce && pid ∉ bad_pids && !retiring(eloop, pid)), workers())
 
         push!(loop_log_cache, "workers()=$(workers()), free_pids=$free_pids, used_pids_map=$(eloop.used_pids_map), used_pids_reduce=$(eloop.used_pids_reduce), bad_pids=$bad_pids, initialized_pids=$(eloop.initialized_pids)")
         push!(loop_log_cache, "channel lengths: map_add=$(eloop.pid_channel_map_add.n_avail_items), map_remove=$(eloop.pid_channel_map_remove.n_avail_items), reduce_add=$(eloop.pid_channel_reduce_add.n_avail_items), reduce_remove=$(eloop.pid_channel_reduce_remove.n_avail_items)")
@@ -805,7 +918,21 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                 logerror(e, Logging.Debug)
             end
 
-            if δ < 0 || length(bad_pids) > 0
+            group_rm_pids = eloop.worker_group === nothing ? nothing : retire_worker_groups!(eloop, bad_pids, δ)
+            if group_rm_pids !== nothing && !isempty(group_rm_pids)
+                push!(loop_log_cache, "retiring worker groups, calling rmprocs on $group_rm_pids")
+                tsk_addrmprocs_tic = time()
+                tsk_addrmprocs = @async begin
+                    try
+                        robust_rmprocs(group_rm_pids; waitfor=addrmprocs_timeout)
+                    catch
+                        @warn "unable to run rmprocs on $group_rm_pids in $addrmprocs_timeout seconds."
+                    end
+                    for rm_pid in group_rm_pids
+                        haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
+                    end
+                end
+            elseif group_rm_pids === nothing && (δ < 0 || length(bad_pids) > 0)
                 rm_pids = Int[]
                 while !isempty(bad_pids)
                     push!(rm_pids, pop!(bad_pids))
@@ -900,16 +1027,25 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     # ensure we are left with epmap_minworkers
     @debug "elastic loop, trimminig workers"
     try
-        _workers = workers()
-        if 1 ∈ _workers
-            popfirst!(_workers)
-        end
-        n = length(_workers) - eloop.epmap_minworkers()
-        if n > 0
-            @debug "trimming $n workers"
-            tsk_addrmprocs_tic = time()
-            tsk_addrmprocs = robust_rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
-            @debug "done trimming $n workers"
+        if eloop.worker_group !== nothing
+            groups, unknown = worker_groups!(eloop.group_keys, eloop.worker_group, workers())
+            rm_pids = trim_worker_groups(groups, eloop.epmap_minworkers() - length(unknown), eloop.retiring_groups)
+            if !isempty(rm_pids)
+                @debug "trimming worker groups" rm_pids
+                robust_rmprocs(rm_pids; waitfor=addrmprocs_timeout)
+            end
+        else
+            _workers = workers()
+            if 1 ∈ _workers
+                popfirst!(_workers)
+            end
+            n = length(_workers) - eloop.epmap_minworkers()
+            if n > 0
+                @debug "trimming $n workers"
+                tsk_addrmprocs_tic = time()
+                tsk_addrmprocs = robust_rmprocs(workers()[1:n]; waitfor=addrmprocs_timeout)
+                @debug "done trimming $n workers"
+            end
         end
     catch e
         @warn "problem trimming workers after map-reduce"
@@ -959,6 +1095,7 @@ mutable struct SchedulerOptions{C}
     reduce_trigger::Function
     save_partial_reduction::Function
     gethostname::Function
+    worker_group::Union{Nothing,Function}
 end
 
 function SchedulerOptions(;
@@ -997,7 +1134,8 @@ function SchedulerOptions(;
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
-        gethostname = gethostname)
+        gethostname = gethostname,
+        worker_group = nothing)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1033,7 +1171,8 @@ function SchedulerOptions(;
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction,
-        gethostname)
+        gethostname,
+        worker_group)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -1072,7 +1211,8 @@ function Base.copy(options::SchedulerOptions)
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction,
-        options.gethostname)
+        options.gethostname,
+        options.worker_group)
 end
 
 """
@@ -1105,6 +1245,7 @@ and `pmap_kwargs` are as follows.
 * `reporttasks=true` log task assignment
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
+* `worker_group=nothing` optional `pid->key` mapping; pids with the same key (for example, processes on one VM) are retired together, only once all are idle. Return `nothing` while a pid's group is unknown.
 # GXTODO: add doc
 ## Notes
 [1] The number of machines provisioned may be greater than the number of workers in the cluster since with
@@ -1156,7 +1297,7 @@ function epmap_map(options::SchedulerOptions, f::Function, tasks, eloop::Elastic
                 end
 
                 @debug "map task loop exit condition" pid length(eloop.tsk_pool_todo) eloop.interrupted
-                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted
+                if length(eloop.tsk_pool_todo) == 0 || eloop.interrupted || retiring(eloop, pid)
                     @debug "putting $pid onto map_remove channel"
                     put!(eloop.pid_channel_map_remove, (pid,false))
                     break
@@ -1261,6 +1402,7 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
+* `worker_group=nothing` optional `pid->key` mapping; pids with the same key are retired together, only once all are idle
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
@@ -1431,7 +1573,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
 
                 @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
                 @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
-                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed)
+                if isempty(epmap_eloop.tsk_pool_todo) || epmap_eloop.interrupted || (epmap_eloop.is_reduce_triggered && !epmap_eloop.checkpoints_are_flushed) || retiring(epmap_eloop, pid)
                     if epmap_eloop.checkpoints[pid] !== nothing
                         push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
                     end
@@ -1642,7 +1784,7 @@ function epmapreduce_reduce!(result::T, epmap_eloop, epmap_journal, options) whe
                 n_checkpoints = epmap_eloop.is_reduce_triggered ? length(epmap_eloop.reduce_checkpoints_snapshot) : length(epmap_eloop.reduce_checkpoints)
 
                 @debug "reduce, pid=$pid, at exit condition, n_checkpoints=$n_checkpoints"
-                if n_checkpoints < 2
+                if n_checkpoints < 2 || retiring(epmap_eloop, pid)
                     unlock(l)
                     @debug "reduce, popping pid=$pid from dirty list"
                     pop!(epmap_eloop.reduce_checkpoints_is_dirty, pid)
