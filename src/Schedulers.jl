@@ -152,6 +152,133 @@ end
 # for performance metrics, track when the pid is started
 const _pid_up_timestamp = Dict{Int, Float64}()
 
+"""
+    DemandObservation(workers, phase, evaluated_at)
+
+One evaluation of how many worker processes an elastic loop can use. `phase` is
+`:active` while it dispatches work, `:idle` after it finished normally, and
+`:stopping` after an error or interrupt. `evaluated_at` is the `time_ns()` when
+the evaluation began.
+"""
+struct DemandObservation
+    workers::Int
+    phase::Symbol
+    evaluated_at::UInt64
+end
+
+"""
+    DemandFeed(publish; queue_limit=16)
+
+Demand hooks for a resource manager that admits capacity against the
+application's current need. Pass it as `SchedulerOptions(; demand=feed)`.
+
+Each pass of the elastic loop evaluates the useful number of workers,
+`clamp(remaining tasks and reductions, minworkers, maxworkers)`, and hands it to
+`publish(::DemandObservation)` on a separate task. The loop never waits for
+`publish`; an observation not yet delivered is replaced by a newer one. When the
+loop ends it publishes `:idle` with the number of workers it kept, or
+`:stopping` after an error or interrupt. In demand mode the loop never calls
+`addprocs`: growth belongs to the resource manager. Retirement is unchanged.
+
+[`request_evaluation`](@ref) answers an admission check with an evaluation made
+after the request. A feed serves one loop at a time and can be reused by
+consecutive loops.
+"""
+mutable struct DemandFeed
+    publish::Function
+    queue_limit::Int
+    lock::ReentrantLock
+    attached::Bool
+    resting::DemandObservation        # the answer while no loop is attached
+    pending::Union{Nothing,DemandObservation}
+    delivering::Bool
+    requests::Vector{Tuple{UInt64,Channel{DemandObservation}}}
+end
+
+DemandFeed(publish::Function; queue_limit::Integer=16) = DemandFeed(publish, Int(queue_limit),
+    ReentrantLock(), false, DemandObservation(0, :idle, time_ns()), nothing, false,
+    Tuple{UInt64,Channel{DemandObservation}}[])
+
+"""
+    request_evaluation(feed; timeout=10) -> Union{DemandObservation,Nothing}
+
+A fresh evaluation of the loop's demand: the first that began after this call.
+With no loop running, the resting state (`:idle` or `:stopping`) is returned,
+evaluated now. Returns `nothing` when the loop does not answer within `timeout`
+seconds or too many requests are waiting; treat that as "do not admit".
+"""
+function request_evaluation(feed::DemandFeed; timeout::Real=10)
+    received = time_ns()
+    reply = Channel{DemandObservation}(1)
+    queued = lock(feed.lock) do
+        feed.attached || return DemandObservation(feed.resting.workers, feed.resting.phase, received)
+        length(feed.requests) < feed.queue_limit || return false
+        push!(feed.requests, (received, reply))
+        true
+    end
+    queued isa DemandObservation && return queued
+    queued || return nothing
+    timedwait(() -> isready(reply), Float64(timeout); pollint=0.02)
+    lock(feed.lock) do
+        filter!(request -> request[2] !== reply, feed.requests)
+    end
+    isready(reply) ? take!(reply) : nothing
+end
+
+function _attach!(feed::DemandFeed)
+    lock(feed.lock) do
+        feed.attached && throw(ArgumentError("a DemandFeed serves one elastic loop at a time"))
+        feed.attached = true
+    end
+    nothing
+end
+
+# Answer the requests `obs` was evaluated after (all of them when detaching),
+# then queue `obs` for publishing.
+function _observe!(feed::DemandFeed, obs::DemandObservation; answer_all::Bool=false)
+    lock(feed.lock) do
+        filter!(feed.requests) do (received, reply)
+            (answer_all || received <= obs.evaluated_at) || return true
+            put!(reply, obs)
+            false
+        end
+        feed.pending = obs
+        if !feed.delivering
+            feed.delivering = true
+            @async _deliver(feed)
+        end
+    end
+    nothing
+end
+
+function _deliver(feed::DemandFeed)
+    while true
+        obs = lock(feed.lock) do
+            next = feed.pending
+            feed.pending = nothing
+            next === nothing && (feed.delivering = false)
+            next
+        end
+        obs === nothing && return
+        try
+            feed.publish(obs)
+        catch e
+            @warn "demand publish failed"
+            logerror(e, Logging.Debug)
+        end
+    end
+end
+
+function _detach!(feed::DemandFeed, obs::DemandObservation; flush_timeout::Real=5)
+    lock(feed.lock) do
+        feed.attached = false
+        feed.resting = obs
+    end
+    _observe!(feed, obs; answer_all=true)
+    timedwait(() -> lock(() -> !feed.delivering, feed.lock), Float64(flush_timeout); pollint=0.02)
+    nothing
+end
+
 mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Function,FMaxWorkers<:Function,FMaxReduceWorkers<:Function,FNWorkers<:Function,FTrigger<:Function,FSave<:Function,FQuantum<:Function,T,C}
     epmap_use_master::Bool
     initialized_pids::Set{Int}
@@ -189,6 +316,7 @@ mutable struct ElasticLoop{FAddProcs<:Function,FInit<:Function,FMinWorkers<:Func
     null_tsk_runtime_threshold::Float64
     skip_tsk_tol_ratio::Float64
     grace_period_ratio::Float64
+    demand::Union{Nothing,DemandFeed}
 end
 function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
     _tsk_pool_todo = vec(collect(tasks))
@@ -230,6 +358,7 @@ function ElasticLoop(::Type{C}, tasks, options; isreduce) where {C}
         options.null_tsk_runtime_threshold,
         options.skip_tsk_tol_ratio,
         options.grace_period_ratio,
+        options.demand,
     )
 
     if !isreduce
@@ -698,6 +827,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         end
 
         local _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers,_epmap_quantum
+        evaluated_at = time_ns()
         try
             _epmap_nworkers,_epmap_minworkers,_epmap_maxworkers,_epmap_maxreduceworkers,_epmap_quantum = eloop.epmap_nworkers(),eloop.epmap_minworkers(),eloop.epmap_maxworkers(),eloop.epmap_maxreduceworkers(),eloop.epmap_quantum()
         catch e
@@ -794,6 +924,11 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
             logerror(e, Logging.Debug)
         end
 
+        if eloop.demand !== nothing
+            _observe!(eloop.demand, DemandObservation(
+                clamp(n_remaining_tasks, _epmap_minworkers, _epmap_maxworkers), :active, evaluated_at))
+        end
+
         push!(loop_log_cache, "add at most $_epmap_quantum machines when there are less than $_epmap_maxworkers, and there are less then the current task count: $n_remaining_tasks (δ=$δ, n=$_epmap_nworkers)")
         push!(loop_log_cache, "remove machine when there are more than $_epmap_minworkers, and less tasks ($n_remaining_tasks) than workers ($_epmap_nworkers), and when those workers are free (currently there are $_epmap_nworkers workers, $(length(eloop.used_pids_map)) map workers, and $(length(eloop.used_pids_reduce)) reduce workers)")
 
@@ -828,7 +963,7 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
                         haskey(wrkrs, rm_pid) && delete!(wrkrs, rm_pid)
                     end
                 end
-            elseif δ > 0
+            elseif δ > 0 && eloop.demand === nothing
                 try
                     push!(loop_log_cache, "adding $δ procs")
                     tsk_addrmprocs_tic = time()
@@ -920,6 +1055,22 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
     nothing
 end
 
+# Run the elastic loop with its demand feed attached; publish how it ended, however it ends.
+function with_demand(f::Function, eloop::ElasticLoop, tasks_failed::Function)
+    feed = eloop.demand
+    feed === nothing && return f()
+    _attach!(feed)
+    finished = false
+    try
+        result = f()
+        finished = !(eloop.errored || eloop.interrupted || tasks_failed())
+        result
+    finally
+        _detach!(feed, DemandObservation(count(!=(1), workers()),
+            finished ? :idle : :stopping, time_ns()))
+    end
+end
+
 default_reducer!(x, y) = (x .+= y; nothing)
 
 mutable struct SchedulerOptions{C}
@@ -959,6 +1110,7 @@ mutable struct SchedulerOptions{C}
     reduce_trigger::Function
     save_partial_reduction::Function
     gethostname::Function
+    demand::Union{Nothing,DemandFeed}
 end
 
 function SchedulerOptions(;
@@ -997,7 +1149,8 @@ function SchedulerOptions(;
         rm_checkpoint = default_rm_checkpoint,
         reduce_trigger = channel->nothing,
         save_partial_reduction = checkpoint->nothing,
-        gethostname = gethostname)
+        gethostname = gethostname,
+        demand = nothing)
     SchedulerOptions(
         retries,
         maxerrors,
@@ -1033,7 +1186,8 @@ function SchedulerOptions(;
         rm_checkpoint,
         reduce_trigger,
         save_partial_reduction,
-        gethostname)
+        gethostname,
+        demand)
 end
 
 function Base.copy(options::SchedulerOptions)
@@ -1072,7 +1226,8 @@ function Base.copy(options::SchedulerOptions)
         options.rm_checkpoint,
         options.reduce_trigger,
         options.save_partial_reduction,
-        options.gethostname)
+        options.gethostname,
+        options.demand)
 end
 
 """
@@ -1096,7 +1251,7 @@ and `pmap_kwargs` are as follows.
 * `maxworkers=Distributed.nworkers` method (or value) giving the maximum number of workers to elastically expand to
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=Distributed.nworkers` the number of machines currently provisioned for work[1]
-* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `quantum=()->32` the maximum number of workers to elastically add at a time (unused with `demand`, where the loop does not call `addprocs`)
 * `addprocs=n->Distributed.addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated[2].
@@ -1105,6 +1260,7 @@ and `pmap_kwargs` are as follows.
 * `reporttasks=true` log task assignment
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
+* `demand=nothing` optional [`DemandFeed`](@ref): publish the loop's demand to a resource manager, which admits growth, instead of calling `addprocs`
 # GXTODO: add doc
 ## Notes
 [1] The number of machines provisioned may be greater than the number of workers in the cluster since with
@@ -1117,7 +1273,9 @@ function epmap(options::SchedulerOptions, f::Function, tasks, args...; kwargs...
     journal = journal_init(tasks, options.journal_init_callback; reduce=false)
 
     tsk_map = @async epmap_map(options, f, tasks, eloop, journal, args...; kwargs...)
-    loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    with_demand(eloop, () -> istaskfailed(tsk_map)) do
+        loop(eloop, journal, options.journal_task_callback, tsk_map, @async nothing)
+    end
     fetch(tsk_map)
 end
 
@@ -1247,7 +1405,7 @@ and `epmap_kwargs` are as follows.
 * `maxreduceworkers=typemax(Int)` maximum number of workers that can be used for the reduction step[3]
 * `usemaster=false` assign tasks to the master process?
 * `nworkers=nworkers` the number of machines currently provisioned for work[4]
-* `quantum=()->32` the maximum number of workers to elastically add at a time
+* `quantum=()->32` the maximum number of workers to elastically add at a time (unused with `demand`, where the loop does not call `addprocs`)
 * `addprocs=n->addprocs(n)` method for adding n processes (will depend on the cluster manager being used)
 * `init=pid->nothing` after starting a worker, this method is run on that worker.
 * `preempt_channel_future=pid->nothing` method for retrieving a `Future` that hold a `Channel` through which preemption events are communicated.
@@ -1261,6 +1419,7 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
+* `demand=nothing` optional [`DemandFeed`](@ref): publish the loop's demand to a resource manager, which admits growth, instead of calling `addprocs`
 ## Notes
 [1] The signature is `my_save_checkpoint(checkpoint_file, x)` where `checkpoint_file` is the file that will be
 written to, and `x` is the data that will be written.
@@ -1342,7 +1501,9 @@ function epmapreduce!(result::T, options::SchedulerOptions, f::Function, tasks, 
         tsk_reduce = @async epmapreduce_reduce!(result, epmap_eloop, epmap_journal, options)
 
         @debug "waiting for tsk_loop"
-        loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        with_demand(epmap_eloop, () -> istaskfailed(tsk_map) || istaskfailed(tsk_reduce)) do
+            loop(epmap_eloop, epmap_journal, options.journal_task_callback, tsk_map, tsk_reduce)
+        end
         @debug "fetching from tsk_reduce"
         result = fetch(tsk_reduce)
         @debug "finished fetching from tsk_reduce"
@@ -1882,5 +2043,6 @@ default_load_checkpoint(checkpoint) = deserialize(checkpoint)
 default_rm_checkpoint(checkpoint) = isfile(checkpoint) && rm(checkpoint)
 
 export SchedulerOptions, epmap, epmapreduce!, trigger_reduction!, total_tasks, pending_tasks, complete_tasks
+export DemandFeed, DemandObservation, request_evaluation
 
 end
