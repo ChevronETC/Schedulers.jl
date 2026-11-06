@@ -1562,11 +1562,11 @@ and `epmap_kwargs` are as follows.
 * `reducer! = default_reducer!` the method used to reduce the result. The default is `(x,y)->(x .+= y)`.  Not used when `reduce_streaming=true`[7]
 * `save_checkpoint = default_save_checkpoint` the method used to save checkpoints[1]
 * `load_checkpoint = default_load_checkpoint` the method used to load a checkpoint[2]
-* `zeros = ()->zeros(eltype(result), size(result))` the method used to initialize partial reductions
+* `zeros = ()->zeros(eltype(result), size(result))` the method used to initialize partial reductions, called on a worker once it has a task
 * `retries=0` number of times to retry a task on a given machine before removing that machine from the cluster
 * `maxerrors=Inf` the maximum number of errors before we give-up and exit
 * `timeout_multiplier=5` if any (miscellaneous) task takes `timeout_multiplier` longer than the median (miscellaneous) task time, then abort that task; removing a checkpoint is given at least a minute
-* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) median (actual) task time, then abort that task
+* `timeout_function_multiplier=5` if any (actual) task takes `timeout_function_multiplier` longer than the (robust) median (actual) task time, then abort that task; initializing the partial reduction of a worker (`zeros`, or loading its last checkpoint) is not part of the time of a task: it times out like saving a checkpoint, but not in less than a minute
 * `null_tsk_runtime_threshold=0` the maximum duration (in seconds) for a task to be considered insignificant or ‘null’ and thus not included in the timeout measurement.
 * `skip_tsk_tol_ratio=0` the ratio of the total number of tasks that can be skipped
 * `grace_period_ratio=0` the ratio between the "grace period" (when enough number of tasks are done) over the (robust) median task time
@@ -1732,6 +1732,68 @@ function epmapreduce_fetch_apply(_localresult, ::Type{T}, epmapreduce_fetch, f, 
     nothing
 end
 
+#=
+The local result of a map worker, which it reduces its tasks into: zeros, or its last checkpoint after a later
+checkpoint failed, since the task that it was saving runs again.
+=#
+function new_localresult(options, checkpoint, pid, ::Type{T}) where {T}
+    if checkpoint === nothing
+        remotecall_default_threadpool(options.zeros, pid)
+    elseif options.reduce_streaming
+        remotecall_default_threadpool(load_checkpoint_streaming, pid, options.zeros, checkpoint, T, options.reduce_chunkbytes, options.reduce_depth)
+    else
+        remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, checkpoint, T)
+    end
+end
+
+# making a local result does not time out in less than a minute (see `prepare_localresult!`)
+const LOCALRESULT_MIN_TIMEOUT = 60.0
+
+#=
+Make the local result of the map worker `pid`, which has a task, unless it has one, and wait until it is ready.  It is
+only made once the worker has a task: workers are given to the map whenever tasks are left, and most find none, for
+example when a task that failed is put back, as they all race for it.
+
+Making it is not part of the time of the task: allocating a large local result can take much longer than a task (for
+example 30 seconds for 63 GB, with tasks of 5 seconds), and the first task of every new worker would then time out
+once the median task time is set by the later tasks of other workers.  It times out like saving a checkpoint, since
+loading one takes about as long, but not in less than a minute, since allocating can take longer than saving a small
+checkpoint.
+=#
+function prepare_localresult!(localresults, pid, checkpoint, checkpoint_times, tsk_count, options, ::Type{T}) where {T}
+    haskey(localresults, pid) || (localresults[pid] = new_localresult(options, checkpoint, pid, T))
+    # waits on the worker, without fetching the local result, and throws if it could not be made
+    t = @async wait(localresults[pid])
+    tic = time()
+    wait_for(t) do
+        if time() - tic > maximum_task_time(TimesAtLeast(checkpoint_times, LOCALRESULT_MIN_TIMEOUT, options.timeout_multiplier), tsk_count, options.timeout_multiplier)
+            throw(TimeoutException(pid, time() - tic))
+        end
+    end
+    fetch(t)
+    nothing
+end
+
+#=
+Stop holding the local result of a map worker, so that the worker frees it at its next garbage collection, rather than
+once the master's garbage collector collects the reference.  A worker that is given to the map again and again, with
+a task each time, would otherwise hold a local result from each time, and can run out of memory.
+=#
+function drop_localresult!(localresults, pid)
+    localresult = pop!(localresults, pid, nothing)
+    localresult === nothing || finalize(localresult)
+    nothing
+end
+
+# the map worker `pid` leaves the map: its last checkpoint goes to the reduction, and its local result is dropped
+function leave_map!(epmap_eloop, localresults, pid)
+    checkpoint = get(epmap_eloop.checkpoints, pid, nothing)
+    checkpoint === nothing || push!(epmap_eloop.reduce_checkpoints, checkpoint)
+    drop_localresult!(localresults, pid)
+    pop!(epmap_eloop.checkpoints, pid, nothing)
+    nothing
+end
+
 function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, args...; kwargs...) where {T}
     localresults = Dict{Int, Future}()
 
@@ -1750,7 +1812,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @debug "map, pid=$pid"
         pid == -1 && break # pid=-1 is put onto the channel in the above elastic_loop when tsk_pool_done is full.
 
-        if pid ∈ keys(localresults) # task loop has already run for this pid
+        if haskey(epmap_eloop.checkpoints, pid) # the task loop already runs for this pid
             put!(epmap_eloop.pid_channel_map_remove, (pid,false))
             continue
         end
@@ -1770,22 +1832,13 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         @debug "map, done retrieving preempt channel future, pid=$pid"
 
         @async try
-            # This is an async remotecall.  Exceptions will be caught the first time we fetch `localresults[pid]` in the `epmapreduce_fetch_apply` method.
-            # this is in the async block for the case where `options.zeros` sends a large amount of data to pid (should not be true in general)
-            @debug "map, getting local result, pid=$pid"
-            localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
-            @debug "map, done getting local result, pid=$pid"
-
+            # the local result is made once the worker has a task (see `prepare_localresult!`)
             while true
                 @debug "map, pid=$pid, interrupted=$(epmap_eloop.interrupted), isempty(epmap_eloop.tsk_pool_todo)=$(isempty(epmap_eloop.tsk_pool_todo))"
                 @debug "epmap_eloop.is_reduce_triggered=$(epmap_eloop.is_reduce_triggered)"
                 # a worker with nothing left to do leaves before it is looked up
                 if map_worker_done(epmap_eloop)
-                    if epmap_eloop.checkpoints[pid] !== nothing
-                        push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                    end
-                    pop!(localresults, pid)
-                    pop!(epmap_eloop.checkpoints, pid)
+                    leave_map!(epmap_eloop, localresults, pid)
                     put!(epmap_eloop.pid_channel_map_remove, (pid,false))
                     # once the last map worker is done, reducers can start on spare work right away
                     notify(epmap_eloop.wakeup)
@@ -1800,11 +1853,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     catch e
                         @warn "unable to determine hostname for pid=$pid within 60 seconds."
                         logerror(e, Logging.Debug)
-                        if epmap_eloop.checkpoints[pid] !== nothing
-                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                        end
-                        pop!(localresults, pid)
-                        pop!(epmap_eloop.checkpoints, pid)
+                        leave_map!(epmap_eloop, localresults, pid)
                         put!(epmap_eloop.pid_channel_map_remove, (pid,true))
                         notify(epmap_eloop.wakeup)
                         @debug "...finished cleanup for hostname failure for pid=$pid."
@@ -1833,6 +1882,28 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                 end
                 @debug "map, got next task for pid=$pid: $tsk"
 
+                # the local result, which is not part of the time of the task
+                try
+                    @debug "map, preparing the local result, pid=$pid"
+                    prepare_localresult!(localresults, pid, epmap_eloop.checkpoints[pid], checkpoint_times, epmap_eloop.tsk_count, options, T)
+                    @debug "map, the local result is ready, pid=$pid"
+                catch e
+                    @warn "pid=$pid ($hostname), task loop, caught exception while preparing the local result"
+                    # the task did not run
+                    push!(epmap_eloop.tsk_pool_todo, tsk)
+                    # it is made again for the next task
+                    drop_localresult!(localresults, pid)
+                    r = handle_exception(e, pid, hostname, epmap_eloop.pid_failures, options.maxerrors, options.retries)
+                    epmap_eloop.interrupted = r.do_interrupt
+                    epmap_eloop.errored = r.do_error
+                    if r.do_break || r.do_interrupt
+                        leave_map!(epmap_eloop, localresults, pid)
+                        put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
+                        break
+                    end
+                    continue
+                end
+
                 # compute and reduce
                 try
                     options.reporttasks && @info "running task $tsk on process $pid ($hostname); $(nworkers()) julia workers total; $(options.nworkers()) provisioned workers total; $n_tasks_remaining tasks left in task-pool."
@@ -1855,11 +1926,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     epmap_eloop.interrupted = r.do_interrupt
                     epmap_eloop.errored = r.do_error
                     if r.do_break || r.do_interrupt
-                        if epmap_eloop.checkpoints[pid] !== nothing
-                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                        end
-                        pop!(localresults, pid)
-                        pop!(epmap_eloop.checkpoints, pid)
+                        leave_map!(epmap_eloop, localresults, pid)
                         put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
                         break
                     end
@@ -1906,29 +1973,17 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     end
                     if r.do_break || r.do_interrupt
                         @debug "epmap_eloop.checkpoints[$pid]", epmap_eloop.checkpoints[pid]
-                        if epmap_eloop.checkpoints[pid] !== nothing
-                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                        end
-                        @debug "popping localresults"
-                        pop!(localresults, pid)
-                        @debug "popping checkpoints"
-                        pop!(epmap_eloop.checkpoints, pid)
+                        leave_map!(epmap_eloop, localresults, pid)
                         @debug "returning pid to elastic loop"
                         put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
                         @debug "done returning pid to elastic loop"
                         break
                     end
 
-                    # populate local reduction with the previous checkpoint since we will re-run the task.
-                    if epmap_eloop.checkpoints[pid] === nothing
-                        @debug "re-zeroing local result (no existing checkpoints)"
-                        localresults[pid] = remotecall_default_threadpool(options.zeros, pid)
-                    else
-                        @debug "re-setting localresult to the previously saved checkpoint"
-                        localresults[pid] = options.reduce_streaming ?
-                            remotecall_default_threadpool(load_checkpoint_streaming, pid, options.zeros, epmap_eloop.checkpoints[pid], T, options.reduce_chunkbytes, options.reduce_depth) :
-                            remotecall_default_threadpool(load_checkpoint, pid, options.load_checkpoint, epmap_eloop.checkpoints[pid], T)
-                    end
+                    # the task runs again, so the local result starts again from the previous checkpoint, or from zeros, when
+                    # it is made for the next task (see `prepare_localresult!`)
+                    @debug "dropping the local result of pid=$pid, to make it again from the previous checkpoint ($(epmap_eloop.checkpoints[pid] !== nothing)) or from zeros"
+                    drop_localresult!(localresults, pid)
 
                     continue # there is no new checkpoint, and we need to keep the old checkpoint
                 end
@@ -1952,11 +2007,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
                     epmap_eloop.interrupted = r.do_interrupt
                     epmap_eloop.errored = r.do_error
                     if r.do_break || r.do_interrupt
-                        if epmap_eloop.checkpoints[pid] !== nothing
-                            push!(epmap_eloop.reduce_checkpoints, epmap_eloop.checkpoints[pid])
-                        end
-                        pop!(localresults, pid)
-                        pop!(epmap_eloop.checkpoints, pid)
+                        leave_map!(epmap_eloop, localresults, pid)
                         put!(epmap_eloop.pid_channel_map_remove, (pid,r.bad_pid))
                         break
                     end
@@ -1965,6 +2016,7 @@ function epmapreduce_map(f, results::T, epmap_eloop, epmap_journal, options, arg
         catch e
             @warn "map, uncaught exception in worker loop for pid=$pid"
             logerror(e, Logging.Debug)
+            leave_map!(epmap_eloop, localresults, pid)
             @debug "map, putting $pid onto remove channel"
             isopen(epmap_eloop.pid_channel_map_remove) && put!(epmap_eloop.pid_channel_map_remove, (pid,true))
             @debug "map, done putting $pid onto remove channel"

@@ -1836,6 +1836,117 @@ end
     rm(tmpdir; recursive=true, force=true)
 end
 
+@testset "pmapreduce, making the local result of a new worker is not part of the time of its first task" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    @everywhere begin
+        # allocating a large local result can take longer than the timeout of a task
+        zeros_slow() = (sleep(6); zeros(Float32, 10))
+        foo_quick(r, tsk) = (r .+= tsk; sleep(0.5); nothing)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    ndone = Ref(0)
+    count_done(t) = (get(t["trials"][end], "status", "") == "succeeded" && (ndone[] += 1); nothing)
+    # a second worker joins once tasks time out after 5 times their median time, of a second
+    options = SchedulerOptions(;scratch=tmpdir, zeros=zeros_slow, journal_task_callback=count_done, maxworkers=()->ndone[] >= 20 ? 2 : 1)
+    logger = Test.TestLogger(; min_level=Logging.Info, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 10), options, foo_quick, 1:60)
+    end
+    msgs = [string(l.message) for l in logger.logs]
+    taskpids = unique(m[1] for m in filter(!isnothing, match.(r"^running task \d+ on process (\d+)", msgs)))
+
+    @test all(==(sum(1:60)), r)
+    # the first task of the new worker did not time out, and the new worker ran tasks
+    @test count(contains("caught exception during f eval"), msgs) == 0
+    @test length(taskpids) == 2
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, only workers that get a task make a local result" begin
+    safe_addprocs(6)
+    @everywhere using Distributed, Schedulers
+    @everywhere begin
+        nzeros = Ref(0)
+        zeros_counted() = (nzeros[] += 1; zeros(Float32, 10))
+        foo_counted(r, tsk) = (r .+= tsk; sleep(2); nothing)
+        # a named function: an anonymous one would take the master's `nzeros` with it
+        nzeros_made() = nzeros[]
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, zeros=zeros_counted)
+    logger = Test.TestLogger(; min_level=Logging.Info, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 10), options, foo_counted, 1:2)
+    end
+    msgs = [string(l.message) for l in logger.logs]
+    taskpids = unique(m[1] for m in filter(!isnothing, match.(r"^running task \d+ on process (\d+)", msgs)))
+
+    @test all(==(3), r)
+    # every worker is given to the map while tasks are left, but only those that got one made a local result
+    @test sum(pid->remotecall_fetch(nzeros_made, pid), workers()) == length(taskpids)
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
+@testset "pmapreduce, a dropped local result is freed on its worker without the master's garbage collection" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    @everywhere begin
+        nmade, nfreed = Ref(0), Ref(0)
+        zeros_tracked() = (nmade[] += 1; x = zeros(Float32, 10); finalizer(_->(nfreed[] += 1), x); x)
+        made_and_freed() = (GC.gc(); GC.gc(); GC.gc(); (nmade[], nfreed[]))
+    end
+
+    pid = workers()[1]
+    localresults = Dict(pid=>Schedulers.remotecall_default_threadpool(zeros_tracked, pid))
+    wait(localresults[pid])
+    # without garbage collection on the master, the worker only frees the local result if the master drops it explicitly
+    local counts
+    GC.enable(false)
+    try
+        Schedulers.drop_localresult!(localresults, pid)
+        sleep(2) # for the message that drops the reference to reach the worker
+        counts = remotecall_fetch(made_and_freed, pid)
+    finally
+        GC.enable(true)
+    end
+
+    @test isempty(localresults)
+    @test counts == (1, 1)
+    # a worker without a local result has nothing to drop
+    @test Schedulers.drop_localresult!(localresults, pid) === nothing
+    rmprocs(workers())
+end
+
+@testset "pmapreduce, after a checkpoint fails, the local result is made again from the last checkpoint, reduce_streaming=$streaming" for streaming in (false, true)
+    safe_addprocs(2)
+    @everywhere using Distributed, Schedulers
+    @everywhere begin
+        nfetch = Ref(0)
+        # the local result is fetched by each task, and by each checkpoint: the second checkpoint of each worker fails
+        fetch_failing(x) = ((nfetch[] += 1) == 4 && error("injected checkpoint failure"); fetch(x))
+        foo_reload(r, tsk) = (r .+= tsk; sleep(0.5); nothing)
+    end
+
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir, epmapreduce_fetch=fetch_failing, retries=1, reduce_streaming=streaming)
+    logger = Test.TestLogger(; min_level=Logging.Info, catch_exceptions=true)
+    r,tsks = with_logger(logger) do
+        epmapreduce!(zeros(Float32, 10), options, foo_reload, 1:8)
+    end
+    msgs = [string(l.message) for l in logger.logs]
+
+    # the task whose checkpoint failed ran again, on the local result made from the previous checkpoint
+    @test count(contains("caught exception during save_checkpoint"), msgs) >= 1
+    @test all(==(sum(1:8)), r)
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "copy SchedulerOptions" begin
     options = SchedulerOptions()
     _options = copy(options)
