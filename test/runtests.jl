@@ -1385,6 +1385,41 @@ end
     rmprocs(workers())
 end
 
+@testset "a failed worker leaves the rest of its group working" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    bad = first(workers())
+    sibling = only(pid for pid in workers() if pid != bad && pairs[pid] == pairs[bad])
+    s = randstring(6)
+    @everywhere function foo_failing(tsk, s, bad)
+        myid() == bad && error("simulated failure on process $bad")
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk,$(myid())")
+        sleep(1)
+    end
+
+    # No new workers, and minworkers is what remains, so only retirement removes anyone.
+    options = SchedulerOptions(; maxworkers=4, minworkers=3, addprocs=n -> Int[],
+        timeout_function_multiplier=100, worker_group=pid -> get(pairs, pid, nothing))
+    epmap(options, foo_failing, 1:12, s, bad)
+
+    @test bad ∉ workers()
+    @test sibling ∈ workers()
+    ran_on = Int[]
+    for tsk = 1:12
+        file = joinpath(tempdir(), "task-$s-$tsk.txt")
+        @test isfile(file)
+        isfile(file) || continue
+        task, pid = parse.(Int, split(read(file, String), ","))
+        @test task == tsk
+        push!(ran_on, pid)
+        rm(file)
+    end
+    @test bad ∉ ran_on
+    @test sibling ∈ ran_on
+    rmprocs(workers())
+end
+
 @testset "demand feed" begin
     observation(n, phase=:active) = DemandObservation(n, phase, time_ns())
     published = DemandObservation[]

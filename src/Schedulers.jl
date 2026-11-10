@@ -857,34 +857,38 @@ end
 
 """
 Update the loop's retiring groups for one pass and return the pids to remove:
-idle retiring groups, plus failed or idle reclaimed pids whose group was never known.
+idle retiring groups, failed pids, and idle reclaimed pids whose group was never
+known. A failed pid is removed on its own: the other workers of its group run in
+their own processes (and, on shared machines, their own containers), so one
+worker's fault is not taken as the machine's, and they keep their work. A
+reclaimed pid retires its whole group, since the resource manager wants the
+machine back.
 """
 function retire_worker_groups!(eloop::ElasticLoop, bad_pids::Set{Int}, δ::Integer)
     live = workers()
     groups, _ = worker_groups!(eloop.group_keys, eloop.worker_group, live)
     busy = union(eloop.used_pids_map, eloop.used_pids_reduce)
-    lone_bad = Int[]
-    for pid in bad_pids
-        key = get(eloop.group_keys, pid, nothing)
-        if key !== nothing
-            push!(eloop.retiring_groups, key)
-        elseif pid ∈ live
-            push!(lone_bad, pid)
-        end
-    end
+    failed = sort!([pid for pid in bad_pids if pid ∈ live])
     empty!(bad_pids)
+    # Plan whole-group retirement on what remains of each group once the failed pids leave.
+    for key in collect(keys(groups))
+        filter!(∉(failed), groups[key])
+        isempty(groups[key]) && delete!(groups, key)
+    end
+    lone = copy(failed)
     for pid in eloop.reclaimed_pids
+        pid ∈ failed && continue
         key = get(eloop.group_keys, pid, nothing)
         if key !== nothing
             push!(eloop.retiring_groups, key)
         elseif pid ∈ live && pid ∉ busy
-            push!(lone_bad, pid)
+            push!(lone, pid)
         end
     end
     eloop.retiring_groups, rm_pids = plan_group_retirement(
-        groups, busy, eloop.retiring_groups, max(-δ, 0) - length(lone_bad))
+        groups, busy, eloop.retiring_groups, max(-δ, 0) - length(lone))
     eloop.retiring_pids = Set{Int}(pid for key in eloop.retiring_groups for pid in groups[key])
-    sort!(union(rm_pids, lone_bad))
+    sort!(union(rm_pids, lone))
 end
 
 # Pids the resource manager wants back this pass; they get no new work.
@@ -1548,7 +1552,7 @@ and `pmap_kwargs` are as follows.
 * `reporttasks=true` log task assignment
 * `journal_init_callback=tsks->nothing` additional method when initializing the journal
 * `journal_task_callback=tsk->nothing` additional method when journaling a task
-* `worker_group=nothing` optional `pid->key` mapping; pids with the same key (for example, processes on one VM) are retired together, only once all are idle. Return `nothing` while a pid's group is unknown.
+* `worker_group=nothing` optional `pid->key` mapping; pids with the same key (for example, processes on one VM) are retired together, only once all are idle. A pid that fails is removed on its own; the rest of its group keeps working. Return `nothing` while a pid's group is unknown.
 * `demand=nothing` optional [`DemandFeed`](@ref): publish the loop's demand to a resource manager, which admits growth, instead of calling `addprocs`
 * `reclaim=nothing` optional method returning the pids the resource manager wants back; they get no new work and are removed once idle (with `worker_group`, their whole group)
 # GXTODO: add doc
@@ -1717,7 +1721,7 @@ and `epmap_kwargs` are as follows.
 * `id=randstring(6)` identifier used for the scratch files
 * `reduce_trigger=eloop->nothing` condition for triggering a reduction prior to the completion of the map
 * `save_partial_reduction=x->nothing` method for saving a partial reduction triggered by `reduce_trigger`
-* `worker_group=nothing` optional `pid->key` mapping; pids with the same key are retired together, only once all are idle
+* `worker_group=nothing` optional `pid->key` mapping; pids with the same key are retired together, only once all are idle; a pid that fails is removed on its own
 * `demand=nothing` optional [`DemandFeed`](@ref): publish the loop's demand to a resource manager, which admits growth, instead of calling `addprocs`
 * `reclaim=nothing` optional method returning the pids the resource manager wants back; they get no new work and are removed once idle (with `worker_group`, their whole group)
 ## Notes
