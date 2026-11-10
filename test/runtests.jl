@@ -1084,3 +1084,91 @@ end
         sleep(0.01)
     end
 end
+
+@testset "worker group retirement planning" begin
+    plan = Schedulers.plan_group_retirement
+    groups = Dict(:a => [2, 3, 4, 5], :b => [6, 7, 8, 9])
+
+    # An idle primary with busy siblings is not removed; the group stops taking work.
+    retiring, rm_pids = plan(groups, Set([3, 4, 5, 6, 7, 8, 9]), Set{Any}(), 4)
+    @test retiring == Set([:a]) && isempty(rm_pids)
+    # A task completing while retirement is pending makes the whole group removable.
+    retiring, rm_pids = plan(groups, Set([6, 7, 8, 9]), retiring, 4)
+    @test rm_pids == [2, 3, 4, 5]
+    # Excess smaller than a group retires nothing (round down to whole groups).
+    @test plan(groups, Set{Int}(), Set{Any}(), 3) == (Set{Any}(), Int[])
+    # Groups with fewer busy workers retire first.
+    @test first(plan(groups, Set([2]), Set{Any}(), 4)) == Set([:b])
+    # A retiring group whose members have all exited is forgotten.
+    @test first(plan(Dict(:b => [6]), Set{Int}(), Set([:a]), 0)) == Set{Any}()
+
+    keys_cache = Dict{Int,Any}()
+    grouped, unknown = Schedulers.worker_groups!(keys_cache, pid -> pid == 9 ? nothing : div(pid, 2), [1, 2, 3, 9])
+    @test grouped == Dict(1 => [2, 3]) && unknown == [9]
+    @test keys_cache == Dict(2 => 1, 3 => 1)
+
+    @test Schedulers.trim_worker_groups(groups, 4) == [2, 3, 4, 5]
+    @test Schedulers.trim_worker_groups(groups, 5) == Int[]
+    @test Schedulers.trim_worker_groups(groups, 8, Set([:b])) == [6, 7, 8, 9]
+end
+
+@testset "epmap with grouped workers" begin
+    safe_addprocs(6)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    s = randstring(6)
+    @everywhere function foo_grouped(tsk, s)
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk,$(myid())")
+        sleep(tsk <= 2 ? 20 : 2)
+    end
+
+    # Long tasks run 10x the median; a high multiplier keeps them from timing out.
+    options = SchedulerOptions(; maxworkers=6, minworkers=2, timeout_function_multiplier=100,
+        worker_group=pid -> get(pairs, pid, nothing))
+    epmap(options, foo_grouped, 1:12, s)
+
+    remaining = workers()
+    @test length(remaining) == 2
+    @test pairs[remaining[1]] == pairs[remaining[2]]
+    for tsk = 1:12
+        file = joinpath(tempdir(), "task-$s-$tsk.txt")
+        @test split(read(file, String), ",")[1] == "$tsk"
+        rm(file)
+    end
+    rmprocs(workers())
+end
+
+@testset "a failed worker leaves the rest of its group working" begin
+    safe_addprocs(4)
+    @everywhere using Distributed, Schedulers
+    pairs = Dict(pid => div(pid - first(workers()), 2) for pid in workers())
+    bad = first(workers())
+    sibling = only(pid for pid in workers() if pid != bad && pairs[pid] == pairs[bad])
+    s = randstring(6)
+    @everywhere function foo_failing(tsk, s, bad)
+        myid() == bad && error("simulated failure on process $bad")
+        write(joinpath(tempdir(), "task-$s-$tsk.txt"), "$tsk,$(myid())")
+        sleep(1)
+    end
+
+    # No new workers, and minworkers is what remains, so only retirement removes anyone.
+    options = SchedulerOptions(; maxworkers=4, minworkers=3, addprocs=n -> Int[],
+        timeout_function_multiplier=100, worker_group=pid -> get(pairs, pid, nothing))
+    epmap(options, foo_failing, 1:12, s, bad)
+
+    @test bad ∉ workers()
+    @test sibling ∈ workers()
+    ran_on = Int[]
+    for tsk = 1:12
+        file = joinpath(tempdir(), "task-$s-$tsk.txt")
+        @test isfile(file)
+        isfile(file) || continue
+        task, pid = parse.(Int, split(read(file, String), ","))
+        @test task == tsk
+        push!(ran_on, pid)
+        rm(file)
+    end
+    @test bad ∉ ran_on
+    @test sibling ∈ ran_on
+    rmprocs(workers())
+end
