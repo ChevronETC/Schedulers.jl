@@ -112,8 +112,12 @@ function journal_stop!(journal, epmap_journal_task_callback=tsk->nothing; stage,
     end
 end
 
+# The names of Main that have a value. Since Julia 1.12, a top-level assignment such as `x = epmapreduce!(...)`
+# declares the global `x` before the right-hand side runs, and evaluating `x` throws until it is assigned.
+assigned_names_of_main() = filter(name->isdefined(Main, name), names(Main; imported=true))
+
 function load_modules_on_new_workers(pid)
-    _names = names(Main; imported=true)
+    _names = assigned_names_of_main()
     for _name in _names
         try
             if isa(Base.eval(Main, _name), Module) && _name ∉ (:Base, :Core, :InteractiveUtils, :VSCodeServer, :Main, :_vscodeserver)
@@ -129,7 +133,7 @@ end
 
 function load_functions_on_new_workers(pid)
     ignore = (Symbol("@enter"), Symbol("@run"), :ans, :eval, :include, :vscodedisplay)
-    _names = filter(name->name ∉ ignore && isa(Base.eval(Main, name), Function), names(Main; imported=true))
+    _names = filter(name->name ∉ ignore && isa(Base.eval(Main, name), Function), assigned_names_of_main())
 
     for _name in _names
         try
