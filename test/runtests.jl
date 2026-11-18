@@ -1219,6 +1219,26 @@ end
     rm(dir; recursive=true, force=true)
 end
 
+@testset "epmapreduce! assigning the result to a global at the top level" begin
+    safe_addprocs(2)
+    @everywhere using Distributed, Schedulers
+    @everywhere foo_toplevel(r, tsk) = (r .+= tsk; nothing)
+
+    # since Julia 1.12, a top-level assignment declares its global before the right-hand side runs, so the global is a
+    # name of Main without a value while epmapreduce! starts the workers, and copies the functions of Main to them
+    tmpdir = mktempdir(;cleanup=false)
+    options = SchedulerOptions(;scratch=tmpdir)
+    t = @async Core.eval(Main, :(schedulers_test_result = epmapreduce!(zeros(10), $options, foo_toplevel, 1:4)))
+    @test timedwait(()->istaskdone(t), 120.0; pollint=1.0) == :ok # the workers start, instead of failing to
+    if istaskdone(t)
+        @test !istaskfailed(t)
+        @test Main.schedulers_test_result[1] ≈ sum(1:4) * ones(10)
+    end
+
+    rmprocs(workers())
+    rm(tmpdir; recursive=true, force=true)
+end
+
 @testset "minworkers > maxworkers" begin
     options = SchedulerOptions(;minworkers=10, maxworkers=5)
 
