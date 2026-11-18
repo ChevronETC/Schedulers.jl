@@ -1117,8 +1117,10 @@ end
 
     # The first checkpoint save after more than half of the tasks have run holds its worker until
     # the grace window has closed, then fails, so its task returns to the pool after the window closed.
+    # It records the tasks that are done when it starts, its own task among them.
     @everywhere function save_checkpoint_requeue(checkpoint, localresult)
-        if count(startswith("done-"), readdir(requeue_dir)) > 12
+        done = filter(startswith("done-"), readdir(requeue_dir))
+        if length(done) > 12
             claimed = try
                 mkdir(joinpath(requeue_dir, "failed"))
                 true
@@ -1126,6 +1128,7 @@ end
                 false
             end
             if claimed
+                write(joinpath(requeue_dir, "failed", "done"), join(done, "\n"))
                 sleep(8)
                 write(joinpath(requeue_dir, "failed", "at"), string(time()))
                 error("checkpoint save failed after the grace window closed")
@@ -1147,7 +1150,11 @@ end
     if finished
         g, tsks = fetch(t)
         started = filter(tsk -> isfile(joinpath(dir, "start-$tsk")), 1:24)
-        requeued = filter(tsk -> isfile(joinpath(dir, "done-$tsk")), tsks)
+        # Tasks still running when the window closed are only abandoned by the master: their workers can finish them
+        # before they are removed. That is after the failed save started, since the grace period only starts once more
+        # than half of the tasks are saved, so only count the skipped tasks that were done when it started.
+        done_before_failure = readlines(joinpath(dir, "failed", "done"))
+        requeued = filter(tsk -> "done-$tsk" ∈ done_before_failure, tsks)
         failed_at = parse(Float64, read(joinpath(dir, "failed", "at"), String))
         @test length(requeued) == 1
         @test all(tsk -> mtime(joinpath(dir, "start-$tsk")) < failed_at, started)
