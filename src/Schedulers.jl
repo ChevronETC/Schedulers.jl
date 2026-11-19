@@ -593,6 +593,18 @@ function robust_rmprocs(pids; waitfor)
     end
 end
 
+# Has the worker `pid` joined the cluster? Distributed lists a worker in `workers()` as soon as the master is connected
+# to it, but only sends it the cluster cookie once the master is connected to the workers with lower pids too, for
+# example to workers of the same `addprocs` call that are slower to start. A message that reaches the worker before the
+# cookie is taken for an invalid cookie: the worker drops the connection and never joins, and its `addprocs` call fails,
+# possibly only after `JULIA_WORKER_TIMEOUT`. The master records the Julia version of a worker once it has joined.
+function has_joined(pid)
+    w = get(Distributed.map_pid_wrkr, pid, nothing)
+    w isa Distributed.Worker || return w !== nothing
+    hasfield(Distributed.Worker, :version) || return true # a Distributed that does not record it: do not wait
+    isdefined(w, :version) && w.version !== nothing
+end
+
 function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_reduce)
     polling_interval = parse(Int, get(ENV, "SCHEDULERS_POLLING_INTERVAL", "1"))
     addrmprocs_timeout = parse(Int, get(ENV, "SCHEDULERS_ADDRMPROCS_TIMEOUT", "60"))
@@ -763,6 +775,8 @@ function loop(eloop::ElasticLoop, journal, journal_task_callback, tsk_map, tsk_r
         for uninitialized_pid in uninitialized_pids
             if !haskey(Distributed.map_pid_wrkr, uninitialized_pid)
                 @warn "worker with pid=$uninitialized_pid is not registered"
+            elseif !has_joined(uninitialized_pid)
+                push!(loop_log_cache, "waiting for $uninitialized_pid to join the cluster before initializing it")
             else
                 wrkrs[uninitialized_pid] = Distributed.map_pid_wrkr[uninitialized_pid]
                 push!(initializing_pids, uninitialized_pid)

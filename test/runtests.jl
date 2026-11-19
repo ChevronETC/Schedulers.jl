@@ -237,6 +237,42 @@ end
     end
 end
 
+# Starts local workers, and connects to the first worker of each `addprocs` call 5 seconds late. Until then, Distributed
+# lists the other workers of the call in `workers()`, but does not send them the cluster cookie yet: it first needs the
+# address of the first worker, to send it to them.
+struct LateFirstConnectManager <: ClusterManager
+    manager::Distributed.LocalManager
+    isfirst::Base.RefValue{Bool}
+end
+LateFirstConnectManager(n) = LateFirstConnectManager(Distributed.LocalManager(n, true), Ref(true))
+Distributed.launch(m::LateFirstConnectManager, params::Dict, launched::Array, c::Condition) = Distributed.launch(m.manager, params, launched, c)
+Distributed.manage(m::LateFirstConnectManager, pid::Integer, config::WorkerConfig, op::Symbol) = Distributed.manage(m.manager, pid, config, op)
+Distributed.kill(m::LateFirstConnectManager, pid::Int, config::WorkerConfig) = Distributed.kill(m.manager, pid, config)
+function Distributed.connect(m::LateFirstConnectManager, pid::Int, config::WorkerConfig)
+    if m.isfirst[]
+        m.isfirst[] = false
+        sleep(5)
+    end
+    invoke(Distributed.connect, Tuple{ClusterManager,Int,WorkerConfig}, m, pid, config)
+end
+
+@testset "epmap initializes a new worker once it has joined the cluster" begin
+    safe_addprocs(1)
+    @everywhere using Distributed, Schedulers
+    @everywhere foo_joined(tsk) = (sleep(1); nothing)
+
+    added = Int[]
+    options = SchedulerOptions(; minworkers=4, maxworkers=4, addprocs=n->append!(added, addprocs(LateFirstConnectManager(n))))
+    journal, tsks = epmap(options, foo_joined, 1:20)
+
+    # a message that reaches a new worker before the cluster cookie breaks its connection, so that it never joins, and
+    # its `addprocs` call fails
+    @test length(added) == 3
+    @test nworkers() == 4
+
+    rmprocs(workers())
+end
+
 @testset "pmap with timeout" begin
     using Distributed, Schedulers
 
